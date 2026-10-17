@@ -57,14 +57,7 @@ fn broker_readiness_preserves_an_attached_controller() {
     use super::link::EmulatorLink;
     let (ea, sa) = start_broker();
     let emulator = fake_emu(ea, Some("ready-owner".into()));
-    std::thread::sleep(Duration::from_millis(100));
-    let mut owner = super::broker_link::connect_with_token(
-        &sa,
-        Some("ready-owner".into()),
-        TEST_SESSION_TOKEN,
-        Duration::from_secs(1),
-    )
-    .unwrap();
+    let mut owner = connect_registered(&sa, "ready-owner");
     super::broker_link::probe_session_with_token(&sa, TEST_SESSION_TOKEN, Duration::from_secs(1))
         .unwrap();
     assert_eq!(
@@ -419,16 +412,8 @@ fn broker_attach_preserves_contract_advertisement() {
         .unwrap();
         std::thread::sleep(Duration::from_millis(300));
     });
-    std::thread::sleep(Duration::from_millis(100));
-
-    let stream = TcpStream::connect(session_addr).unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut writer = stream;
-    let response = authenticated_attach(
-        &mut writer,
-        &mut reader,
-        serde_json::json!({"name": "nds-contracts"}),
-    );
+    let (_stream, response) =
+        attach_eventually(&session_addr, serde_json::json!({"name": "nds-contracts"}));
     let value: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(
         value["result"]["contracts"]["catalog"],
@@ -459,14 +444,13 @@ fn broker_attach_preserves_contract_advertisement() {
 fn broker_rejects_mesen_without_native_halt_features() {
     let (emu_addr, session_addr) = start_broker();
     let emulator = fake_mesen_emu(emu_addr, "unpatched", &["code_break_idle"], 200);
-    std::thread::sleep(Duration::from_millis(100));
+    emulator.join().unwrap();
 
     let (_session, response) = attach(&session_addr, Some("unpatched"));
     assert!(
         response.contains("no_such_emulator"),
         "incompatible Mesen must not enter the broker registry: {response}"
     );
-    emulator.join().unwrap();
 }
 
 #[test]
@@ -478,9 +462,8 @@ fn broker_forwards_mesen_native_halt_identity() {
         &["code_break_idle", "native_halt_service"],
         500,
     );
-    std::thread::sleep(Duration::from_millis(100));
-
-    let (_session, response) = attach(&session_addr, Some("patched"));
+    let (_session, response) =
+        attach_eventually(&session_addr, serde_json::json!({"name": "patched"}));
     let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     let result = &response["result"];
     assert_eq!(result["mesen_host_api"], 1);
@@ -551,11 +534,34 @@ fn attach_eventually(sa: &str, params: serde_json::Value) -> (TcpStream, String)
         }
         let transient = matches!(
             response["error"]["kind"].as_str(),
-            Some("not_connected" | "no_such_emulator")
+            Some("busy" | "not_connected" | "no_such_emulator")
         );
         assert!(
             transient && std::time::Instant::now() < deadline,
             "broker producer registration did not become visible: {}",
+            attempt.1
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn attach_error_eventually(
+    sa: &str,
+    params: serde_json::Value,
+    expected_kind: &str,
+) -> (TcpStream, String) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let attempt = attach_with_params(sa, params.clone());
+        let response: serde_json::Value = serde_json::from_str(attempt.1.trim()).unwrap();
+        let kind = response["error"]["kind"].as_str();
+        if kind == Some(expected_kind) {
+            return attempt;
+        }
+        let transient = matches!(kind, Some("busy" | "not_connected" | "no_such_emulator"));
+        assert!(
+            transient && std::time::Instant::now() < deadline,
+            "broker did not return {expected_kind} after registration: {}",
             attempt.1
         );
         std::thread::sleep(Duration::from_millis(5));
@@ -620,8 +626,7 @@ fn disconnect_producer(producer: &TcpStream, session: &TcpStream) {
 fn broker_authenticated_duplicate_cannot_evict_owner() {
     let (ea, sa) = start_broker();
     let mut original = controlled_producer(&ea, Some("g"), "launch-original");
-    std::thread::sleep(Duration::from_millis(100));
-    let (mut session, first) = attach(&sa, Some("g"));
+    let (mut session, first) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
     for launch in ["launch-attacker", "launch-original"] {
         let mut candidate = controlled_producer(&ea, Some("g"), launch);
@@ -680,11 +685,9 @@ fn broker_authenticated_duplicate_cannot_evict_owner() {
 fn broker_anonymous_registration_skips_named_slots() {
     let (ea, sa) = start_broker();
     let _named = controlled_producer(&ea, Some("emu1"), "named");
-    std::thread::sleep(Duration::from_millis(100));
-    let (_owner, first) = attach(&sa, Some("emu1"));
+    let (_owner, first) = attach_eventually(&sa, serde_json::json!({"name": "emu1"}));
     let _anonymous = controlled_producer(&ea, None, "anonymous");
-    std::thread::sleep(Duration::from_millis(100));
-    let (_, second) = attach(&sa, Some("emu2"));
+    let (_, second) = attach_eventually(&sa, serde_json::json!({"name": "emu2"}));
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(second["result"]["launch_id"], test_launch_id("anonymous"));
     assert!(first.contains("named"));
@@ -711,8 +714,7 @@ fn broker_concurrent_duplicate_admission_has_one_owner() {
         .into_iter()
         .map(|attempt| attempt.join().unwrap())
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
-    let (_session, response) = attach(&sa, Some("g"));
+    let (_session, response) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert_eq!(response["ok"], true);
     let winner = response["result"]["launch_id"].as_str().unwrap();
@@ -737,7 +739,6 @@ fn broker_concurrent_duplicate_admission_has_one_owner() {
 fn broker_rejects_unauthenticated_same_name_producer_without_replacement() {
     let (ea, sa) = start_broker();
     let _legitimate = fake_emu_alive(ea.clone(), "g", 3000);
-    std::thread::sleep(Duration::from_millis(100));
 
     let attacker = TcpStream::connect(&ea).unwrap();
     let port = attacker.peer_addr().unwrap().port();
@@ -757,9 +758,7 @@ fn broker_rejects_unauthenticated_same_name_producer_without_replacement() {
         Duration::from_secs(1),
     )
     .is_err());
-    std::thread::sleep(Duration::from_millis(100));
-
-    let (_session, response) = attach(&sa, Some("g"));
+    let (_session, response) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["methods"], serde_json::json!(["status"]));
@@ -769,7 +768,6 @@ fn broker_rejects_unauthenticated_same_name_producer_without_replacement() {
 fn broker_rejects_malformed_producer_envelopes_before_registration() {
     let (ea, sa) = start_broker();
     let _legitimate = fake_emu_alive(ea.clone(), "g", 3000);
-    std::thread::sleep(Duration::from_millis(100));
 
     let malformed = [
         serde_json::json!({
@@ -793,9 +791,7 @@ fn broker_rejects_malformed_producer_envelopes_before_registration() {
         .into_iter()
         .map(|response| submit_producer_hello(&ea, response))
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
-
-    let (_session, response) = attach(&sa, Some("g"));
+    let (_session, response) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["methods"], serde_json::json!(["status"]));
@@ -805,8 +801,7 @@ fn broker_rejects_malformed_producer_envelopes_before_registration() {
 fn broker_rejects_unauthenticated_registration_takeover_without_name_disclosure() {
     let (ea, sa) = start_broker();
     let _emulator = fake_emu_alive(ea, "g", 3000);
-    std::thread::sleep(Duration::from_millis(100));
-    let (mut legitimate, attached) = attach(&sa, Some("g"));
+    let (mut legitimate, attached) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let attached: serde_json::Value = serde_json::from_str(attached.trim()).unwrap();
     let registration = attached["result"]["broker_registration_id"]
         .as_u64()
@@ -1119,8 +1114,7 @@ fn broker_routes_by_name_and_ambiguous() {
 fn broker_second_session_busy() {
     let (ea, sa) = start_broker();
     let _a = fake_emu(ea, Some("g".into()));
-    std::thread::sleep(Duration::from_millis(100));
-    let (_s1, ar1) = attach(&sa, Some("g")); // 살아있는 첫 세션
+    let (_s1, ar1) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(ar1.contains("attached_name"), "{ar1}");
     let (_s2, ar2) = attach(&sa, Some("g")); // 둘째 → Busy
     assert!(ar2.contains("busy"), "둘째 세션은 busy: {ar2}");
@@ -1130,8 +1124,7 @@ fn broker_second_session_busy() {
 fn broker_exact_registration_can_resume_the_same_application_link() {
     let (ea, sa) = start_broker();
     let _emulator = fake_emu_alive(ea, "g", 4000);
-    std::thread::sleep(Duration::from_millis(100));
-    let (old_session, first) = attach(&sa, Some("g"));
+    let (old_session, first) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
     let registration_id = first["result"]["broker_registration_id"]
         .as_u64()
@@ -1155,14 +1148,14 @@ fn broker_exact_registration_can_resume_the_same_application_link() {
 fn broker_rejects_a_reconnect_after_emulator_registration_changes() {
     let (ea, sa) = start_broker();
     let _emulator = fake_emu_alive(ea, "g", 4000);
-    std::thread::sleep(Duration::from_millis(100));
 
-    let (_session, response) = attach_with_params(
+    let (_session, response) = attach_error_eventually(
         &sa,
         serde_json::json!({
             "name": "g",
             "expected_registration_id": u64::MAX,
         }),
+        "identity_mismatch",
     );
     assert!(
         response.contains("identity_mismatch"),
@@ -1174,15 +1167,13 @@ fn broker_rejects_a_reconnect_after_emulator_registration_changes() {
 fn broker_accepts_reregistration_only_for_the_same_returned_launch() {
     let (ea, sa) = start_broker();
     let first_emulator = controlled_producer(&ea, Some("g"), "launch-same");
-    std::thread::sleep(Duration::from_millis(100));
-    let (first_session, first) = attach(&sa, Some("g"));
+    let (first_session, first) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
     let first_registration = first["result"]["broker_registration_id"].as_u64().unwrap();
 
     disconnect_producer(&first_emulator, &first_session);
     let _replacement_emulator = fake_managed_emu_alive(ea, "g", "launch-same", 4000);
-    std::thread::sleep(Duration::from_millis(100));
-    let (_continued_session, continued) = attach_with_params(
+    let (_continued_session, continued) = attach_eventually(
         &sa,
         serde_json::json!({
             "name": "g",
@@ -1203,15 +1194,15 @@ fn broker_accepts_reregistration_only_for_the_same_returned_launch() {
 fn broker_rejects_reregistration_for_a_different_launch() {
     let (ea, sa) = start_broker();
     let _emulator = fake_managed_emu_alive(ea, "g", "launch-new", 4000);
-    std::thread::sleep(Duration::from_millis(100));
 
-    let (_session, response) = attach_with_params(
+    let (_session, response) = attach_error_eventually(
         &sa,
         serde_json::json!({
             "name": "g",
             "expected_registration_id": u64::MAX,
             "expected_launch_id": test_launch_id("launch-old"),
         }),
+        "identity_mismatch",
     );
     assert!(
         response.contains("identity_mismatch"),
@@ -1276,19 +1267,17 @@ fn broker_old_session_reader_does_not_clobber_new_pairing() {
     // 신규 세션의 페어링을 unpair하면 안 된다(session generation 가드).
     let (ea, sa) = start_broker();
     let e1 = controlled_producer(&ea, Some("g"), "old");
-    std::thread::sleep(Duration::from_millis(100));
 
     // 세션 A: 구 에뮬레이터에 페어링(소켓 보관 — 아직 종료 안 함).
-    let (a_sock, ar_a) = attach(&sa, Some("g"));
+    let (a_sock, ar_a) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
 
     // EOF cleanup releases the name before a different producer registers.
     disconnect_producer(&e1, &a_sock);
     let _e2 = fake_emu_alive(ea.clone(), "g", 3000);
-    std::thread::sleep(Duration::from_millis(200)); // 신규 등록 완료
 
     // 세션 B: 신규 에뮬레이터에 페어링.
-    let (_b_sock, ar_b) = attach(&sa, Some("g"));
+    let (_b_sock, ar_b) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(
         ar_b.contains("attached_name"),
         "B attach(신규 에뮬레이터): {ar_b}"
@@ -1312,8 +1301,7 @@ fn broker_does_not_transfer_an_open_session_after_elapsed_time() {
     // heartbeat 지연은 관측 신호일 뿐이며 열린 세션의 배타 제어권을 이전하지 않는다.
     let (ea, sa) = start_broker();
     let _e = fake_emu_alive(ea, "g", 4000);
-    std::thread::sleep(Duration::from_millis(100));
-    let (a_sock, ar_a) = attach(&sa, Some("g"));
+    let (a_sock, ar_a) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
     std::thread::sleep(Duration::from_millis(350));
     let (_b, ar_b) = attach(&sa, Some("g"));
@@ -1329,8 +1317,7 @@ fn broker_heartbeat_does_not_change_exclusive_control() {
     // _ping은 transport 관측일 뿐이며 열린 세션의 배타 제어권을 바꾸지 않는다.
     let (ea, sa) = start_broker();
     let _e = fake_emu_alive(ea, "g", 4000);
-    std::thread::sleep(Duration::from_millis(100));
-    let (mut a_sock, ar_a) = attach(&sa, Some("g"));
+    let (mut a_sock, ar_a) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
     // A가 heartbeat를 주기적으로 보내도 소유권 근거로 사용하지 않는다.
     for _ in 0..4 {
@@ -1382,10 +1369,9 @@ fn broker_fences_a_late_response_after_closed_session_reattach() {
     let (ea, sa) = start_broker();
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     let _e = fake_emu_hold_reply(ea, "g", go_rx);
-    std::thread::sleep(Duration::from_millis(100)); // 등록 여유
 
     // 세션 A: attach 후 요청(id=7) 전송 — 에뮬레이터는 읽되 응답 보류.
-    let (a_sock, ar_a) = attach(&sa, Some("g"));
+    let (a_sock, ar_a) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
     {
         let mut wa = a_sock.try_clone().unwrap();
@@ -1394,8 +1380,7 @@ fn broker_fences_a_late_response_after_closed_session_reattach() {
     std::thread::sleep(Duration::from_millis(80)); // 에뮬레이터가 A 요청을 읽을 시간
 
     drop(a_sock);
-    std::thread::sleep(Duration::from_millis(100));
-    let (b_sock, ar_b) = attach(&sa, Some("g"));
+    let (b_sock, ar_b) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(
         ar_b.contains("attached_name"),
         "A가 닫힌 뒤 B가 명시적으로 attach: {ar_b}"
@@ -1427,14 +1412,12 @@ fn broker_fences_a_late_response_after_closed_session_reattach() {
 fn broker_persists_across_session() {
     let (ea, sa) = start_broker();
     let _a = fake_emu(ea, Some("g".into()));
-    std::thread::sleep(Duration::from_millis(100));
     {
-        let (s1, ar1) = attach(&sa, Some("g"));
+        let (s1, ar1) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
         assert!(ar1.contains("attached_name"));
         drop(s1);
     }
-    std::thread::sleep(Duration::from_millis(100)); // 언페어 여유
-    let (_s2, ar2) = attach(&sa, Some("g")); // 재attach 같은 에뮬레이터
+    let (_s2, ar2) = attach_eventually(&sa, serde_json::json!({"name": "g"}));
     assert!(
         ar2.contains("attached_name") && ar2.contains("g"),
         "재attach 복귀: {ar2}"
@@ -1532,7 +1515,6 @@ fn oversized_admission_is_closed_at_every_stage() {
     }
     // Rejected candidates release permits; ordinary admission remains available.
     let _producer = fake_emu(producer, Some("after-limit".into()));
-    std::thread::sleep(Duration::from_millis(150));
-    let (_, response) = attach(&session, Some("after-limit"));
+    let (_, response) = attach_eventually(&session, serde_json::json!({"name": "after-limit"}));
     assert!(response.contains("after-limit"), "{response}");
 }
