@@ -366,14 +366,12 @@ fn fake_mesen_emu(
 fn broker_routes_and_pumps_keepalive() {
     let (ea, sa) = start_broker();
     let h = fake_emu(ea, None);
-    std::thread::sleep(Duration::from_millis(100)); // 등록 여유
 
     // 세션: attach(이름 없음, 단일) → status → working 건너뛰고 completed 받기
-    let s = TcpStream::connect(sa).unwrap();
+    let (s, ar) = attach_eventually(&sa, serde_json::json!({}));
     let mut r = BufReader::new(s.try_clone().unwrap());
     let mut w = s;
-    let ar = authenticated_attach(&mut w, &mut r, serde_json::json!({}));
-    assert!(ar.contains("attached_name"), "attach 응답: {ar}");
+    assert!(ar.contains("attached_name"), "attach response: {ar}");
 
     writeln!(w, r#"{{"v":1,"id":2,"method":"status","params":{{}}}}"#).unwrap();
     // working + completed 두 줄이 와야 함(양방향 펌프)
@@ -541,6 +539,27 @@ fn attach_with_params(sa: &str, params: serde_json::Value) -> (TcpStream, String
     let mut w = s.try_clone().unwrap();
     let ar = authenticated_attach(&mut w, &mut r, params);
     (s, ar)
+}
+
+fn attach_eventually(sa: &str, params: serde_json::Value) -> (TcpStream, String) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let attempt = attach_with_params(sa, params.clone());
+        let response: serde_json::Value = serde_json::from_str(attempt.1.trim()).unwrap();
+        if response["result"].get("attached_name").is_some() {
+            return attempt;
+        }
+        let transient = matches!(
+            response["error"]["kind"].as_str(),
+            Some("not_connected" | "no_such_emulator")
+        );
+        assert!(
+            transient && std::time::Instant::now() < deadline,
+            "broker producer registration did not become visible: {}",
+            attempt.1
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn submit_producer_hello(ea: &str, response: serde_json::Value) -> TcpStream {
