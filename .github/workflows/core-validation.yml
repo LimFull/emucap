@@ -46,10 +46,13 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            test_threads: 4
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+            test_threads: 1
           - os: macos-14
             target: aarch64-apple-darwin
+            test_threads: 4
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -75,7 +78,7 @@ jobs:
         timeout-minutes: 15
         working-directory: source
         env:
-          RUST_TEST_THREADS: '4'
+          RUST_TEST_THREADS: ${{ matrix.test_threads }}
         run: cargo test --locked --release --target ${{ matrix.target }} --all-targets -- --nocapture
       - name: Check lints
         working-directory: source

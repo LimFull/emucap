@@ -3,6 +3,7 @@ use std::io::BufRead;
 use std::net::TcpListener;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
     Arc,
 };
 
@@ -34,8 +35,36 @@ impl ReconnectAuthEnv {
     }
 }
 
-fn accept_authenticated(listener: &TcpListener, port: u16) -> TcpStream {
-    let (stream, _) = listener.accept().unwrap();
+fn accept_authenticated(
+    listener: &TcpListener,
+    port: u16,
+    worker_result: Option<&Receiver<std::io::Result<()>>>,
+) -> TcpStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(worker_result) = worker_result {
+                    match worker_result.try_recv() {
+                        Ok(Ok(())) => panic!("bridge exited before the expected reconnect"),
+                        Ok(Err(error)) => panic!("bridge failed before reconnect: {error}"),
+                        Err(TryRecvError::Disconnected) => {
+                            panic!("bridge worker ended without a result")
+                        }
+                        Err(TryRecvError::Empty) => {}
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bridge did not reconnect within the test deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("bridge listener failed: {error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
     crate::live::producer_auth::authenticate_listener_stream(
         stream,
         AUTH_ROOT,
@@ -61,11 +90,13 @@ fn reconnects_front_session_without_recreating_handler_state() {
     #[cfg(unix)]
     let before = count_fds();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let _auth = ReconnectAuthEnv::new(port);
+    let (worker_result_tx, worker_result_rx) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
         let mut calls = 0u64;
-        serve_reconnecting_inner(
+        let result = serve_reconnecting_inner(
             port,
             "test-bridge",
             move |request| {
@@ -78,11 +109,15 @@ fn reconnects_front_session_without_recreating_handler_state() {
                 }
             },
             Some(SESSIONS as usize),
-        )
+        );
+        let _ = worker_result_tx.send(result);
     });
 
     for expected in 1..=SESSIONS {
-        let mut socket = accept_authenticated(&listener, port);
+        let mut socket = accept_authenticated(&listener, port, Some(&worker_result_rx));
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         socket
             .write_all(
                 format!("{{\"v\":1,\"id\":{expected},\"method\":\"status\",\"params\":{{}}}}\n")
@@ -97,7 +132,11 @@ fn reconnects_front_session_without_recreating_handler_state() {
         assert_eq!(response["result"]["calls"], expected);
         drop(socket);
     }
-    worker.join().unwrap().unwrap();
+    worker_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bridge did not finish after the bounded session count")
+        .unwrap();
+    worker.join().unwrap();
     drop(listener);
     #[cfg(unix)]
     eprintln!(
@@ -229,7 +268,7 @@ fn backend_terminal_reply_closes_front_and_exits_instead_of_reconnecting() {
         )
     });
 
-    let mut socket = accept_authenticated(&listener, port);
+    let mut socket = accept_authenticated(&listener, port, None);
     socket
         .write_all(b"{\"v\":1,\"id\":11,\"method\":\"status\",\"params\":{}}\n")
         .unwrap();
@@ -272,7 +311,7 @@ fn idle_front_is_closed_when_process_dependency_ends() {
         )
     });
 
-    let socket = accept_authenticated(&listener, port);
+    let socket = accept_authenticated(&listener, port, None);
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
