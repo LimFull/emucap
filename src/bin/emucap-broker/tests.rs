@@ -84,8 +84,11 @@ fn election_reloads_credentials_while_a_concurrent_winner_becomes_ready() {
     store
         .write_broker_controller_token(emu_port, &broker::new_session_token())
         .unwrap();
+    let first_probe = session.try_clone().unwrap();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(120));
+        let (stale, _) = first_probe.accept().unwrap();
+        drop(stale);
+        drop(first_probe);
         let current = broker::new_session_token();
         store
             .write_broker_controller_token(emu_port, &current)
