@@ -1,4 +1,6 @@
 use std::ffi::OsString;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -32,4 +34,26 @@ impl Drop for EnvGuard {
             }
         }
     }
+}
+
+/// Temporary directory whose exposed root is created with emucap's private-filesystem policy.
+pub(crate) struct PrivateTempDir {
+    _outer: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl PrivateTempDir {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub(crate) fn private_tempdir() -> io::Result<PrivateTempDir> {
+    let outer = tempfile::tempdir()?;
+    let path = outer.path().join("managed");
+    crate::private_fs::create_private_dir(&path)?;
+    Ok(PrivateTempDir {
+        _outer: outer,
+        path,
+    })
 }

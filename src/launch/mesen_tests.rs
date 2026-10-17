@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_env::{lock_env, EnvGuard};
+use crate::test_env::{lock_env, private_tempdir, EnvGuard};
 use serde_json::{json, Value};
 
 #[test]
@@ -60,13 +60,7 @@ fn read(path: &Path) -> Value {
 fn with_emu_home<T>(base: &Path, f: impl FnOnce() -> T) -> T {
     let _guard = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    #[cfg(windows)]
-    crate::private_fs::windows::privatize_dir(base).unwrap();
+    crate::private_fs::verify_private_dir(base).unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", base);
     f()
 }
@@ -127,7 +121,7 @@ fn default_install_candidates_include_windows_user_installs() {
 #[test]
 fn portable_plain_binary_writes_only_emucap_home() {
     let src = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let source_bin = src.path().join("Mesen");
     let source_settings = src.path().join("settings.json");
     std::fs::write(&source_bin, "fake mesen").unwrap();
@@ -211,7 +205,7 @@ fn build_metadata_rejects_a_binary_replaced_after_the_sidecar_was_written() {
 #[test]
 fn portable_patched_publish_copies_runtime_dependencies_and_sidecar() {
     let src = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let source_bin = src.path().join("Mesen");
     std::fs::write(&source_bin, "fake mesen").unwrap();
     std::fs::write(src.path().join("Mesen.dll"), "dependency").unwrap();
@@ -239,7 +233,7 @@ fn portable_patched_publish_copies_runtime_dependencies_and_sidecar() {
 #[test]
 fn successive_portable_generations_do_not_inherit_guest_data() {
     let src = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let source_bin = src.path().join("Mesen");
     std::fs::write(&source_bin, "fake mesen").unwrap();
     std::fs::write(src.path().join("Mesen.dll"), "runtime v1").unwrap();
@@ -282,7 +276,7 @@ fn successive_portable_generations_do_not_inherit_guest_data() {
 #[test]
 fn repeatable_portable_is_separate_from_ordinary_guest_data() {
     let src = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let source_bin = src.path().join("Mesen");
     let lua = src.path().join("emucap-snes.lua");
     let log = src.path().join("mesen.log");
@@ -377,7 +371,7 @@ fn repository_lock_rejects_sidecar_from_another_revision() {
 #[test]
 fn portable_plain_binary_refuses_symlink_inside_emucap_home() {
     let outside = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let target_bin = outside.path().join("Mesen");
     std::fs::write(&target_bin, "user mesen").unwrap();
     make_executable(&target_bin);
@@ -409,7 +403,7 @@ fn portable_plain_binary_refuses_symlink_inside_emucap_home() {
 #[test]
 fn portable_plain_binary_refuses_symlinked_parent_inside_emucap_home() {
     let outside = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let outside_portable = outside.path().join("portable-target");
     std::fs::create_dir_all(&outside_portable).unwrap();
     let target_bin = outside_portable.join("Mesen");
@@ -434,7 +428,7 @@ fn portable_plain_binary_refuses_symlinked_parent_inside_emucap_home() {
 #[test]
 fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
     let src = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let app = src.path().join("Mesen.app");
     let source_bin = app.join("Contents/MacOS/Mesen");
     let source_info = app.join("Contents/Info.plist");
@@ -524,7 +518,7 @@ fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
 #[test]
 fn portable_ports_get_distinct_bundle_identities_without_touching_source_profile() {
     let src = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
+    let emu_home = private_tempdir().unwrap();
     let app = src.path().join("Mesen.app");
     let source_bin = app.join("Contents/MacOS/Mesen");
     let source_info = app.join("Contents/Info.plist");

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_env::{lock_env, EnvGuard};
+use crate::test_env::{lock_env, private_tempdir, EnvGuard};
 
 fn output_status(backend: &str, result: &str, state: &str) -> serde_json::Value {
     serde_json::json!({
@@ -83,20 +83,6 @@ fn make_executable(path: &Path) {
     permissions.set_mode(permissions.mode() | 0o755);
     std::fs::set_permissions(path, permissions).unwrap();
 }
-
-#[cfg(unix)]
-fn make_private_root(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-}
-
-#[cfg(windows)]
-fn make_private_root(path: &Path) {
-    crate::private_fs::windows::privatize_dir(path).unwrap();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn make_private_root(_path: &Path) {}
 
 fn metadata() -> BuildMetadata {
     BuildMetadata {
@@ -188,8 +174,7 @@ fn runtime_plain_binary_is_copied_under_a_unique_manual_generation() {
     let _guard = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let source = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
-    make_private_root(emu_home.path());
+    let emu_home = private_tempdir().unwrap();
     let binary = source.path().join("dolphin-emu-nogui");
     std::fs::write(&binary, b"fake dolphin").unwrap();
     std::fs::create_dir_all(source.path().join("Sys/GC")).unwrap();
@@ -273,8 +258,7 @@ fn runtime_windows_distribution_preserves_dependencies_and_system_data() {
     let _guard = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let source = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    make_private_root(home.path());
+    let home = private_tempdir().unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", home.path());
     let files = [
         ("Dolphin.exe", "executable"),
@@ -310,8 +294,7 @@ fn runtime_app_bundle_copy_preserves_resources() {
     let _guard = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let source = tempfile::tempdir().unwrap();
-    let emu_home = tempfile::tempdir().unwrap();
-    make_private_root(emu_home.path());
+    let emu_home = private_tempdir().unwrap();
     let app = source.path().join("DolphinQt.app");
     let binary = app.join("Contents/MacOS/DolphinQt");
     let resource = app.join("Contents/Resources/qt.conf");

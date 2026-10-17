@@ -193,6 +193,18 @@ impl StateSaveGdb {
     }
 }
 
+fn write_emulator_owned_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut file = crate::private_fs::create_private_file(path)?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 impl GdbTransport for StateSaveGdb {
     fn send_with_timeout(
         &mut self,
@@ -234,7 +246,7 @@ impl GdbTransport for StateSaveGdb {
                     .map_err(|_| GdbError::Emulator("bad saveitems path utf8".into()))?,
             );
             std::fs::create_dir_all(&path)?;
-            std::fs::write(path.join("manifest.txt"), "item\n")?;
+            write_emulator_owned_file(&path.join("manifest.txt"), b"item\n")?;
             self.save_items_dir = Some(path);
             return Ok("OK|1|0".into());
         }
@@ -245,7 +257,7 @@ impl GdbTransport for StateSaveGdb {
                 String::from_utf8(bytes)
                     .map_err(|_| GdbError::Emulator("bad savepixels path utf8".into()))?,
             );
-            std::fs::write(&path, [1_u8, 2, 3, 4, 5, 6, 7, 8])?;
+            write_emulator_owned_file(&path, &[1_u8, 2, 3, 4, 5, 6, 7, 8])?;
             self.framebuffer_path = Some(path);
             return Ok("OK|2|1|8".into());
         }
