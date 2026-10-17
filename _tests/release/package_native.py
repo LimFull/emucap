@@ -448,8 +448,8 @@ def main():
             copy(original, dest)
             executable = dest / binary.relative_to(original) if original.is_dir() else dest
             # Build sidecars may sit beside a standalone executable or outside its app.
-            for parent in (binary.parent, original.parent, work, src):
-                for metadata in parent.glob('*emucap*build.json'):
+            for metadata_dir in (binary.parent, original.parent, work, src):
+                for metadata in metadata_dir.glob('*emucap*build.json'):
                     target_meta = executable.parent / metadata.name
                     if not target_meta.exists():
                         shutil.copy2(metadata, target_meta)

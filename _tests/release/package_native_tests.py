@@ -8,10 +8,39 @@ import tarfile
 import plistlib
 import sys
 import shutil
+from contextlib import ExitStack
+from unittest.mock import patch
+import package_native
 from package_native import copy_dolphin_gui, copy_pcsx2_qt_plugins, files_manifest, one, format_of, copy_library, move_app_metadata, refresh_executable_metadata, macho_dependencies, source_archive, restore_package, sha, select_outputs, linux_dependencies
 
 
 class PackageBoundaries(unittest.TestCase):
+    def test_fresh_package_has_no_reuse_parent(self):
+        with tempfile.TemporaryDirectory() as d, ExitStack() as mocks:
+            root = Path(d).resolve()
+            src, output = root / 'native', root / 'artifacts'
+            src.mkdir()
+            binary = src / 'emulator'
+            binary.write_bytes(b'native binary fixture')
+            (src / 'emucap-build.json').write_text('{}')
+            (root / 'Cargo.toml').write_text('[package]\nversion="1.1.0"\n')
+            (root / 'NOTICE').write_text('notice')
+            def archive(*args):
+                result = output / 'fixture-source.tar.gz'
+                result.write_bytes(b'source fixture')
+                return result
+            mocks.enter_context(patch.object(sys, 'argv', ['package_native', '--source', str(root),
+                '--adapter', 'np2kai', '--platform', 'linux', '--output', str(output)]))
+            mocks.enter_context(patch.object(package_native, 'select_outputs', return_value=(src, src, binary, binary)))
+            mocks.enter_context(patch.object(package_native, 'run', return_value='a' * 40))
+            mocks.enter_context(patch.object(package_native, 'linux_dependencies', return_value=[]))
+            mocks.enter_context(patch.object(package_native, 'refresh_executable_metadata'))
+            mocks.enter_context(patch.object(package_native, 'source_archive', side_effect=archive))
+            record = mocks.enter_context(patch('native_provenance.create_record'))
+            package_native.main()
+            self.assertEqual(record.call_args.kwargs['parents'], [])
+            self.assertTrue(list(output.glob('emucap-*.tar.gz')))
+
     def test_dolphin_gui_materializes_verified_source_license_links(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d).resolve()
