@@ -476,6 +476,32 @@ fn fixture(display: bool) -> (OpenMsxBridge<FakeControl>, Arc<Mutex<Vec<String>>
     fixture_with_failure(display, None)
 }
 
+fn new_test_bridge(
+    control: FakeControl,
+    session: &PreparedSession,
+    runtime_home: &Path,
+    display: bool,
+    sound: bool,
+) -> OpenMsxBridge<FakeControl> {
+    try_new_test_bridge(control, session, runtime_home, display, sound).unwrap()
+}
+
+fn try_new_test_bridge(
+    control: FakeControl,
+    session: &PreparedSession,
+    runtime_home: &Path,
+    display: bool,
+    sound: bool,
+) -> Result<OpenMsxBridge<FakeControl>, OpenMsxBridgeError> {
+    let _env_lock = crate::test_env::lock_env();
+    let _env =
+        crate::test_env::EnvGuard::new(&["EMUCAP_FAILURE_FILE", "EMUCAP_NAME", "EMUCAP_LAUNCH_ID"]);
+    for key in ["EMUCAP_FAILURE_FILE", "EMUCAP_NAME", "EMUCAP_LAUNCH_ID"] {
+        std::env::remove_var(key);
+    }
+    OpenMsxBridge::new(control, session, runtime_home, display, sound)
+}
+
 #[cfg_attr(windows, allow(clippy::permissions_set_readonly_false))]
 fn reinterpret_fixture_as_writable_disk(bridge: &mut OpenMsxBridge<FakeControl>) {
     bridge.session.media.kind = MediaKind::Disk;
@@ -513,8 +539,7 @@ fn fixture_with_failure(
         fail_once,
         prepared.session.media.mounted_path.clone(),
     );
-    let bridge =
-        OpenMsxBridge::new(control, &prepared.session, temp.path(), display, false).unwrap();
+    let bridge = new_test_bridge(control, &prepared.session, temp.path(), display, false);
     (bridge, commands, temp)
 }
 
@@ -1515,7 +1540,7 @@ fn launch_audio_is_independent_of_display_and_read_back_from_native() {
                 bridge.session.media.mounted_path.clone(),
             );
             let mut initialized =
-                OpenMsxBridge::new(control, &bridge.session, temp.path(), display, sound).unwrap();
+                new_test_bridge(control, &bridge.session, temp.path(), display, sound);
             assert_eq!(
                 initialized.status().unwrap()["diagnostics"]["audio_muted"],
                 !sound
@@ -1534,11 +1559,11 @@ fn launch_rejects_acknowledged_but_unapplied_audio_policy() {
     let (bridge, _, temp) = fixture(false);
     let mut control = bridge.control;
     control.ignore_mute_write = true;
-    let initialized = OpenMsxBridge::new(control, &bridge.session, temp.path(), false, true);
-    assert!(
-        matches!(initialized, Err(OpenMsxBridgeError::Emulator(message))
-        if message.contains("did not apply"))
-    );
+    let initialized = try_new_test_bridge(control, &bridge.session, temp.path(), false, true);
+    assert!(matches!(
+        initialized,
+        Err(OpenMsxBridgeError::Emulator(message)) if message.contains("did not apply")
+    ));
 }
 
 #[test]
