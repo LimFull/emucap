@@ -245,7 +245,7 @@ impl TungsteniteWs {
         {
             let result = self.socket.read();
             self.socket.get_mut().deadline = exchange_deadline;
-            return result;
+            result
         }
         #[cfg(not(windows))]
         {

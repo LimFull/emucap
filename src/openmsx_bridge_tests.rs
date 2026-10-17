@@ -476,6 +476,7 @@ fn fixture(display: bool) -> (OpenMsxBridge<FakeControl>, Arc<Mutex<Vec<String>>
     fixture_with_failure(display, None)
 }
 
+#[cfg_attr(windows, allow(clippy::permissions_set_readonly_false))]
 fn reinterpret_fixture_as_writable_disk(bridge: &mut OpenMsxBridge<FakeControl>) {
     bridge.session.media.kind = MediaKind::Disk;
     let mut permissions = fs::metadata(&bridge.session.media.mounted_path)
