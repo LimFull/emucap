@@ -72,7 +72,7 @@ native emulator changes are needed for control and observation.
 
 ## Project status
 
-**1.0.0 is available.** [COMPATIBILITY.md](COMPATIBILITY.md) defines
+**A stable 1.x release is available.** [COMPATIBILITY.md](COMPATIBILITY.md) defines
 the 1.x compatibility commitments; [CHANGELOG.md](CHANGELOG.md) records changes.
 
 The core and otherwise unmarked source are **GPL-2.0-or-later**. Emulator patches

@@ -4,6 +4,8 @@ Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Unreleased
 
+## 1.1.0
+
 ### Added
 - Add N64 analog-stick input and exact `input_polls` stepping/tap timing through the existing
   `step` and `tap` tools.
