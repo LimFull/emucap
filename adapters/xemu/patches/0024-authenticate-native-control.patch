@@ -1,0 +1,1065 @@
+diff --git i/chardev/char-socket.c w/chardev/char-socket.c
+index 26d2f11..7cb30c4 100644
+--- i/chardev/char-socket.c
++++ w/chardev/char-socket.c
+@@ -33,6 +33,9 @@
+ #include "qapi/clone-visitor.h"
+ #include "qapi/qapi-visit-sockets.h"
+ #include "qemu/yank.h"
++#include "crypto/hmac.h"
++#include "crypto/random.h"
++#include "qemu/bswap.h"
+ #include "trace.h"
+ 
+ #include "chardev/char-io.h"
+@@ -40,6 +43,597 @@
+ 
+ static gboolean socket_reconnect_timeout(gpointer opaque);
+ static void tcp_chr_telnet_init(Chardev *chr);
++static void tcp_chr_change_state(SocketChardev *s, TCPChardevState state);
++static void tcp_chr_set_listener_handler(Chardev *chr);
++static int tcp_chr_new_client(Chardev *chr, QIOChannelSocket *sioc);
++static void tcp_chr_set_client_ioc_name(Chardev *chr,
++                                        QIOChannelSocket *sioc);
++static void char_socket_yank_iochannel(void *opaque);
++static bool emucap_socket_auth_init(SocketChardev *s,
++                                    ChardevSocket *sock,
++                                    Error **errp);
++static void emucap_socket_auth_cleanup(SocketChardev *s);
++
++#define EMUCAP_AUTH_MAX_CANDIDATES 8
++#define EMUCAP_AUTH_ACCEPTS_PER_TURN 2
++#define EMUCAP_AUTH_TIMEOUT_MS 5000
++#define EMUCAP_AUTH_MAGIC "ECXA"
++#define EMUCAP_AUTH_HEADER_SIZE 7
++#define EMUCAP_AUTH_NONCE_SIZE 16
++#define EMUCAP_AUTH_PROOF_SIZE 32
++#define EMUCAP_AUTH_TOKEN_MAX 256
++#define EMUCAP_AUTH_CLIENT_HELLO_SIZE \
++    (EMUCAP_AUTH_HEADER_SIZE + EMUCAP_AUTH_NONCE_SIZE)
++#define EMUCAP_AUTH_SERVER_PROOF_SIZE \
++    (EMUCAP_AUTH_HEADER_SIZE + EMUCAP_AUTH_NONCE_SIZE + \
++     EMUCAP_AUTH_PROOF_SIZE)
++#define EMUCAP_AUTH_CLIENT_PROOF_SIZE \
++    (EMUCAP_AUTH_HEADER_SIZE + EMUCAP_AUTH_PROOF_SIZE)
++#define EMUCAP_AUTH_SERVER_OK_SIZE EMUCAP_AUTH_HEADER_SIZE
++
++typedef enum EmucapAuthPhase {
++    EMUCAP_AUTH_AWAIT_HELLO,
++    EMUCAP_AUTH_WRITE_SERVER_PROOF,
++    EMUCAP_AUTH_AWAIT_CLIENT_PROOF,
++    EMUCAP_AUTH_WRITE_SERVER_OK,
++} EmucapAuthPhase;
++
++typedef struct EmucapAuthCandidate EmucapAuthCandidate;
++
++struct EmucapSocketAuth {
++    SocketChardev *socket;
++    char *token;
++    const char *domain;
++    uint8_t endpoint;
++    GPtrArray *candidates;
++    uint64_t next_serial;
++    unsigned int accepts_this_turn;
++    GSource *accept_resume_source;
++};
++
++struct EmucapAuthCandidate {
++    EmucapSocketAuth *auth;
++    QIOChannelSocket *sioc;
++    GSource *io_source;
++    GSource *timeout_source;
++    int64_t deadline_us;
++    uint64_t serial;
++    EmucapAuthPhase phase;
++    bool verified;
++    uint8_t input[EMUCAP_AUTH_CLIENT_PROOF_SIZE];
++    size_t input_offset;
++    size_t input_size;
++    uint8_t output[EMUCAP_AUTH_SERVER_PROOF_SIZE];
++    size_t output_offset;
++    size_t output_size;
++    uint8_t client_nonce[EMUCAP_AUTH_NONCE_SIZE];
++    uint8_t server_nonce[EMUCAP_AUTH_NONCE_SIZE];
++};
++
++static void emucap_auth_accept(QIONetListener *listener,
++                               QIOChannelSocket *cioc,
++                               void *opaque);
++
++static void emucap_auth_header(uint8_t *header,
++                               uint8_t type,
++                               uint8_t endpoint)
++{
++    memcpy(header, EMUCAP_AUTH_MAGIC, 4);
++    header[4] = 1;
++    header[5] = type;
++    header[6] = endpoint;
++}
++
++static bool emucap_auth_header_matches(const uint8_t *header,
++                                       uint8_t type,
++                                       uint8_t endpoint)
++{
++    uint8_t expected[EMUCAP_AUTH_HEADER_SIZE];
++
++    emucap_auth_header(expected, type, endpoint);
++    return memcmp(header, expected, sizeof(expected)) == 0;
++}
++
++static bool emucap_auth_constant_time_equal(const uint8_t *left,
++                                            const uint8_t *right,
++                                            size_t size)
++{
++    uint8_t difference = 0;
++    size_t i;
++
++    for (i = 0; i < size; i++) {
++        difference |= left[i] ^ right[i];
++    }
++    return difference == 0;
++}
++
++static bool emucap_auth_proof(EmucapSocketAuth *auth,
++                              const char *direction,
++                              const uint8_t *client_nonce,
++                              const uint8_t *server_nonce,
++                              uint8_t proof[EMUCAP_AUTH_PROOF_SIZE])
++{
++    const uint8_t *fields[] = {
++        (const uint8_t *)auth->domain,
++        (const uint8_t *)direction,
++        client_nonce,
++        server_nonce,
++    };
++    size_t sizes[] = {
++        strlen(auth->domain),
++        strlen(direction),
++        EMUCAP_AUTH_NONCE_SIZE,
++        EMUCAP_AUTH_NONCE_SIZE,
++    };
++    uint64_t lengths[G_N_ELEMENTS(fields)];
++    struct iovec iov[G_N_ELEMENTS(fields) * 2];
++    g_autoptr(QCryptoHmac) hmac = NULL;
++    uint8_t *result = proof;
++    size_t result_size = EMUCAP_AUTH_PROOF_SIZE;
++    Error *error = NULL;
++    size_t i;
++
++    hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256,
++                            (const uint8_t *)auth->token,
++                            strlen(auth->token), &error);
++    if (!hmac) {
++        error_free(error);
++        return false;
++    }
++    for (i = 0; i < G_N_ELEMENTS(fields); i++) {
++        lengths[i] = cpu_to_be64(sizes[i]);
++        iov[i * 2].iov_base = &lengths[i];
++        iov[i * 2].iov_len = sizeof(lengths[i]);
++        iov[i * 2 + 1].iov_base = (void *)fields[i];
++        iov[i * 2 + 1].iov_len = sizes[i];
++    }
++    if (qcrypto_hmac_bytesv(hmac, iov, G_N_ELEMENTS(iov),
++                            &result, &result_size, &error) < 0) {
++        error_free(error);
++        return false;
++    }
++    return result == proof && result_size == EMUCAP_AUTH_PROOF_SIZE;
++}
++
++static void emucap_auth_clear_source(GSource **source)
++{
++    if (*source) {
++        g_source_destroy(*source);
++        g_source_unref(*source);
++        *source = NULL;
++    }
++}
++
++static void emucap_auth_candidate_destroy(EmucapAuthCandidate *candidate,
++                                          bool close_channel)
++{
++    emucap_auth_clear_source(&candidate->io_source);
++    emucap_auth_clear_source(&candidate->timeout_source);
++    if (candidate->sioc) {
++        if (close_channel) {
++            qio_channel_shutdown(QIO_CHANNEL(candidate->sioc),
++                                 QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
++            qio_channel_close(QIO_CHANNEL(candidate->sioc), NULL);
++        }
++        object_unref(OBJECT(candidate->sioc));
++    }
++    g_free(candidate);
++}
++
++static void emucap_auth_remove_candidate(EmucapAuthCandidate *candidate,
++                                         bool close_channel)
++{
++    EmucapSocketAuth *auth = candidate->auth;
++    size_t i;
++
++    for (i = 0; i < auth->candidates->len; i++) {
++        if (g_ptr_array_index(auth->candidates, i) == candidate) {
++            g_ptr_array_remove_index(auth->candidates, i);
++            break;
++        }
++    }
++    emucap_auth_candidate_destroy(candidate, close_channel);
++}
++
++static gboolean emucap_auth_candidate_timeout(gpointer opaque)
++{
++    EmucapAuthCandidate *candidate = opaque;
++    GSource *source = candidate->timeout_source;
++
++    candidate->timeout_source = NULL;
++    g_source_unref(source);
++    emucap_auth_remove_candidate(candidate, true);
++    return G_SOURCE_REMOVE;
++}
++
++static void emucap_auth_arm_candidate(EmucapAuthCandidate *candidate,
++                                      GIOCondition condition);
++
++static bool emucap_auth_prepare_server_proof(EmucapAuthCandidate *candidate)
++{
++    uint8_t *proof;
++    Error *error = NULL;
++
++    if (!emucap_auth_header_matches(candidate->input, 1,
++                                    candidate->auth->endpoint)) {
++        return false;
++    }
++    memcpy(candidate->client_nonce,
++           candidate->input + EMUCAP_AUTH_HEADER_SIZE,
++           EMUCAP_AUTH_NONCE_SIZE);
++    if (qcrypto_random_bytes(candidate->server_nonce,
++                             sizeof(candidate->server_nonce), &error) < 0) {
++        error_free(error);
++        return false;
++    }
++    emucap_auth_header(candidate->output, 2, candidate->auth->endpoint);
++    memcpy(candidate->output + EMUCAP_AUTH_HEADER_SIZE,
++           candidate->server_nonce, EMUCAP_AUTH_NONCE_SIZE);
++    proof = candidate->output + EMUCAP_AUTH_HEADER_SIZE +
++            EMUCAP_AUTH_NONCE_SIZE;
++    if (!emucap_auth_proof(candidate->auth, "server",
++                           candidate->client_nonce,
++                           candidate->server_nonce, proof)) {
++        return false;
++    }
++    candidate->output_offset = 0;
++    candidate->output_size = EMUCAP_AUTH_SERVER_PROOF_SIZE;
++    candidate->phase = EMUCAP_AUTH_WRITE_SERVER_PROOF;
++    return true;
++}
++
++static bool emucap_auth_validate_client_proof(EmucapAuthCandidate *candidate)
++{
++    uint8_t expected[EMUCAP_AUTH_PROOF_SIZE];
++
++    if (!emucap_auth_header_matches(candidate->input, 3,
++                                    candidate->auth->endpoint) ||
++        !emucap_auth_proof(candidate->auth, "client",
++                           candidate->client_nonce,
++                           candidate->server_nonce, expected) ||
++        !emucap_auth_constant_time_equal(
++            expected, candidate->input + EMUCAP_AUTH_HEADER_SIZE,
++            sizeof(expected))) {
++        return false;
++    }
++    emucap_auth_header(candidate->output, 4, candidate->auth->endpoint);
++    candidate->output_offset = 0;
++    candidate->output_size = EMUCAP_AUTH_SERVER_OK_SIZE;
++    candidate->phase = EMUCAP_AUTH_WRITE_SERVER_OK;
++    candidate->verified = true;
++    return true;
++}
++
++static void emucap_auth_close_other_candidates(
++    EmucapAuthCandidate *selected)
++{
++    EmucapSocketAuth *auth = selected->auth;
++    size_t i = auth->candidates->len;
++
++    while (i > 0) {
++        EmucapAuthCandidate *candidate =
++            g_ptr_array_index(auth->candidates, --i);
++        if (candidate != selected) {
++            emucap_auth_remove_candidate(candidate, true);
++        }
++    }
++}
++
++static void emucap_auth_cancel_accept_resume(EmucapSocketAuth *auth)
++{
++    emucap_auth_clear_source(&auth->accept_resume_source);
++    auth->accepts_this_turn = 0;
++}
++
++static void emucap_auth_promote(EmucapAuthCandidate *candidate)
++{
++    EmucapSocketAuth *auth = candidate->auth;
++    SocketChardev *s = auth->socket;
++    Chardev *chr = CHARDEV(s);
++    QIOChannelSocket *sioc = candidate->sioc;
++    size_t i;
++
++    assert(candidate->verified);
++    assert(candidate->output_offset == candidate->output_size);
++    emucap_auth_close_other_candidates(candidate);
++    for (i = 0; i < auth->candidates->len; i++) {
++        if (g_ptr_array_index(auth->candidates, i) == candidate) {
++            g_ptr_array_remove_index(auth->candidates, i);
++            break;
++        }
++    }
++    emucap_auth_clear_source(&candidate->io_source);
++    emucap_auth_clear_source(&candidate->timeout_source);
++    candidate->sioc = NULL;
++    g_free(candidate);
++
++    emucap_auth_cancel_accept_resume(auth);
++    qio_net_listener_set_client_func_full(s->listener, NULL, NULL,
++                                          NULL, chr->gcontext);
++    tcp_chr_change_state(s, TCP_CHARDEV_STATE_CONNECTING);
++    tcp_chr_set_client_ioc_name(chr, sioc);
++    if (s->registered_yank) {
++        yank_register_function(CHARDEV_YANK_INSTANCE(chr->label),
++                               char_socket_yank_iochannel,
++                               QIO_CHANNEL(sioc));
++    }
++    if (tcp_chr_new_client(chr, sioc) < 0) {
++        if (s->registered_yank) {
++            yank_unregister_function(CHARDEV_YANK_INSTANCE(chr->label),
++                                     char_socket_yank_iochannel,
++                                     QIO_CHANNEL(sioc));
++        }
++        tcp_chr_change_state(s, TCP_CHARDEV_STATE_DISCONNECTED);
++        qio_channel_shutdown(QIO_CHANNEL(sioc),
++                             QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
++        qio_channel_close(QIO_CHANNEL(sioc), NULL);
++        tcp_chr_set_listener_handler(chr);
++    }
++    object_unref(OBJECT(sioc));
++}
++
++static gboolean emucap_auth_candidate_io(QIOChannel *ioc,
++                                         GIOCondition condition,
++                                         gpointer opaque)
++{
++    EmucapAuthCandidate *candidate = opaque;
++    GSource *source = candidate->io_source;
++    Error *error = NULL;
++    ssize_t result;
++
++    candidate->io_source = NULL;
++    g_source_unref(source);
++    if (g_get_monotonic_time() >= candidate->deadline_us) {
++        emucap_auth_remove_candidate(candidate, true);
++        return G_SOURCE_REMOVE;
++    }
++    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
++        emucap_auth_remove_candidate(candidate, true);
++        return G_SOURCE_REMOVE;
++    }
++
++    if (candidate->phase == EMUCAP_AUTH_AWAIT_HELLO ||
++        candidate->phase == EMUCAP_AUTH_AWAIT_CLIENT_PROOF) {
++        result = qio_channel_read(ioc,
++                                  candidate->input + candidate->input_offset,
++                                  candidate->input_size -
++                                  candidate->input_offset, &error);
++        if (result == QIO_CHANNEL_ERR_BLOCK) {
++            error_free(error);
++            emucap_auth_arm_candidate(candidate, G_IO_IN);
++            return G_SOURCE_REMOVE;
++        }
++        if (result <= 0) {
++            error_free(error);
++            emucap_auth_remove_candidate(candidate, true);
++            return G_SOURCE_REMOVE;
++        }
++        candidate->input_offset += result;
++        if (candidate->input_offset != candidate->input_size) {
++            emucap_auth_arm_candidate(candidate, G_IO_IN);
++            return G_SOURCE_REMOVE;
++        }
++        if ((candidate->phase == EMUCAP_AUTH_AWAIT_HELLO &&
++             !emucap_auth_prepare_server_proof(candidate)) ||
++            (candidate->phase == EMUCAP_AUTH_AWAIT_CLIENT_PROOF &&
++             !emucap_auth_validate_client_proof(candidate))) {
++            emucap_auth_remove_candidate(candidate, true);
++            return G_SOURCE_REMOVE;
++        }
++        emucap_auth_arm_candidate(candidate, G_IO_OUT);
++        return G_SOURCE_REMOVE;
++    }
++
++    result = qio_channel_write(ioc,
++                               candidate->output + candidate->output_offset,
++                               candidate->output_size -
++                               candidate->output_offset, &error);
++    if (result == QIO_CHANNEL_ERR_BLOCK) {
++        error_free(error);
++        emucap_auth_arm_candidate(candidate, G_IO_OUT);
++        return G_SOURCE_REMOVE;
++    }
++    if (result <= 0) {
++        error_free(error);
++        emucap_auth_remove_candidate(candidate, true);
++        return G_SOURCE_REMOVE;
++    }
++    candidate->output_offset += result;
++    if (candidate->output_offset != candidate->output_size) {
++        emucap_auth_arm_candidate(candidate, G_IO_OUT);
++        return G_SOURCE_REMOVE;
++    }
++    if (candidate->phase == EMUCAP_AUTH_WRITE_SERVER_OK) {
++        emucap_auth_promote(candidate);
++        return G_SOURCE_REMOVE;
++    }
++
++    candidate->phase = EMUCAP_AUTH_AWAIT_CLIENT_PROOF;
++    candidate->input_offset = 0;
++    candidate->input_size = EMUCAP_AUTH_CLIENT_PROOF_SIZE;
++    emucap_auth_arm_candidate(candidate, G_IO_IN);
++    return G_SOURCE_REMOVE;
++}
++
++static void emucap_auth_arm_candidate(EmucapAuthCandidate *candidate,
++                                      GIOCondition condition)
++{
++    Chardev *chr = CHARDEV(candidate->auth->socket);
++
++    assert(candidate->io_source == NULL);
++    candidate->io_source = qio_channel_create_watch(
++        QIO_CHANNEL(candidate->sioc),
++        condition | G_IO_HUP | G_IO_ERR | G_IO_NVAL);
++    g_source_set_priority(candidate->io_source, G_PRIORITY_DEFAULT - 10);
++    g_source_set_callback(candidate->io_source,
++                          (GSourceFunc)emucap_auth_candidate_io,
++                          candidate, NULL);
++    g_source_attach(candidate->io_source, chr->gcontext);
++}
++
++static gboolean emucap_auth_resume_accepts(gpointer opaque)
++{
++    EmucapSocketAuth *auth = opaque;
++    GSource *source = auth->accept_resume_source;
++
++    auth->accept_resume_source = NULL;
++    g_source_unref(source);
++    auth->accepts_this_turn = 0;
++    if (auth->socket->listener &&
++        auth->socket->state == TCP_CHARDEV_STATE_DISCONNECTED) {
++        tcp_chr_set_listener_handler(CHARDEV(auth->socket));
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void emucap_auth_pause_accepts(EmucapSocketAuth *auth)
++{
++    Chardev *chr = CHARDEV(auth->socket);
++
++    if (auth->accept_resume_source) {
++        return;
++    }
++    qio_net_listener_set_client_func_full(auth->socket->listener,
++                                          NULL, NULL, NULL,
++                                          chr->gcontext);
++    auth->accept_resume_source = g_idle_source_new();
++    g_source_set_priority(auth->accept_resume_source,
++                          G_PRIORITY_DEFAULT_IDLE);
++    g_source_set_callback(auth->accept_resume_source,
++                          emucap_auth_resume_accepts, auth, NULL);
++    g_source_attach(auth->accept_resume_source, chr->gcontext);
++}
++
++static EmucapAuthCandidate *emucap_auth_oldest_unverified(
++    EmucapSocketAuth *auth)
++{
++    EmucapAuthCandidate *oldest = NULL;
++    size_t i;
++
++    for (i = 0; i < auth->candidates->len; i++) {
++        EmucapAuthCandidate *candidate =
++            g_ptr_array_index(auth->candidates, i);
++        if (!candidate->verified &&
++            (!oldest || candidate->serial < oldest->serial)) {
++            oldest = candidate;
++        }
++    }
++    return oldest;
++}
++
++static void emucap_auth_accept(QIONetListener *listener,
++                               QIOChannelSocket *cioc,
++                               void *opaque)
++{
++    Chardev *chr = CHARDEV(opaque);
++    SocketChardev *s = SOCKET_CHARDEV(chr);
++    EmucapSocketAuth *auth = s->emucap_auth;
++    EmucapAuthCandidate *candidate;
++    Error *error = NULL;
++
++    assert(auth);
++    assert(s->state == TCP_CHARDEV_STATE_DISCONNECTED);
++    if (auth->candidates->len == EMUCAP_AUTH_MAX_CANDIDATES) {
++        EmucapAuthCandidate *oldest =
++            emucap_auth_oldest_unverified(auth);
++        if (!oldest) {
++            qio_channel_shutdown(QIO_CHANNEL(cioc),
++                                 QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
++            return;
++        }
++        emucap_auth_remove_candidate(oldest, true);
++    }
++    if (!qio_channel_set_blocking(QIO_CHANNEL(cioc), false, &error)) {
++        error_free(error);
++        qio_channel_shutdown(QIO_CHANNEL(cioc),
++                             QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
++        return;
++    }
++    if (s->do_nodelay) {
++        qio_channel_set_delay(QIO_CHANNEL(cioc), false);
++    }
++    tcp_chr_set_client_ioc_name(chr, cioc);
++    candidate = g_new0(EmucapAuthCandidate, 1);
++    candidate->auth = auth;
++    candidate->sioc = cioc;
++    object_ref(OBJECT(cioc));
++    candidate->serial = auth->next_serial++;
++    candidate->deadline_us = g_get_monotonic_time() +
++                             EMUCAP_AUTH_TIMEOUT_MS * 1000;
++    candidate->phase = EMUCAP_AUTH_AWAIT_HELLO;
++    candidate->input_size = EMUCAP_AUTH_CLIENT_HELLO_SIZE;
++    g_ptr_array_add(auth->candidates, candidate);
++
++    candidate->timeout_source =
++        g_timeout_source_new(EMUCAP_AUTH_TIMEOUT_MS);
++    g_source_set_callback(candidate->timeout_source,
++                          emucap_auth_candidate_timeout,
++                          candidate, NULL);
++    g_source_attach(candidate->timeout_source, chr->gcontext);
++    emucap_auth_arm_candidate(candidate, G_IO_IN);
++
++    auth->accepts_this_turn++;
++    if (auth->accepts_this_turn >= EMUCAP_AUTH_ACCEPTS_PER_TURN) {
++        emucap_auth_pause_accepts(auth);
++    }
++}
++
++static bool emucap_socket_auth_init(SocketChardev *s,
++                                    ChardevSocket *sock,
++                                    Error **errp)
++{
++    EmucapSocketAuth *auth;
++    const char *token;
++    size_t token_size;
++
++    if (!sock->emucap_auth) {
++        return true;
++    }
++    token = g_getenv("EMUCAP_NATIVE_DEBUG_TOKEN");
++    token_size = token ? strlen(token) : 0;
++    if (token_size == 0 || token_size > EMUCAP_AUTH_TOKEN_MAX) {
++        error_setg(errp,
++                   "EMUCAP_NATIVE_DEBUG_TOKEN must contain 1..256 bytes");
++        return false;
++    }
++    if (!qcrypto_hmac_supports(QCRYPTO_HASH_ALGO_SHA256)) {
++        error_setg(errp, "SHA-256 HMAC is unavailable for emucap authentication");
++        return false;
++    }
++    auth = g_new0(EmucapSocketAuth, 1);
++    auth->socket = s;
++    auth->token = g_strdup(token);
++    auth->candidates = g_ptr_array_new();
++    if (strcmp(sock->emucap_auth, "xemu-qmp-v1") == 0) {
++        auth->domain = "emucap-xemu-qmp-auth-v1";
++        auth->endpoint = 1;
++    } else {
++        auth->domain = "emucap-xemu-gdb-auth-v1";
++        auth->endpoint = 2;
++    }
++    s->emucap_auth = auth;
++    return true;
++}
++
++static void emucap_socket_auth_cleanup(SocketChardev *s)
++{
++    EmucapSocketAuth *auth = s->emucap_auth;
++
++    if (!auth) {
++        return;
++    }
++    emucap_auth_cancel_accept_resume(auth);
++    while (auth->candidates->len > 0) {
++        EmucapAuthCandidate *candidate =
++            g_ptr_array_index(auth->candidates,
++                              auth->candidates->len - 1);
++        emucap_auth_remove_candidate(candidate, true);
++    }
++    g_ptr_array_free(auth->candidates, true);
++    g_free(auth->token);
++    g_free(auth);
++    s->emucap_auth = NULL;
++}
+ 
+ static void tcp_chr_change_state(SocketChardev *s, TCPChardevState state)
+ {
+@@ -101,6 +695,19 @@ static void tcp_chr_accept(QIONetListener *listener,
+                            QIOChannelSocket *cioc,
+                            void *opaque);
+ 
++static void tcp_chr_set_listener_handler(Chardev *chr)
++{
++    SocketChardev *s = SOCKET_CHARDEV(chr);
++
++    if (!s->listener || s->state != TCP_CHARDEV_STATE_DISCONNECTED) {
++        return;
++    }
++    qio_net_listener_set_client_func_full(
++        s->listener,
++        s->emucap_auth ? emucap_auth_accept : tcp_chr_accept,
++        chr, NULL, chr->gcontext);
++}
++
+ static int tcp_chr_read_poll(void *opaque);
+ static void tcp_chr_disconnect_locked(Chardev *chr);
+ 
+@@ -465,8 +1072,7 @@ static void tcp_chr_disconnect_locked(Chardev *chr)
+     tcp_chr_free_connection(chr);
+ 
+     if (s->listener) {
+-        qio_net_listener_set_client_func_full(s->listener, tcp_chr_accept,
+-                                              chr, NULL, chr->gcontext);
++        tcp_chr_set_listener_handler(chr);
+     }
+     update_disconnected_filename(s);
+     if (emit_close) {
+@@ -666,8 +1272,7 @@ static void tcp_chr_update_read_handler(Chardev *chr)
+          * qemu_chr_be_update_read_handlers().  Reset it for QIO net
+          * listener if there is.
+          */
+-        qio_net_listener_set_client_func_full(s->listener, tcp_chr_accept,
+-                                              chr, NULL, chr->gcontext);
++        tcp_chr_set_listener_handler(chr);
+     }
+ 
+     if (s->telnet_source) {
+@@ -936,7 +1541,7 @@ static int tcp_chr_add_client(Chardev *chr, int fd)
+     QIOChannelSocket *sioc;
+     SocketChardev *s = SOCKET_CHARDEV(chr);
+ 
+-    if (s->state != TCP_CHARDEV_STATE_DISCONNECTED) {
++    if (s->state != TCP_CHARDEV_STATE_DISCONNECTED || s->emucap_auth) {
+         return -1;
+     }
+ 
+@@ -1022,6 +1627,12 @@ static int tcp_chr_wait_connected(Chardev *chr, Error **errp)
+     bool optset[] = { s->is_telnet, s->is_tn3270, s->is_websock, s->tls_creds };
+     size_t i;
+ 
++    if (s->emucap_auth) {
++        error_setg(errp,
++                   "synchronous wait is unavailable on an authenticated socket");
++        return -1;
++    }
++
+     QEMU_BUILD_BUG_ON(G_N_ELEMENTS(opts) != G_N_ELEMENTS(optset));
+     for (i = 0; i < G_N_ELEMENTS(opts); i++) {
+         if (optset[i]) {
+@@ -1106,14 +1717,17 @@ static void char_socket_finalize(Object *obj)
+     Chardev *chr = CHARDEV(obj);
+     SocketChardev *s = SOCKET_CHARDEV(obj);
+ 
++    if (s->listener) {
++        qio_net_listener_set_client_func_full(s->listener, NULL, NULL,
++                                              NULL, chr->gcontext);
++    }
++    emucap_socket_auth_cleanup(s);
+     tcp_chr_free_connection(chr);
+     tcp_chr_reconn_timer_cancel(s);
+     qapi_free_SocketAddress(s->addr);
+     tcp_chr_telnet_destroy(s);
+     g_free(s->telnet_init);
+     if (s->listener) {
+-        qio_net_listener_set_client_func_full(s->listener, NULL, NULL,
+-                                              NULL, chr->gcontext);
+         object_unref(OBJECT(s->listener));
+         s->listener = NULL;
+     }
+@@ -1248,7 +1862,10 @@ static int qmp_chardev_open_socket_server(Chardev *chr,
+         goto skip_listen;
+     }
+ 
+-    if (qio_net_listener_open_sync(s->listener, s->addr, 1, errp) < 0) {
++    if (qio_net_listener_open_sync(s->listener, s->addr,
++                                   s->emucap_auth ?
++                                   EMUCAP_AUTH_MAX_CANDIDATES : 1,
++                                   errp) < 0) {
+         object_unref(OBJECT(s->listener));
+         s->listener = NULL;
+         return -1;
+@@ -1263,10 +1880,7 @@ skip_listen:
+     if (is_waitconnect) {
+         tcp_chr_accept_server_sync(chr);
+     } else {
+-        qio_net_listener_set_client_func_full(s->listener,
+-                                              tcp_chr_accept,
+-                                              chr, NULL,
+-                                              chr->gcontext);
++        tcp_chr_set_listener_handler(chr);
+     }
+ 
+     return 0;
+@@ -1340,6 +1954,25 @@ static bool qmp_chardev_validate_socket(ChardevSocket *sock,
+         return false;
+     }
+ 
++    if (sock->emucap_auth) {
++        if (addr->type != SOCKET_ADDRESS_TYPE_INET ||
++            !sock->has_server || !sock->server ||
++            (sock->has_wait && sock->wait) ||
++            sock->tls_creds ||
++            (sock->has_telnet && sock->telnet) ||
++            (sock->has_tn3270 && sock->tn3270) ||
++            (sock->has_websocket && sock->websocket)) {
++            error_setg(errp,
++                       "'emucap-auth' requires a raw non-waiting TCP server socket");
++            return false;
++        }
++        if (strcmp(sock->emucap_auth, "xemu-qmp-v1") != 0 &&
++            strcmp(sock->emucap_auth, "xemu-gdb-v1") != 0) {
++            error_setg(errp, "unknown emucap socket authentication domain");
++            return false;
++        }
++    }
++
+     /* Validate any options which have a dependency on client vs server */
+     if (!sock->has_server || sock->server) {
+         if (sock->has_reconnect_ms) {
+@@ -1419,6 +2052,9 @@ static void qmp_chardev_open_socket(Chardev *chr,
+     if (!qmp_chardev_validate_socket(sock, addr, errp)) {
+         return;
+     }
++    if (!emucap_socket_auth_init(s, sock, errp)) {
++        return;
++    }
+ 
+     qemu_chr_set_feature(chr, QEMU_CHAR_FEATURE_RECONNECTABLE);
+ #ifndef _WIN32
+@@ -1519,6 +2155,7 @@ static void qemu_chr_parse_socket(QemuOpts *opts, ChardevBackend *backend,
+ 
+     sock->tls_creds = g_strdup(qemu_opt_get(opts, "tls-creds"));
+     sock->tls_authz = g_strdup(qemu_opt_get(opts, "tls-authz"));
++    sock->emucap_auth = g_strdup(qemu_opt_get(opts, "emucap-auth"));
+ 
+     addr = g_new0(SocketAddressLegacy, 1);
+     if (path) {
+diff --git i/chardev/char.c w/chardev/char.c
+index a9d63f2..efe683d 100644
+--- i/chardev/char.c
++++ w/chardev/char.c
+@@ -930,6 +930,9 @@ QemuOptsList qemu_chardev_opts = {
+         },{
+             .name = "websocket",
+             .type = QEMU_OPT_BOOL,
++        },{
++            .name = "emucap-auth",
++            .type = QEMU_OPT_STRING,
+         },{
+             .name = "width",
+             .type = QEMU_OPT_NUMBER,
+diff --git i/include/chardev/char-socket.h w/include/chardev/char-socket.h
+index d6d13ad..9cc123e 100644
+--- i/include/chardev/char-socket.h
++++ w/include/chardev/char-socket.h
+@@ -45,6 +45,7 @@ typedef enum {
+ } TCPChardevState;
+ 
+ typedef ChardevClass SocketChardevClass;
++typedef struct EmucapSocketAuth EmucapSocketAuth;
+ 
+ struct SocketChardev {
+     Chardev parent;
+@@ -78,6 +79,7 @@ struct SocketChardev {
+     bool connect_err_reported;
+ 
+     QIOTask *connect_task;
++    EmucapSocketAuth *emucap_auth;
+ };
+ typedef struct SocketChardev SocketChardev;
+ 
+diff --git i/qapi/char.json w/qapi/char.json
+index 140614f..ffaa3b1 100644
+--- i/qapi/char.json
++++ w/qapi/char.json
+@@ -274,6 +274,10 @@
+ #     Setting this to zero disables this function.
+ #     (default: 0) (Since: 9.2)
+ #
++# @emucap-auth: internal managed-xemu authentication domain.  This is
++#     accepted only for raw TCP server sockets.
++#     (Since: xemu 0.8.136-emucap)
++#
+ # Since: 1.4
+ ##
+ { 'struct': 'ChardevSocket',
+@@ -286,7 +290,8 @@
+             '*telnet': 'bool',
+             '*tn3270': 'bool',
+             '*websocket': 'bool',
+-            '*reconnect-ms': 'int' },
++            '*reconnect-ms': 'int',
++            '*emucap-auth': 'str' },
+   'base': 'ChardevCommon' }
+ 
+ ##
+diff --git i/tests/unit/test-char.c w/tests/unit/test-char.c
+index 8a98e42..042c470 100644
+--- i/tests/unit/test-char.c
++++ w/tests/unit/test-char.c
+@@ -3,6 +3,7 @@
+ 
+ #include "qapi/error.h"
+ #include "qemu/config-file.h"
++#include "qemu/bswap.h"
+ #include "qemu/module.h"
+ #include "qemu/option.h"
+ #include "qemu/sockets.h"
+@@ -13,6 +14,8 @@
+ #include "qobject/qdict.h"
+ #include "qom/qom-qobject.h"
+ #include "io/channel-socket.h"
++#include "crypto/init.h"
++#include "crypto/hmac.h"
+ #include "qapi/qobject-input-visitor.h"
+ #include "qapi/qapi-visit-sockets.h"
+ #include "socket-helpers.h"
+@@ -1870,6 +1873,186 @@ static void char_hotswap_test(void)
+     g_free(chr_args);
+ }
+ 
++#define EMUCAP_TEST_HEADER_SIZE 7
++#define EMUCAP_TEST_NONCE_SIZE 16
++#define EMUCAP_TEST_PROOF_SIZE 32
++#define EMUCAP_TEST_HELLO_SIZE \
++    (EMUCAP_TEST_HEADER_SIZE + EMUCAP_TEST_NONCE_SIZE)
++#define EMUCAP_TEST_SERVER_PROOF_SIZE \
++    (EMUCAP_TEST_HEADER_SIZE + EMUCAP_TEST_NONCE_SIZE + \
++     EMUCAP_TEST_PROOF_SIZE)
++#define EMUCAP_TEST_CLIENT_PROOF_SIZE \
++    (EMUCAP_TEST_HEADER_SIZE + EMUCAP_TEST_PROOF_SIZE)
++
++static const char emucap_test_token[] =
++    "native-0123456789abcdefghijklmnopqrstuvwxyz-"
++    "ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789";
++
++typedef struct EmucapAuthTestClient {
++    SocketAddress *addr;
++} EmucapAuthTestClient;
++
++static void emucap_test_auth_header(uint8_t *header, uint8_t type)
++{
++    memcpy(header, "ECXA", 4);
++    header[4] = 1;
++    header[5] = type;
++    header[6] = 1;
++}
++
++static void emucap_test_auth_proof(const char *direction,
++                                   const uint8_t *client_nonce,
++                                   const uint8_t *server_nonce,
++                                   uint8_t proof[EMUCAP_TEST_PROOF_SIZE])
++{
++    static const char domain[] = "emucap-xemu-qmp-auth-v1";
++    const uint8_t *fields[] = {
++        (const uint8_t *)domain,
++        (const uint8_t *)direction,
++        client_nonce,
++        server_nonce,
++    };
++    size_t sizes[] = {
++        strlen(domain),
++        strlen(direction),
++        EMUCAP_TEST_NONCE_SIZE,
++        EMUCAP_TEST_NONCE_SIZE,
++    };
++    uint64_t lengths[G_N_ELEMENTS(fields)];
++    struct iovec iov[G_N_ELEMENTS(fields) * 2];
++    g_autoptr(QCryptoHmac) hmac = NULL;
++    uint8_t *result = proof;
++    size_t result_size = EMUCAP_TEST_PROOF_SIZE;
++    size_t i;
++
++    hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256,
++                            (const uint8_t *)emucap_test_token,
++                            strlen(emucap_test_token), &error_abort);
++    for (i = 0; i < G_N_ELEMENTS(fields); i++) {
++        lengths[i] = cpu_to_be64(sizes[i]);
++        iov[i * 2].iov_base = &lengths[i];
++        iov[i * 2].iov_len = sizeof(lengths[i]);
++        iov[i * 2 + 1].iov_base = (void *)fields[i];
++        iov[i * 2 + 1].iov_len = sizes[i];
++    }
++    g_assert_cmpint(qcrypto_hmac_bytesv(hmac, iov, G_N_ELEMENTS(iov),
++                                       &result, &result_size,
++                                       &error_abort), ==, 0);
++    g_assert(result == proof);
++    g_assert_cmpuint(result_size, ==, EMUCAP_TEST_PROOF_SIZE);
++}
++
++static gpointer emucap_auth_test_client(gpointer opaque)
++{
++    EmucapAuthTestClient *client = opaque;
++    QIOChannelSocket *ioc = qio_channel_socket_new();
++    uint8_t hello[EMUCAP_TEST_HELLO_SIZE];
++    uint8_t challenge[EMUCAP_TEST_SERVER_PROOF_SIZE];
++    uint8_t expected[EMUCAP_TEST_PROOF_SIZE];
++    uint8_t response[EMUCAP_TEST_CLIENT_PROOF_SIZE + 4];
++    uint8_t acknowledgement[EMUCAP_TEST_HEADER_SIZE];
++    uint8_t expected_header[EMUCAP_TEST_HEADER_SIZE];
++    uint8_t client_nonce[EMUCAP_TEST_NONCE_SIZE];
++    const uint8_t *server_nonce = challenge + EMUCAP_TEST_HEADER_SIZE;
++
++    memset(client_nonce, 0x11, sizeof(client_nonce));
++    qio_channel_socket_connect_sync(ioc, client->addr, &error_abort);
++    emucap_test_auth_header(hello, 1);
++    memcpy(hello + EMUCAP_TEST_HEADER_SIZE,
++           client_nonce, sizeof(client_nonce));
++    g_assert_cmpint(qio_channel_write_all(QIO_CHANNEL(ioc), hello,
++                                         sizeof(hello), &error_abort), ==, 0);
++    g_assert_cmpint(qio_channel_read_all(QIO_CHANNEL(ioc), challenge,
++                                        sizeof(challenge), &error_abort), ==, 0);
++    emucap_test_auth_header(expected_header, 2);
++    g_assert_cmpmem(challenge, EMUCAP_TEST_HEADER_SIZE,
++                    expected_header, sizeof(expected_header));
++    emucap_test_auth_proof("server", client_nonce, server_nonce, expected);
++    g_assert_cmpmem(challenge + EMUCAP_TEST_HEADER_SIZE +
++                    EMUCAP_TEST_NONCE_SIZE,
++                    EMUCAP_TEST_PROOF_SIZE, expected, sizeof(expected));
++
++    emucap_test_auth_header(response, 3);
++    emucap_test_auth_proof("client", client_nonce, server_nonce,
++                           response + EMUCAP_TEST_HEADER_SIZE);
++    memcpy(response + EMUCAP_TEST_CLIENT_PROOF_SIZE, "AUTH", 4);
++    g_assert_cmpint(qio_channel_write_all(QIO_CHANNEL(ioc), response,
++                                         sizeof(response), &error_abort), ==, 0);
++    g_assert_cmpint(qio_channel_read_all(QIO_CHANNEL(ioc), acknowledgement,
++                                        sizeof(acknowledgement),
++                                        &error_abort), ==, 0);
++    emucap_test_auth_header(expected_header, 4);
++    g_assert_cmpmem(acknowledgement, sizeof(acknowledgement),
++                    expected_header, sizeof(expected_header));
++    object_unref(OBJECT(ioc));
++    return NULL;
++}
++
++static void char_socket_emucap_auth_test(void)
++{
++    Chardev *chr;
++    CharFrontend frontend = {0};
++    FeHandler handler = {0};
++    QObject *qaddr;
++    SocketAddress *addr;
++    Visitor *visitor;
++    QemuOpts *opts;
++    QIOChannelSocket *legacy;
++    QemuThread thread;
++    EmucapAuthTestClient client;
++    uint8_t legacy_greeting[EMUCAP_TEST_HELLO_SIZE] = {0};
++
++    g_setenv("EMUCAP_NATIVE_DEBUG_TOKEN", emucap_test_token, true);
++    opts = qemu_opts_parse_noisily(
++        qemu_find_opts("chardev"),
++        "socket,id=emucap-auth,host=127.0.0.1,port=0,server=on,"
++        "wait=off,emucap-auth=xemu-qmp-v1",
++        true);
++    g_assert_nonnull(opts);
++    chr = qemu_chr_new_from_opts(opts, NULL, &error_abort);
++    qemu_opts_del(opts);
++    g_assert_nonnull(chr);
++    g_assert(!object_property_get_bool(OBJECT(chr), "connected",
++                                       &error_abort));
++
++    qaddr = object_property_get_qobject(OBJECT(chr), "addr", &error_abort);
++    g_assert_nonnull(qaddr);
++    visitor = qobject_input_visitor_new(qaddr);
++    visit_type_SocketAddress(visitor, "addr", &addr, &error_abort);
++    visit_free(visitor);
++    qobject_unref(qaddr);
++
++    qemu_chr_fe_init(&frontend, chr, &error_abort);
++    qemu_chr_fe_set_handlers(&frontend, fe_can_read, fe_read, fe_event,
++                             NULL, &handler, NULL, true);
++    memcpy(legacy_greeting, "{\"QMP\":{}}\r\n", 12);
++    legacy = qio_channel_socket_new();
++    qio_channel_socket_connect_sync(legacy, addr, &error_abort);
++    g_assert_cmpint(qio_channel_write_all(QIO_CHANNEL(legacy),
++                                         legacy_greeting,
++                                         sizeof(legacy_greeting),
++                                         &error_abort), ==, 0);
++    qio_channel_shutdown(QIO_CHANNEL(legacy),
++                         QIO_CHANNEL_SHUTDOWN_BOTH, &error_abort);
++    object_unref(OBJECT(legacy));
++    client.addr = addr;
++    qemu_thread_create(&thread, "emucap-auth-client",
++                       emucap_auth_test_client, &client,
++                       QEMU_THREAD_JOINABLE);
++    while (!handler.is_open || handler.read_count < 4) {
++        main_loop_wait(false);
++    }
++    g_assert(!handler.openclose_mismatch);
++    g_assert_cmpint(handler.openclose_count, ==, 1);
++    g_assert_cmpmem(handler.read_buf, handler.read_count, "AUTH", 4);
++    qemu_thread_join(&thread);
++
++    qemu_chr_fe_deinit(&frontend, false);
++    object_unparent(OBJECT(chr));
++    qapi_free_SocketAddress(addr);
++    g_unsetenv("EMUCAP_NATIVE_DEBUG_TOKEN");
++}
++
+ static SocketAddress tcpaddr = {
+     .type = SOCKET_ADDRESS_TYPE_INET,
+     .u.inet.host = (char *)"127.0.0.1",
+@@ -1886,8 +2069,13 @@ int main(int argc, char **argv)
+ {
+     bool has_ipv4, has_ipv6;
+ 
++#ifdef XBOX
++    qemu_init_main_loop_lock();
++    qemu_mutex_lock_main_loop();
++#endif
+     qemu_init_main_loop(&error_abort);
+     socket_init();
++    g_assert_cmpint(qcrypto_init(&error_abort), ==, 0);
+ 
+     g_test_init(&argc, &argv, NULL);
+ 
+@@ -1976,6 +2164,8 @@ int main(int argc, char **argv)
+     if (has_ipv4) {
+         SOCKET_SERVER_TEST(tcp, &tcpaddr);
+         SOCKET_CLIENT_TEST(tcp, &tcpaddr);
++        g_test_add_func("/char/socket/emucap-auth",
++                        char_socket_emucap_auth_test);
+     }
+ #ifndef WIN32
+     SOCKET_SERVER_TEST(unix, &unixaddr);
+diff --git i/ui/xemu-emucap.c w/ui/xemu-emucap.c
+index 8cba8c7..38127cb 100644
+--- i/ui/xemu-emucap.c
++++ w/ui/xemu-emucap.c
+@@ -27,7 +27,7 @@
+ #include "xemu-input.h"
+ #include "xui/xemu-hud.h"
+ 
+-#define XEMU_EMUCAP_API 3
++#define XEMU_EMUCAP_API 4
+ #define XEMU_EMUCAP_BATCH_MAX_RANGES 64
+ #define XEMU_EMUCAP_BATCH_MAX_BYTES 65536
+ #define XEMU_EMUCAP_MAX_FRAME_STEP 5000

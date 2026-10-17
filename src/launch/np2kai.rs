@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{emu_home_dir, find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
+use super::{find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
 
 const LOCK: &str = include_str!("../../adapters/np2kai/upstream.lock");
 
@@ -100,14 +100,18 @@ pub fn default_build_info_path(repo_root: &Path) -> PathBuf {
     repo_root.join("adapters/np2kai/work/np2kai/emucap-np2kai-build.json")
 }
 
-pub fn default_firmware_root() -> PathBuf {
+pub fn default_firmware_root() -> std::io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("EMUCAP_NP2KAI_FIRMWARE") {
-        return PathBuf::from(path);
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "EMUCAP_NP2KAI_FIRMWARE must be an absolute directory",
+            ));
+        }
+        return Ok(path);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join("workspace/retrobios/bios/NEC/PC-98");
-    }
-    PathBuf::from("retrobios/bios/NEC/PC-98")
+    Ok(super::emu_home_base()?.join("firmware/np2kai"))
 }
 
 pub fn resolve_frontend(repo_root: &Path) -> Option<PathBuf> {
@@ -281,7 +285,7 @@ pub fn launch(request: &Launch<'_>) -> std::io::Result<Launched> {
         )
     })?;
     let bundle = require_compatible_core(request.repo_root)?;
-    let firmware = default_firmware_root();
+    let firmware = default_firmware_root()?;
     if !firmware.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -291,15 +295,16 @@ pub fn launch(request: &Launch<'_>) -> std::io::Result<Launched> {
             ),
         ));
     }
-    let runtime_home = emu_home_dir("np2kai", request.port);
-    fs::create_dir_all(&runtime_home)?;
+    let runtime_home = super::emu_generation_dir("np2kai", request.port, request.runtime)?;
+    let staged_core = prepare_core_copy(&bundle.path, &bundle.identity.core_sha256, &runtime_home)?;
     let (mounted_content, source_content_sha256) =
         prepare_working_copy(request.content, &runtime_home)?;
     let log = runtime_home.join("np2kai.log");
     let mut spec = LaunchSpec::new(&frontend, log)
         .arg(request.port.to_string())
         .arg(mounted_content.to_string_lossy())
-        .arg(bundle.path.to_string_lossy())
+        .arg(staged_core.to_string_lossy())
+        .arg(&bundle.identity.core_sha256)
         .arg(firmware.to_string_lossy())
         .arg(runtime_home.to_string_lossy())
         .arg(&bundle.identity.commit)
@@ -320,13 +325,41 @@ pub fn launch(request: &Launch<'_>) -> std::io::Result<Launched> {
     Ok(Launched {
         pid,
         frontend,
-        core: bundle.path,
+        core: staged_core,
         firmware,
         runtime_home,
         mounted_content,
         source_content_sha256,
         identity: bundle.identity,
     })
+}
+
+fn prepare_core_copy(
+    source: &Path,
+    expected_sha256: &str,
+    runtime_home: &Path,
+) -> std::io::Result<PathBuf> {
+    let core_dir = runtime_home.join("core");
+    fs::create_dir(&core_dir)?;
+    let file_name = source.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "NP2kai core has no file name",
+        )
+    })?;
+    let staged = core_dir.join(file_name);
+    crate::path_safety::atomic_copy_file(source, &staged)?;
+    let actual = sha256_file(&staged)?;
+    if actual != expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("staged NP2kai core digest mismatch: expected {expected_sha256}, got {actual}"),
+        ));
+    }
+    let mut permissions = fs::metadata(&staged)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&staged, permissions)?;
+    Ok(staged)
 }
 
 pub fn accepts_content_path(path: &Path) -> bool {

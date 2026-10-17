@@ -1,3 +1,5 @@
+#include <fstream>
+#include <cstdio>
 #include "emucap_recording.h"
 #include "emucap_input.h"
 
@@ -159,7 +161,33 @@ std::vector<std::string> movie_schedule(std::uint64_t host_step_ms) {
   return order;
 }
 
-int main() {
+int main(int argc, char** argv) {
+  assert(argc > 0);
+  const std::string movie_path = std::string(argv[0]) + ".movie";
+  std::string admitted, admission_error;
+  for (const std::string& data : {std::string("0:\n"), std::string("0:"), std::string("0:\nx"), std::string("xxx")}) {
+    { std::ofstream file(movie_path.c_str(), std::ios::binary); file << data; }
+    const bool accepted = emucap_read_recording_input_movie(movie_path, 3, admitted, admission_error);
+    assert(accepted == (data == "0:\n"));
+    assert(accepted ? admitted == data : admitted.empty());
+  }
+  {
+    std::ofstream file(movie_path.c_str(), std::ios::binary);
+    file.seekp(1024 * 1024 * 1024); file.put('x');
+  }
+  assert(!emucap_read_recording_input_movie(movie_path, 3, admitted, admission_error));
+  assert(!emucap_read_recording_input_movie(movie_path, 0, admitted, admission_error));
+  assert(!emucap_read_recording_input_movie(movie_path, 1048577, admitted, admission_error));
+  {
+    std::ofstream file(movie_path.c_str(), std::ios::binary);
+    file << std::string(1048575, 'x') << '\n';
+  }
+  assert(emucap_read_recording_input_movie(movie_path, 1048576, admitted, admission_error));
+  assert(admitted.size() == 1048576);
+  assert(std::remove(movie_path.c_str()) == 0);
+  assert(!emucap_read_recording_input_movie(movie_path, 3, admitted, admission_error));
+  assert(admission_error == "input_movie open failed");
+
   assert(emucap_recording_capability_json(false).find(
              std::string("\"revision\":\"") + EMUCAP_RECORDING_CAPABILITY_REVISION) !=
          std::string::npos);

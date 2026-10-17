@@ -2,6 +2,8 @@ use super::*;
 
 const MAX_MEMORY_CHUNK: usize = 0x4000;
 const MAX_PATTERN_SCAN: usize = 128 * 1024;
+pub(super) const MAX_BREAKPOINT_SNAPSHOTS: usize = 16;
+const MAX_BREAKPOINT_SNAPSHOT_BYTES: u64 = 0x4000;
 const TRACE_CAPACITY: usize = 4096;
 
 impl Np2kaiHost {
@@ -303,17 +305,9 @@ impl Np2kaiHost {
     pub(super) fn poll_events(&mut self, params: &Value) -> Np2kaiResult<Value> {
         let filter = optional_num(params, "breakpoint_id")?;
         self.drain_native_events()?;
-        let mut events = Vec::new();
-        let mut remaining = Vec::new();
-        for event in std::mem::take(&mut self.pending_events) {
-            if filter.is_none_or(|id| event["breakpoint_id"].as_u64() == Some(id)) {
-                events.push(event);
-            } else {
-                remaining.push(event);
-            }
-        }
-        self.pending_events = remaining;
-        let dropped = unsafe { (self.api.debug_take_dropped_events)() };
+        let events = take_pending_events(&mut self.pending_events, filter);
+        let native_dropped = unsafe { (self.api.debug_take_dropped_events)() };
+        let dropped = take_combined_event_drops(&mut self.dropped_pending_events, native_dropped);
         Ok(json!({"events": events, "dropped": dropped, "pending": self.pending_events.len()}))
     }
 
@@ -344,7 +338,11 @@ impl Np2kaiHost {
                     event["snapshot"] = Value::Array(self.capture_snapshots(&metadata.snapshots)?);
                 }
             }
-            self.pending_events.push(event);
+            enqueue_pending_event(
+                &mut self.pending_events,
+                &mut self.dropped_pending_events,
+                event,
+            );
         }
         Ok(())
     }
@@ -750,6 +748,40 @@ impl Np2kaiHost {
     }
 }
 
+pub(super) fn enqueue_pending_event(
+    pending: &mut VecDeque<Value>,
+    dropped: &mut u64,
+    event: Value,
+) {
+    if pending.len() >= MAX_PENDING_EVENTS {
+        pending.pop_front();
+        *dropped = dropped.saturating_add(1);
+    }
+    pending.push_back(event);
+}
+
+pub(super) fn take_pending_events(
+    pending: &mut VecDeque<Value>,
+    filter: Option<u64>,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut remaining = VecDeque::new();
+    for event in std::mem::take(pending) {
+        if filter.is_none_or(|id| event["breakpoint_id"].as_u64() == Some(id)) {
+            events.push(event);
+        } else {
+            remaining.push_back(event);
+        }
+    }
+    *pending = remaining;
+    events
+}
+
+pub(super) fn take_combined_event_drops(host_dropped: &mut u64, native_dropped: u64) -> u64 {
+    let host_dropped = std::mem::take(host_dropped);
+    host_dropped.saturating_add(native_dropped)
+}
+
 pub(super) fn required_num(params: &Value, key: &str) -> Np2kaiResult<u64> {
     optional_num(params, key)?
         .ok_or_else(|| Np2kaiError::BadParams(format!("missing required param: {key}")))
@@ -861,7 +893,13 @@ pub(super) fn parse_snapshots(raw: Option<&Value>) -> Np2kaiResult<Vec<SnapshotS
     let items = raw
         .as_array()
         .ok_or_else(|| Np2kaiError::BadParams("snapshot must be a list".into()))?;
+    if items.len() > MAX_BREAKPOINT_SNAPSHOTS {
+        return Err(Np2kaiError::BadParams(format!(
+            "snapshot accepts at most {MAX_BREAKPOINT_SNAPSHOTS} ranges"
+        )));
+    }
     let mut result = Vec::new();
+    let mut total = 0u64;
     for item in items {
         let text = item
             .as_str()
@@ -890,6 +928,14 @@ pub(super) fn parse_snapshots(raw: Option<&Value>) -> Np2kaiResult<Vec<SnapshotS
             return Err(Np2kaiError::BadParams(format!(
                 "snapshot range exceeds {}",
                 region.name
+            )));
+        }
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| Np2kaiError::BadParams("snapshot byte total overflow".into()))?;
+        if total > MAX_BREAKPOINT_SNAPSHOT_BYTES {
+            return Err(Np2kaiError::BadParams(format!(
+                "snapshot byte total exceeds {MAX_BREAKPOINT_SNAPSHOT_BYTES:#x}"
             )));
         }
         result.push(SnapshotSpec {

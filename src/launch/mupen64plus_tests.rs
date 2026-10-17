@@ -55,16 +55,26 @@ fn write_root(repo: &Path) -> PathBuf {
 }
 
 #[test]
-fn compatible_root_requires_pinned_metadata_and_display_plugin_only_when_visible() {
+fn compatible_root_requires_pinned_metadata_and_renderer_in_both_modes() {
     let repo = tempfile::tempdir().unwrap();
     let root = write_root(repo.path());
     assert!(require_compatible_root(repo.path(), &root, true).is_ok());
-    std::fs::remove_file(library_path(&root, "mupen64plus-video-rice").unwrap()).unwrap();
-    assert!(require_compatible_root(repo.path(), &root, false).is_ok());
+    let renderer = library_path(&root, "mupen64plus-video-rice").unwrap();
+    std::fs::remove_file(&renderer).unwrap();
+    assert!(require_compatible_root(repo.path(), &root, false).is_err());
     assert!(require_compatible_root(repo.path(), &root, true).is_err());
+    std::fs::write(&renderer, b"renderer").unwrap();
     let metadata_path = root.join("emucap-mupen64plus-build.json");
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    // ABI compatibility alone must not admit a stale native implementation.
+    let expected_patchset = metadata["patchset_sha256"].clone();
+    metadata["patchset_sha256"] = serde_json::json!("stale-patchset");
+    std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(require_compatible_root(repo.path(), &root, false).is_err());
+    metadata["patchset_sha256"] = expected_patchset;
+    std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(require_compatible_root(repo.path(), &root, false).is_ok());
     metadata["host_api"] = serde_json::json!(REQUIRED_HOST_API - 1);
     std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
     assert!(require_compatible_root(repo.path(), &root, false).is_err());
@@ -89,7 +99,7 @@ fn launch_spec_isolated_and_headless_by_default() {
     let root = temp.path().join("m64p");
     let rom = temp.path().join("test.v64");
     let log = temp.path().join("n64.log");
-    let runtime_home = emu_home_dir("mupen64plus", 47890);
+    let runtime_home = temp.path().join("generation/emulators/mupen64plus");
     let launch = Launch {
         binary: &binary,
         repo_root: temp.path(),

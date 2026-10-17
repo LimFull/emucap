@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 const MODERN_VERSION: &str = "2026-07-28";
 const LEGACY_VERSION: &str = "2025-11-25";
 const STATIC_MCP_METADATA_TTL_MS: u64 = 3_600_000;
+const ANALYSIS_LAUNCH_ID: &str = "launch-01arz3ndektsv4rrffq69g5fav";
 
 struct McpProcess {
     child: Child,
@@ -100,9 +101,31 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
     let observed_calls = calls.clone();
     let handle = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let root = RuntimeStore::discover()
+            .unwrap()
+            .read_compatibility_token(port)
+            .expect("read private session root")
+            .expect("private session root exists");
+        let front_key = emucap::live::producer_auth::derive_front_key(
+            &root,
+            emucap::live::producer_auth::Boundary::Direct,
+            port,
+            ANALYSIS_LAUNCH_ID,
+        )
+        .expect("derive analysis adapter front key");
         let stream = loop {
             match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(stream) => break stream,
+                Ok(stream) => {
+                    break emucap::live::producer_auth::authenticate_producer_stream(
+                        stream,
+                        &front_key,
+                        emucap::live::producer_auth::Boundary::Direct,
+                        port,
+                        ANALYSIS_LAUNCH_ID,
+                        Duration::from_secs(3),
+                    )
+                    .expect("authenticate fake analysis adapter")
+                }
                 Err(error) if Instant::now() < deadline => {
                     let _ = error;
                     std::thread::sleep(Duration::from_millis(10));
@@ -126,9 +149,7 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
             observed_calls.lock().unwrap().push(method.to_string());
             let result = match method {
                 "hello" => {
-                    let token = request["params"]["session_token"]
-                        .as_str()
-                        .expect("session token");
+                    assert_eq!(request["params"], json!({}));
                     json!({
                         "protocol_version": 1,
                         "methods": [
@@ -141,8 +162,7 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
                         "system": "test",
                         "adapter": "analysis-wire-test",
                         "build": "analysis-wire-test",
-                        "launch_id": "launch-analysis-wire-test",
-                        "session_token": token,
+                        "launch_id": ANALYSIS_LAUNCH_ID,
                         "contracts": {
                             "catalog": emucap::contracts::CATALOG_ID,
                             "active_exceptions": []
@@ -151,7 +171,7 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
                 }
                 "status" => json!({
                     "connected": true,
-                    "execution": {"state": "frozen"},
+                    "state": "frozen",
                     "execution_limits": {
                         "max_sync_advance_count": 5000,
                         "frame": {"max_count": 120}
@@ -674,6 +694,17 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
         .is_some_and(|text| text.contains("invalid verify_determinism arguments")));
 
     let (_temporary, case_dir) = make_analysis_case();
+    let listening = server.request(modern_request(
+        40,
+        "tools/call",
+        json!({
+            "name": "status", "arguments": {}
+        }),
+    ));
+    let port = listening["result"]["structuredContent"]["listening_port"]
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .expect("status publishes the bound Control listener");
     let (adapter, calls) = spawn_analysis_adapter(port);
     let connected = wait_for_connected_status(&mut server, Duration::from_secs(5));
     assert_eq!(connected["result"]["structuredContent"]["connected"], true);
@@ -823,7 +854,7 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
             }
         }),
     ));
-    assert_ne!(verdict["result"]["isError"], true);
+    assert_ne!(verdict["result"]["isError"], true, "{verdict}");
     assert_eq!(
         verdict["result"]["structuredContent"]["outcome"],
         "reproducible"
@@ -840,7 +871,10 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
     drop(server);
     adapter.join().expect("join fake analysis adapter");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.last().map(String::as_str), Some("resume"));
+    assert!(
+        calls.ends_with(&["pause".to_string(), "status".to_string()]),
+        "analysis must restore and verify the initially frozen execution state: {calls:?}"
+    );
     assert_eq!(
         calls
             .windows(3)

@@ -84,6 +84,20 @@ fn make_executable(path: &Path) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
+#[cfg(unix)]
+fn make_private_root(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(windows)]
+fn make_private_root(path: &Path) {
+    crate::private_fs::windows::privatize_dir(path).unwrap();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn make_private_root(_path: &Path) {}
+
 fn metadata() -> BuildMetadata {
     BuildMetadata {
         upstream: "https://github.com/dolphin-emu/dolphin.git".into(),
@@ -170,13 +184,18 @@ fn resolve_binary_accepts_explicit_app_bundle() {
 }
 
 #[test]
-fn runtime_plain_binary_is_copied_under_per_port_home() {
+fn runtime_plain_binary_is_copied_under_a_unique_manual_generation() {
     let _guard = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let source = tempfile::tempdir().unwrap();
     let emu_home = tempfile::tempdir().unwrap();
+    make_private_root(emu_home.path());
     let binary = source.path().join("dolphin-emu-nogui");
     std::fs::write(&binary, b"fake dolphin").unwrap();
+    std::fs::create_dir_all(source.path().join("Sys/GC")).unwrap();
+    std::fs::write(source.path().join("Sys/GC/font.bin"), b"system font").unwrap();
+    std::fs::create_dir_all(source.path().join("User")).unwrap();
+    std::fs::write(source.path().join("User/settings.ini"), b"private settings").unwrap();
     std::fs::write(
         build_metadata_path(&binary),
         serde_json::to_vec(&metadata()).unwrap(),
@@ -188,21 +207,65 @@ fn runtime_plain_binary_is_copied_under_per_port_home() {
 
     let prepared = prepare_runtime_binary(&binary, 47920).unwrap();
 
-    assert_eq!(
-        prepared.binary,
-        emu_home
-            .path()
-            .join("dolphin/47920/runtime/dolphin-emu-nogui")
-    );
-    assert_eq!(
-        prepared.user_dir,
-        emu_home.path().join("dolphin/47920/user")
-    );
+    assert!(prepared
+        .home
+        .starts_with(emu_home.path().join("dolphin/47920/manual")));
+    assert!(prepared.binary.ends_with("runtime/dolphin-emu-nogui"));
+    assert_eq!(prepared.user_dir, prepared.home.join("user"));
     assert!(prepared
         .home
         .join("runtime/emucap-dolphin-build.json")
         .is_file());
     assert_eq!(std::fs::read(&binary).unwrap(), b"fake dolphin");
+    assert_eq!(
+        std::fs::read(prepared.home.join("runtime/Sys/GC/font.bin")).unwrap(),
+        b"system font"
+    );
+    assert!(!prepared.home.join("runtime/User").exists());
+    assert_eq!(
+        std::fs::read(source.path().join("User/settings.ini")).unwrap(),
+        b"private settings"
+    );
+}
+
+#[test]
+fn managed_user_directories_do_not_cross_launch_generations() {
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    let temporary = tempfile::tempdir().unwrap();
+    let emulator_home = temporary.path().join("emulators");
+    std::env::set_var("EMUCAP_EMU_HOME", &emulator_home);
+    let binary = temporary.path().join("dolphin-emu-nogui");
+    std::fs::write(&binary, b"fake dolphin").unwrap();
+    #[cfg(unix)]
+    make_executable(&binary);
+    let store = crate::live::runtime::RuntimeStore::new(emulator_home.join("sessions"));
+
+    let first = store.prepare(47920).unwrap();
+    let first_failure = first.adapter_failure_path();
+    let first_runtime = crate::launch::RuntimeEnv {
+        launch_id: first.launch_id(),
+        adapter_failure_path: &first_failure,
+    };
+    let first_prepared =
+        prepare_runtime_binary_for_generation(&binary, 47920, Some(first_runtime)).unwrap();
+    std::fs::write(
+        first_prepared.user_dir.join("sentinel"),
+        b"first generation",
+    )
+    .unwrap();
+
+    let second = store.prepare(47920).unwrap();
+    let second_failure = second.adapter_failure_path();
+    let second_runtime = crate::launch::RuntimeEnv {
+        launch_id: second.launch_id(),
+        adapter_failure_path: &second_failure,
+    };
+    let second_prepared =
+        prepare_runtime_binary_for_generation(&binary, 47920, Some(second_runtime)).unwrap();
+
+    assert_ne!(first_prepared.user_dir, second_prepared.user_dir);
+    assert!(!second_prepared.user_dir.join("sentinel").exists());
 }
 
 #[test]
@@ -211,6 +274,7 @@ fn runtime_windows_distribution_preserves_dependencies_and_system_data() {
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let source = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    make_private_root(home.path());
     std::env::set_var("EMUCAP_EMU_HOME", home.path());
     let files = [
         ("Dolphin.exe", "executable"),
@@ -247,6 +311,7 @@ fn runtime_app_bundle_copy_preserves_resources() {
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let source = tempfile::tempdir().unwrap();
     let emu_home = tempfile::tempdir().unwrap();
+    make_private_root(emu_home.path());
     let app = source.path().join("DolphinQt.app");
     let binary = app.join("Contents/MacOS/DolphinQt");
     let resource = app.join("Contents/Resources/qt.conf");
@@ -260,17 +325,14 @@ fn runtime_app_bundle_copy_preserves_resources() {
 
     let prepared = prepare_runtime_binary(&binary, 47921).unwrap();
 
-    assert_eq!(
-        prepared.binary,
-        emu_home
-            .path()
-            .join("dolphin/47921/runtime/DolphinQt.app/Contents/MacOS/DolphinQt")
-    );
+    assert!(prepared
+        .binary
+        .ends_with("runtime/DolphinQt.app/Contents/MacOS/DolphinQt"));
     assert_eq!(
         std::fs::read(
-            emu_home
-                .path()
-                .join("dolphin/47921/runtime/DolphinQt.app/Contents/Resources/qt.conf")
+            prepared
+                .home
+                .join("runtime/DolphinQt.app/Contents/Resources/qt.conf")
         )
         .unwrap(),
         b"resource"
@@ -293,7 +355,8 @@ fn runtime_refuses_symlinked_binary_inside_owned_home() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", emu_home.path());
 
-    let error = prepare_runtime_binary(&link, 47922).unwrap_err();
+    let home = emu_home.path().join("dolphin/47922");
+    let error = prepare_runtime_binary_in_home(&link, &home).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(&target).unwrap(), b"user dolphin");
@@ -317,7 +380,7 @@ fn runtime_refuses_symlinked_user_directory_without_touching_target() {
     std::os::unix::fs::symlink(real_user.path(), home.join("user")).unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", emu_home.path());
 
-    let error = prepare_runtime_binary(&binary, 47923).unwrap_err();
+    let error = prepare_runtime_binary_in_home(&binary, &home).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(marker).unwrap(), b"user settings");
@@ -341,7 +404,7 @@ fn runtime_refuses_symlinked_runtime_directory_without_touching_target() {
     std::os::unix::fs::symlink(installed.path(), home.join("runtime")).unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", emu_home.path());
 
-    let error = prepare_runtime_binary(&binary, 47924).unwrap_err();
+    let error = prepare_runtime_binary_in_home(&binary, &home).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(marker).unwrap(), b"installed dolphin");

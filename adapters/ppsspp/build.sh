@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Build PPSSPPHeadless from a pinned PPSSPP commit for the emucap PSP adapter.
 set -euo pipefail
+if [ "${EMUCAP_PPSSPP_REQUIRE_GUI:-0}" = 1 ] && [ "${EMUCAP_PPSSPP_BUILD_GUI:-1}" = 0 ]; then
+  echo "ERROR: GUI is required but disabled" >&2
+  exit 1
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
 . "$HERE/upstream.lock"
@@ -37,8 +41,11 @@ if [ "$(uname)" = "Darwin" ]; then export CC=/usr/bin/clang CXX=/usr/bin/clang++
 SRC="$WORK/ppsspp"
 ORIGIN="${EMUCAP_PPSSPP_SRC:-$PPSSPP_REPO}"
 if [ ! -d "$SRC/.git" ]; then git clone --recurse-submodules "$ORIGIN" "$SRC"; fi
-git -C "$SRC" fetch --recurse-submodules origin
-git -C "$SRC" checkout "$PPSSPP_COMMIT"
+if ! git -C "$SRC" cat-file -e "$PPSSPP_COMMIT^{commit}" 2>/dev/null; then
+  git -C "$SRC" fetch origin "$PPSSPP_COMMIT"
+fi
+# This owned checkout is rebuilt from the lock, including when a previous pin was patched.
+git -C "$SRC" checkout --detach --force "$PPSSPP_COMMIT"
 git -C "$SRC" submodule update --init --recursive
 # Apply the repo-owned emucap patch stack (savestate.save/load + emucap.screenshot WebSocket
 # commands, and a headless run-loop that survives GE stepping). The patches also add new source
@@ -57,9 +64,8 @@ done
 # (PPSSPPSDL) — the two are not mutually exclusive, so one configure builds both from the same
 # patched tree. PPSSPPHeadless is the default headless debugging path; PPSSPPSDL is the HITL
 # `display:true` build (a real window a human sees and plays while the agent drives the same debugger
-# WebSocket). Both carry the identical patch stack (loopback-bind + savestate/screenshot + the GUI
-# --debugger=<port> honoring from 0005 + the isolated memstick from 0006), so the launcher can pick
-# either binary with one build.
+# WebSocket). Both carry the same loopback, state/capture and isolated-memstick patches,
+# with upstream debugger-port handling, so the launcher can pick either binary with one build.
 # Homebrew upgrades replace versioned Fontconfig Cellar paths. Drop only those cached discovery
 # values before configuring so an existing build tree follows the currently linked formula instead
 # of failing on a deleted older include directory.
@@ -75,6 +81,10 @@ if [ "${EMUCAP_PPSSPP_BUILD_GUI:-1}" != "0" ]; then
   if cmake --build "$SRC/build-headless" --target PPSSPPSDL -j "${PPSSPP_JOBS:-2}"; then
     echo "built: $SRC/build-headless/PPSSPPSDL.app (HITL display:true)"
   else
+    if [ "${EMUCAP_PPSSPP_REQUIRE_GUI:-0}" = 1 ]; then
+      echo "ERROR: required PPSSPPSDL target failed to build" >&2
+      exit 1
+    fi
     echo "WARNING: PPSSPPSDL (GUI/display:true) target failed to build — PPSSPPHeadless is ready for headless debugging." >&2
     echo "         display:true (HITL window) needs SDL3 + sdl3_ttf; install them and re-run to enable it (or set EMUCAP_PPSSPP_BUILD_GUI=0 to skip)." >&2
   fi

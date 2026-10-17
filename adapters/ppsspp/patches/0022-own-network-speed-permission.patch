@@ -1,7 +1,39 @@
+diff --git a/Core/Config.cpp b/Core/Config.cpp
+index 7d3667be10..ef6f558f6e 100644
+--- a/Core/Config.cpp
++++ b/Core/Config.cpp
+@@ -1262,7 +1262,7 @@ bool Config::LoadAppendedConfig() {
+ 
+ 	INFO_LOG(Log::Config, "Loaded appended config '%s'.", appendedConfigFileName_.c_str());
+ 
+-	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
++	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit, bAllowSpeedControlWhileConnected);
+ 	Save("Loaded appended config"); // Let's prevent reset
+ 	return true;
+ }
+@@ -1621,7 +1621,7 @@ void Config::PostLoadCleanup() {
+ 
+ 	// Three frames in flight showed no benefit over two, so the option is gone. Squash old values.
+ 	iInflightFrames = std::clamp(iInflightFrames, 1, 2);
+-	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
++	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit, bAllowSpeedControlWhileConnected);
+ }
+ 
+ void Config::PreSaveCleanup() {
+@@ -1792,7 +1792,7 @@ void Config::RestoreDefaults(RestoreSettingsBits whatToRestore, bool log) {
+ 			currentDirectory = defaultCurrentDirectory;
+ 		}
+ 	}
+-	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
++	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit, bAllowSpeedControlWhileConnected);
+ }
+ 
+ bool Config::HasGameConfig(std::string_view gameId) {
 diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+index d27405c96f..4284e7b915 100644
 --- a/Core/EmucapPacing.h
 +++ b/Core/EmucapPacing.h
-@@ -20,6 +20,7 @@
+@@ -22,6 +22,7 @@ struct EmucapPacingSnapshot {
      int customFps1 = 0;
      int customFps2 = -1;
      int analogTargetFps = 240;
@@ -9,7 +41,7 @@ diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
      uint32_t revision = 0;
  };
  
-@@ -95,15 +96,24 @@
+@@ -97,17 +98,26 @@ class EmucapPacingOwner {
          return true;
      }
  
@@ -25,34 +57,24 @@ diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
          policy_.analogTargetFps = analog;
 +        policy_.allowNetworkSpeed = allowNetworkSpeed;
          ++policy_.revision;
-+    }
-+
+     }
+ 
 +    void SetNetworkSpeedPermission(bool allowed) {
 +        std::lock_guard<std::mutex> guard(mutex_);
 +        if (policy_.allowNetworkSpeed != allowed) {
 +            policy_.allowNetworkSpeed = allowed;
 +            ++policy_.revision;
 +        }
-     }
- 
++    }
++
  private:
-diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
---- a/Core/HLE/sceDisplay.h
-+++ b/Core/HLE/sceDisplay.h
-@@ -44,7 +44,8 @@
- bool __DisplayChangeEmucapLimit(FPSLimit expected, FPSLimit next);
- void __DisplayCycleEmucapLimit();
- bool __DisplaySetEmucapAnalogInput(float amount);
--void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog);
-+void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog, bool allowNetworkSpeed);
-+void __DisplaySetEmucapNetworkSpeedPermission(bool allowed);
- int __DisplayGetEmucapSpeed();
- // Changes whenever the agent speed changes, so a wait computed for the old target can end.
- uint32_t __DisplayEmucapPacingGeneration();
+     bool initialized_ = false;
+     mutable std::mutex mutex_;
 diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+index 7fc46b84d7..e8d835fd15 100644
 --- a/Core/HLE/sceDisplay.cpp
 +++ b/Core/HLE/sceDisplay.cpp
-@@ -388,8 +388,12 @@
+@@ -417,8 +417,12 @@ bool __DisplaySetEmucapAnalogInput(float amount) {
      return emucapPacing.SetAnalogInput(amount);
  }
  
@@ -67,40 +89,52 @@ diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
  }
  
  void __DisplaySetEmucapSpeed(int percent) {
-diff --git a/Core/Config.cpp b/Core/Config.cpp
---- a/Core/Config.cpp
-+++ b/Core/Config.cpp
-@@ -1283,7 +1283,7 @@
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+index 03ec36c66e..1b54f31b62 100644
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -49,7 +49,8 @@ bool __DisplayGetEmucapFastForward();
+ bool __DisplayChangeEmucapLimit(FPSLimit expected, FPSLimit next);
+ void __DisplayCycleEmucapLimit();
+ bool __DisplaySetEmucapAnalogInput(float amount);
+-void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog);
++void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog, bool allowNetworkSpeed);
++void __DisplaySetEmucapNetworkSpeedPermission(bool allowed);
+ int __DisplayGetEmucapSpeed();
+ // Changes whenever the agent speed changes, so a wait computed for the old target can end.
+ uint32_t __DisplayEmucapPacingGeneration();
+diff --git a/Core/HLE/sceNet.cpp b/Core/HLE/sceNet.cpp
+index 2e6a22fee1..bfd239c61a 100644
+--- a/Core/HLE/sceNet.cpp
++++ b/Core/HLE/sceNet.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2012- PPSSPP Project.
  
- 	INFO_LOG(Log::Loader, "Loaded appended config '%s'.", appendedConfigFileName_.c_str());
- 
--	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
-+	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit, bAllowSpeedControlWhileConnected);
- 	Save("Loaded appended config"); // Let's prevent reset
- 	return true;
- }
-@@ -1627,7 +1627,7 @@
- 
- 	// Clamp save state slot count to somewhat sane limits.
- 	g_Config.iSaveStateSlotCount = std::clamp(g_Config.iSaveStateSlotCount, 1, 100);
--	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
-+	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit, bAllowSpeedControlWhileConnected);
- }
- 
- void Config::PreSaveCleanup() {
-@@ -1798,7 +1798,7 @@
- 			currentDirectory = defaultCurrentDirectory;
- 		}
- 	}
--	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
-+	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit, bAllowSpeedControlWhileConnected);
+ // This program is free software: you can redistribute it and/or modify
+@@ -153,7 +154,7 @@ bool NetworkWarnUserIfOnlineAndCantSavestate() {
  }
  
- bool Config::HasGameConfig(std::string_view gameId) {
+ bool NetworkWarnUserIfOnlineAndCantSpeed() {
+-	if (IsNetworkConnected() && !g_Config.bAllowSpeedControlWhileConnected) {
++	if (IsNetworkConnected() && !__DisplayGetEmucapPacing().allowNetworkSpeed) {
+ 		auto nw = GetI18NCategory(I18NCat::NETWORKING);
+ 		g_OSD.Show(OSDType::MESSAGE_INFO, nw->T("Speed controls are not available when online"), 3.0f, "speedonline");
+ 		return true;
+@@ -163,7 +164,7 @@ bool NetworkWarnUserIfOnlineAndCantSpeed() {
+ }
+ 
+ bool NetworkAllowSpeedControl() {
+-	return !IsNetworkConnected() || g_Config.bAllowSpeedControlWhileConnected;
++	return !IsNetworkConnected() || __DisplayGetEmucapPacing().allowNetworkSpeed;
+ }
+ 
+ bool NetworkAllowSaveState() {
 diff --git a/UI/GameSettingsScreen.cpp b/UI/GameSettingsScreen.cpp
+index d0d799fe09..35dd5a1d6a 100644
 --- a/UI/GameSettingsScreen.cpp
 +++ b/UI/GameSettingsScreen.cpp
-@@ -113,6 +113,16 @@
+@@ -116,6 +116,16 @@ void SetMemStickDirDarwin(int requesterToken) {
  }
  #endif
  
@@ -117,7 +151,7 @@ diff --git a/UI/GameSettingsScreen.cpp b/UI/GameSettingsScreen.cpp
  GameSettingsScreen::GameSettingsScreen(const Path &gamePath, std::string gameID, bool editThenRestore)
  	: UITabbedBaseDialogScreen(gamePath, &g_Config.iSettingsCurrentTab, TabDialogFlags::HorizontalOnlyIcons | TabDialogFlags::VerticalShowIcons), gameID_(gameID), editGameSpecificThenRestore_(editThenRestore) {
  	prevInflightFrames_ = g_Config.iInflightFrames;
-@@ -1100,7 +1110,7 @@
+@@ -1104,7 +1114,7 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
  	networkingSettings->Add(new SettingHint(n->T("PortOffsetHint"), portOffset));
  	networkingSettings->Add(new PopupSliderChoice(&g_Config.iMinTimeout, 0, 15000, 0, n->T("Minimum Timeout", "Minimum Timeout (override in ms, 0 = default)"), 50, screenManager()))->SetFormat(di->T("%d ms"));
  	networkingSettings->Add(new CheckBox(&g_Config.bForcedFirstConnect, n->T("Forced First Connect", "Forced First Connect (faster Connect)")));
@@ -126,7 +160,7 @@ diff --git a/UI/GameSettingsScreen.cpp b/UI/GameSettingsScreen.cpp
  	if (Discord::IsAvailable()) {
  		networkingSettings->Add(new CheckBox(&g_Config.bDiscordRichPresence, n->T("Send Discord Presence information")));
  	}
-@@ -1665,7 +1675,7 @@
+@@ -1685,7 +1695,7 @@ void GameSettingsScreen::dialogFinished(const Screen *dialog, DialogResult resul
  		g_Config.iFpsLimit1 = iAlternateSpeedPercent1_ < 0 ? -1 : (iAlternateSpeedPercent1_ * 60) / 100;
  		g_Config.iFpsLimit2 = iAlternateSpeedPercent2_ < 0 ? -1 : (iAlternateSpeedPercent2_ * 60) / 100;
  		g_Config.iAnalogFpsLimit = (iAlternateSpeedPercentAnalog_ * 60) / 100;
@@ -135,29 +169,3 @@ diff --git a/UI/GameSettingsScreen.cpp b/UI/GameSettingsScreen.cpp
  		recreate = true;
  	}
  
-diff --git a/Core/HLE/sceNet.cpp b/Core/HLE/sceNet.cpp
---- a/Core/HLE/sceNet.cpp
-+++ b/Core/HLE/sceNet.cpp
-@@ -1,3 +1,4 @@
-+#include "Core/HLE/sceDisplay.h"
- // Copyright (c) 2012- PPSSPP Project.
- 
- // This program is free software: you can redistribute it and/or modify
-@@ -151,7 +152,7 @@
- }
- 
- bool NetworkWarnUserIfOnlineAndCantSpeed() {
--	if (IsNetworkConnected() && !g_Config.bAllowSpeedControlWhileConnected) {
-+	if (IsNetworkConnected() && !__DisplayGetEmucapPacing().allowNetworkSpeed) {
- 		auto nw = GetI18NCategory(I18NCat::NETWORKING);
- 		g_OSD.Show(OSDType::MESSAGE_INFO, nw->T("Speed controls are not available when online"), 3.0f, "speedonline");
- 		return true;
-@@ -161,7 +162,7 @@
- }
- 
- bool NetworkAllowSpeedControl() {
--	return !IsNetworkConnected() || g_Config.bAllowSpeedControlWhileConnected;
-+	return !IsNetworkConnected() || __DisplayGetEmucapPacing().allowNetworkSpeed;
- }
- 
- bool NetworkAllowSaveState() {

@@ -43,13 +43,14 @@ pub(super) fn np2kai_precondition(root: &Path) -> serde_json::Value {
     let core = np2kai_launch::require_compatible_core(root);
     let firmware = np2kai_launch::default_firmware_root();
     serde_json::json!({
-        "available": frontend.is_some() && core.is_ok() && firmware.is_dir(),
+        "available": frontend.is_some() && core.is_ok() && firmware.as_ref().is_ok_and(|path| path.is_dir()),
         "path": frontend.map(|path| path.display().to_string()),
         "core": core.as_ref().ok().map(|bundle| bundle.path.display().to_string()),
         "host_build": core.as_ref().ok().map(|bundle| &bundle.identity),
         "core_error": core.err().map(|error| error.to_string()),
-        "firmware_root": firmware.display().to_string(),
-        "firmware_available": firmware.is_dir(),
+        "firmware_root": firmware.as_ref().ok().map(|path| path.display().to_string()),
+        "firmware_available": firmware.as_ref().is_ok_and(|path| path.is_dir()),
+        "firmware_error": firmware.err().map(|error| error.to_string()),
         "source": "EMUCAP_NP2KAI_BIN / installed emucap-np2kai; EMUCAP_NP2KAI_CORE / pinned repo build; EMUCAP_NP2KAI_FIRMWARE / operator firmware"
     })
 }

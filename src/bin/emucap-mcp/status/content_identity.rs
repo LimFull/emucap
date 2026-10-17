@@ -35,15 +35,6 @@ pub(crate) fn normalize_rom_sha1(
     }
 }
 
-fn same_content_path(expected: &str, observed: &str) -> bool {
-    let expected = Path::new(expected);
-    let observed = Path::new(observed);
-    match (expected.canonicalize(), observed.canonicalize()) {
-        (Ok(expected), Ok(observed)) => expected == observed,
-        _ => expected == observed,
-    }
-}
-
 /// Return the identity captured before a managed launch. This read-only status path never expands
 /// an adapter-reported descriptor path into indirect filesystem reads.
 pub(crate) fn content_identity_for_rom_info(
@@ -55,7 +46,7 @@ pub(crate) fn content_identity_for_rom_info(
         value,
         endpoint_port,
         live_launch_id,
-        &emucap::live::runtime::RuntimeStore::discover(),
+        &emucap::live::runtime::RuntimeStore::discover()?,
     )
 }
 
@@ -71,9 +62,9 @@ pub(crate) fn content_identity_for_rom_info_with_store(
         if let Some(current) = store.read_current(port)? {
             if current.launch_id == live_launch_id {
                 if let Some(bound) = current.content_identity {
-                    if observed_path
-                        .is_some_and(|observed| !same_content_path(&current.content, observed))
-                    {
+                    if observed_path.is_some_and(|observed| {
+                        !emucap::content_identity::same_content_path(&current.content, observed)
+                    }) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "managed adapter content path does not match its launch generation",

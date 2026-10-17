@@ -104,3 +104,28 @@ fn bounded_reader_rejects_eof_truncated_frame() {
     let error = read_ndjson_frame_with_limit(&mut reader, &mut pending, 64).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 }
+
+#[test]
+fn admission_limit_preserves_exact_boundary_and_post_auth_read_ahead() {
+    let limit = super::broker::MAX_ADMISSION_FRAME_BYTES;
+    let mut bytes = vec![b' '; limit];
+    bytes.push(b'\n');
+    bytes.extend(vec![b' '; limit + 1]);
+    bytes.push(b'\n');
+    let mut reader = Cursor::new(bytes);
+    let mut pending = Vec::new();
+    assert_eq!(
+        read_ndjson_chunk_with_limit(&mut reader, &mut pending, limit)
+            .unwrap()
+            .unwrap()
+            .len(),
+        limit + 1
+    );
+    assert_eq!(
+        read_ndjson_frame(&mut reader, &mut pending)
+            .unwrap()
+            .unwrap()
+            .len(),
+        limit + 2
+    );
+}

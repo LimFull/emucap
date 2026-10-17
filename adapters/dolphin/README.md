@@ -1,8 +1,8 @@
 # emucap — Dolphin (GameCube / Wii) adapter
 
 The Dolphin adapter adds live PowerPC debugging for GameCube and Wii. The supported path is a
-repo-owned native fork: a small emucap service runs inside Dolphin and connects directly to the
-Control MCP listener over NDJSON.
+pinned upstream build with repository-owned patches. A small emucap service runs inside Dolphin
+and connects directly to the Control MCP listener over NDJSON.
 
 `status.methods` and `status.memory_types` are authoritative for every live session.
 
@@ -42,6 +42,11 @@ The native CPU/context owner retains each state operation through its response a
 policies with the independently authored Wii fixture; its usage is in the
 [fixture guide](../../_tests/live/dolphin/wii-pacing-fixture/README.md).
 
+Texture-cache save and restore share limits of 4,096 entries, 1 GiB of serialized pixels,
+1 GiB of estimated native image storage, 65,536 layer/mip uploads, and 65,536 reference/address/hash
+associations. Required presentation textures count toward these limits. Restore checks the complete
+cache section before replacing the existing cache; an over-limit save fails before texture readback.
+
 ## Native adapter
 
 The native adapter keeps Dolphin's normal JIT for free-running execution. It temporarily switches
@@ -79,11 +84,11 @@ stack, and builds:
 The headless target is required. The GUI target is best-effort and may be skipped with
 `EMUCAP_DOLPHIN_BUILD_GUI=0`.
 
-On Windows, `build.ps1` discovers Visual Studio 2022 or Build Tools, builds
+On Windows, `build.ps1` discovers Visual Studio 2026 or Build Tools and uses CMake/Ninja to build
 `DolphinNoGUI.exe` for headless launches and `Dolphin.exe` for visible launches under
 `adapters/dolphin/work/dolphin-src`, and writes the same metadata sidecar expected by the native
-launcher. `-Src` selects the build checkout and `-Jobs` sets parallel projects (default 2). This source path is kept in sync, but its
-runtime behavior has not been verified in this repository's current macOS test environment.
+launcher. `-Src` selects the build checkout and `-Jobs` sets parallel compilation (default 2).
+The target is x64 on both Intel/AMD and ARM Windows build hosts.
 The isolated Windows runtime retains adjacent DLLs, `Sys`, `QtPlugins`, and
 `qt.conf`; each session receives a separate user directory.
 
@@ -92,6 +97,10 @@ repeat it, use `bash adapters/dolphin/test-settings.sh`; set `EMUCAP_SANITIZERS=
 `EMUCAP_SANITIZERS=address,undefined` for sanitizer checks. The test covers concurrent writes,
 cache visibility, callback ordering, layer changes and writes during settings-file I/O. Pacing
 tests cover verified replies, competing writes, native clamps and deadlines during notification.
+
+`test-state-failure.sh` checks native serializer bounds, image extents and readback failures.
+`python3 _tests/native/dolphin-texture-admission.py --source <prepared-dolphin-source>` exercises
+the actual cache admission/save/load methods with controlled backend allocation and upload calls.
 
 ## Launch
 
@@ -106,7 +115,7 @@ GameCube and Wii share several container extensions. Pass `system` explicitly wh
 cannot distinguish them.
 
 Headless mode is the default. `display=true` selects the compatible DolphinQt build and opens its
-render window. Both modes run from an emucap-owned portable copy with a per-port `--user`
+render window. Both modes run from an emucap-owned portable copy with a launch-generation `--user`
 directory. The fork also routes DolphinQt state through that directory, and the launcher rejects
 redirecting symlinks inside the portable tree, leaving an installed Dolphin and its profile
 untouched.
@@ -188,10 +197,13 @@ and unmanaged shutdown routing on a prepared source tree.
 
 ### Breakpoints
 
-Only exact-address exec breakpoints are supported. On a hit, Dolphin freezes before the matching
-instruction and `poll_events` returns the adapter breakpoint ID together with the exact address,
-PC, and PowerPC register snapshot. Adding or removing a breakpoint clears the relevant JIT cache
-state so an already compiled block cannot bypass it.
+Exec breakpoints stop before the matching instruction. Read/write watchpoints report the accessed
+address, value and access phase. `poll_events` includes the adapter breakpoint ID, PC and PowerPC
+register snapshot. Adding or removing an exec breakpoint clears the relevant JIT cache state.
+
+Pending events are bounded to 256 entries and 1 MiB of compact JSON. Overflow removes the oldest
+events; a single oversized event is discarded whole. `poll_events.dropped` reports losses since the
+previous poll and then resets. Event loss does not suppress the native breakpoint stop.
 
 ### Disassembly and call stacks
 
@@ -241,3 +253,15 @@ failed: the CPU is powered down and the managed session must be restarted.
 `screenshot` captures the next frame presented after the request and returns a PNG with dimensions,
 launch generation, and `freshness="current"` provenance. It is bounded to two seconds. A frozen
 core is rejected before a capture is armed; the adapter never resumes guest execution implicitly.
+
+### Linux runtime resources
+
+Standalone builds stage `Sys` beside each executable. Managed launch copies those immutable
+assets into the per-session runtime; configuration and saves remain under the isolated user
+directory. Linux containers running Wii need sufficient `/dev/shm`; use `--shm-size=1g` with
+Docker for the guest memory mappings.
+
+Linux GUI compilation needs Qt's private development headers (`qt6-base-private-dev` on
+Debian/Ubuntu). Set `EMUCAP_DOLPHIN_REQUIRE_GUI=1` to require the GUI target as well as
+headless; release CI uses this mode. Local headless-only builds can use
+`EMUCAP_DOLPHIN_BUILD_GUI=0` with the GUI requirement unset.

@@ -357,7 +357,7 @@ emucap 패치는 guest가 정지한 상태에서도 네이티브 제어 요청�
   → `adapters/mupen64plus/README.md`
 - **openMSX MSX profile** — `adapters/openmsx/build.sh`를 실행하고
   `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 기록된 upstream compatibility backport와
-  emucap host patch를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 per-port
+  emucap host patch를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 launch-generation
   `HOME`에서 실행하며 사용자의 emulator profile을 읽지 않는다. `msx`는 C-BIOS MSX2+,
   `msx1`·`msx2`·`msx2p`는 사용자가 제공한 실제 firmware
   profile이다. 카트리지 범위는 Z80 상태·명령 step, headless/visible exact frame step, 제한된

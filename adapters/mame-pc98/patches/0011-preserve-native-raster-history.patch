@@ -150,8 +150,8 @@
  }
  
  
---- a/src/mame/neogeo/neogeo.cpp
-+++ b/src/mame/neogeo/neogeo.cpp
+--- a/src/mame/snk/neogeo.cpp
++++ b/src/mame/snk/neogeo.cpp
 @@ -1947,6 +1947,7 @@
  	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
  	m_screen->set_raw(NEOGEO_PIXEL_CLOCK, NEOGEO_HTOTAL, NEOGEO_HBEND, NEOGEO_HBSTART, NEOGEO_VTOTAL, NEOGEO_VBEND, NEOGEO_VBSTART);

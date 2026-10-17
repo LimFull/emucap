@@ -24,24 +24,41 @@ fn wait_survives_passes_a_living_process_and_flags_an_exited_one() {
     assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn wait_ws_ready_succeeds_once_the_port_is_listening_and_fails_on_dead_process() {
+fn wait_ws_ready_requires_the_expected_process_to_own_the_listener() {
     use std::net::TcpListener;
     use std::time::Duration;
 
-    // A process that stays alive and a port that is already listening → ready immediately.
-    let alive = std::process::Command::new("sleep")
+    // The current process owns this listener, so readiness succeeds without connecting to it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(super::wait_ws_ready(std::process::id(), port, Duration::from_secs(2)).is_ok());
+
+    // A different live process does not own the listener. This is the pre-bind attack shape: the
+    // launcher must not mistake the attacker's socket for PPSSPP and release the bearer token.
+    let mut unrelated = std::process::Command::new("sleep")
         .arg("5")
         .spawn()
         .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    assert!(super::wait_ws_ready(alive.id(), port, Duration::from_secs(2)).is_ok());
-    let mut alive = alive;
-    let _ = alive.kill();
-    let _ = alive.wait();
+    let error = super::wait_ws_ready(unrelated.id(), port, Duration::from_millis(250)).unwrap_err();
+    assert!(error.to_string().contains("refusing to release"));
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
     drop(listener);
+
+    // Even a listener owned by the expected PID is insufficient when it is reachable through a
+    // wildcard address rather than the native patch's exact IPv4 loopback bind.
+    let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
+    let wildcard_port = wildcard.local_addr().unwrap().port();
+    let error = super::wait_ws_ready(
+        std::process::id(),
+        wildcard_port,
+        Duration::from_millis(250),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to release"));
+    drop(wildcard);
 
     // A process that has already exited, and nothing listening → fails fast (dead, not a timeout).
     let mut dead = std::process::Command::new("sh")
@@ -116,7 +133,8 @@ fn emu_spec_passes_content_positionally_not_as_mount_flag() {
     let bridge = dir.path().join("bridge");
     let log = dir.path().join("ppsspp.log");
     let l = launch_for(&binary, &bridge, &log);
-    let spec = emu_spec(&l, 48900);
+    let profile = dir.path().join("profile");
+    let spec = emu_spec(&l, &profile, 48900, "native-debug-token").unwrap();
     assert_eq!(
         spec.args,
         vec!["--debugger=48900", "--graphics=software", "/roms/game.iso"]
@@ -127,6 +145,30 @@ fn emu_spec_passes_content_positionally_not_as_mount_flag() {
     // --timeout is never passed: it aborts the run on a wall-clock deadline regardless of
     // debugger/WebSocket activity, which would kill an interactive debugging session.
     assert!(!spec.args.iter().any(|a| a.starts_with("--timeout")));
+    assert!(spec.env.contains(&(
+        "EMUCAP_NATIVE_DEBUG_TOKEN".to_string(),
+        "native-debug-token".to_string()
+    )));
+    assert!(!spec
+        .env
+        .iter()
+        .any(|(key, _)| key == "EMUCAP_SESSION_TOKEN"));
+}
+
+#[test]
+fn launch_rejects_missing_or_empty_session_token_before_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("missing-PPSSPPHeadless");
+    let bridge = dir.path().join("missing-bridge");
+    let log = dir.path().join("ppsspp.log");
+    let mut l = launch_for(&binary, &bridge, &log);
+
+    for token in [None, Some("")] {
+        l.session_token = token;
+        let err = super::launch(&l).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("EMUCAP_SESSION_TOKEN"));
+    }
 }
 
 #[test]
@@ -137,19 +179,20 @@ fn emu_spec_display_drops_software_graphics_for_a_real_window() {
     let log = dir.path().join("ppsspp.log");
     let mut l = launch_for(&binary, &bridge, &log);
     l.display = true;
-    let spec = emu_spec(&l, 48900);
+    let profile = dir.path().join("profile");
+    let spec = emu_spec(&l, &profile, 48900, "native-debug-token").unwrap();
     // Display (HITL) mode keeps the same --debugger=<port> and positional content, but omits
     // --graphics=software so the GUI window renders with the real GPU backend.
     assert_eq!(spec.args, vec!["--debugger=48900", "/roms/game.iso"]);
     assert!(!spec.args.iter().any(|a| a == "--graphics=software"));
-    // The GUI honors --debugger=<port> (fork patch 0005); the port is still passed as the flag.
+    // Both frontends receive the reserved debugger port through the same upstream flag.
     assert!(spec.args.iter().any(|a| a == "--debugger=48900"));
 }
 
 #[test]
 fn emu_spec_display_isolates_the_profile_from_the_real_home() {
     // A HITL window must never read or write the operator's real PPSSPP config/saves: the spec
-    // redirects HOME (and the fork's memstick pin) to an emucap-owned per-port dir, not the real
+    // redirects HOME (and the fork's memstick pin) to an emucap-owned generation dir, not the real
     // profile. Regression guard for the display:true isolation fix.
     let _lock = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "HOME"]);
@@ -166,16 +209,18 @@ fn emu_spec_display_isolates_the_profile_from_the_real_home() {
     let mut l = launch_for(&binary, &bridge, &log);
     l.port = 47850;
     l.display = true;
-    let spec = emu_spec(&l, 48900);
+    let expected_home = emu_home
+        .path()
+        .join("sessions/47850/generations/test/emulators/ppsspp");
+    let spec = emu_spec(&l, &expected_home, 48900, "native-debug-token").unwrap();
 
-    // HOME points at the emucap-owned per-port dir (under EMUCAP_EMU_HOME), not the real HOME.
+    // HOME points at the emucap-owned generation dir, not the real HOME.
     let home = &spec
         .env
         .iter()
         .find(|(k, _)| k == "HOME")
         .expect("display spec must set an isolated HOME")
         .1;
-    let expected_home = emu_home.path().join("ppsspp/47850");
     assert_eq!(Path::new(home), expected_home);
     assert_ne!(Path::new(home), real_home.path());
     assert!(!home.contains(real_home.path().to_str().unwrap()));
@@ -189,6 +234,40 @@ fn emu_spec_display_isolates_the_profile_from_the_real_home() {
         .expect("display spec must pin an isolated memstick")
         .1;
     assert!(Path::new(memstick).starts_with(&expected_home));
+}
+
+#[test]
+fn managed_profiles_do_not_inherit_memory_stick_state_across_launch_ids() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    let temporary = tempfile::tempdir().unwrap();
+    let emulator_home = temporary.path().join("emulators");
+    std::env::set_var("EMUCAP_EMU_HOME", &emulator_home);
+    let store = crate::live::runtime::RuntimeStore::new(emulator_home.join("sessions"));
+    let binary = temporary.path().join("PPSSPPHeadless");
+    let bridge = temporary.path().join("bridge");
+    let log = temporary.path().join("ppsspp.log");
+    let mut launch = launch_for(&binary, &bridge, &log);
+
+    let first = store.prepare(47800).unwrap();
+    let first_failure = first.adapter_failure_path();
+    launch.runtime = Some(crate::launch::RuntimeEnv {
+        launch_id: first.launch_id(),
+        adapter_failure_path: &first_failure,
+    });
+    let first_profile = super::prepare_profile(&launch).unwrap();
+    std::fs::write(first_profile.join("memstick/sentinel"), b"first generation").unwrap();
+
+    let second = store.prepare(47800).unwrap();
+    let second_failure = second.adapter_failure_path();
+    launch.runtime = Some(crate::launch::RuntimeEnv {
+        launch_id: second.launch_id(),
+        adapter_failure_path: &second_failure,
+    });
+    let second_profile = super::prepare_profile(&launch).unwrap();
+
+    assert_ne!(first_profile, second_profile);
+    assert!(!second_profile.join("memstick/sentinel").exists());
 }
 
 #[test]
@@ -236,7 +315,7 @@ fn bridge_spec_mirrors_launch_sh_argv_and_env() {
     let bridge = dir.path().join("bridge");
     let log = dir.path().join("ppsspp.log");
     let l = launch_for(&binary, &bridge, &log);
-    let spec = bridge_spec(&l, 48900);
+    let spec = bridge_spec(&l, 48900, "native-debug-token");
     assert_eq!(spec.program, bridge);
     assert_eq!(spec.args, vec!["47800", "48900"]);
     assert!(spec
@@ -248,6 +327,19 @@ fn bridge_spec_mirrors_launch_sh_argv_and_env() {
     assert!(spec
         .env
         .contains(&("EMUCAP_SESSION_TOKEN".to_string(), "token".to_string())));
+    assert!(spec.env.contains(&(
+        "EMUCAP_NATIVE_DEBUG_TOKEN".to_string(),
+        "native-debug-token".to_string()
+    )));
+}
+
+#[test]
+fn native_debug_tokens_are_fresh_and_distinct_from_the_front_session_token() {
+    let first = super::new_native_debug_token();
+    let second = super::new_native_debug_token();
+    assert!(first.starts_with("native-"));
+    assert_ne!(first, second);
+    assert_ne!(first, "token");
 }
 
 #[test]

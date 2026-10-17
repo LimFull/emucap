@@ -1,0 +1,13 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1336,6 +1336,10 @@
+ 		)
+ 	endif()
+ 	add_executable(PPSSPPHeadless ${HeadlessSource})
++	if(UNIX AND NOT ANDROID AND NOT SDL_LIB_TARGET)
++		# Native software-only builds use the same explicit no-context path as cross builds.
++		target_compile_definitions(PPSSPPHeadless PRIVATE HEADLESS_NO_SDL)
++	endif()
+ 	target_link_libraries(PPSSPPHeadless ${COCOA_LIBRARY} ${QUARTZ_CORE_LIBRARY} ${IOKIT_LIBRARY} ${CMAKE_THREAD_LIBS_INIT} Core)
+ 	if(SDL_LIB_TARGET)
+ 		target_link_libraries(PPSSPPHeadless ${SDL_LIB_TARGET})

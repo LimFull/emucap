@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Reproducible MAME PC-98 adapter build entrypoint.
 #
-# A system MAME binary is only a bootstrap smoke fallback.  PC-98 parity work
-# needs emulator-thread hooks that Lua/GDB cannot provide, so this script
+# Controlled MAME operation requires the maintained native hooks. This script
 # fetches a pinned MAME source release, applies repo-local patches, and exposes
 # a safe headless wrapper at adapters/mame-pc98/work/mame for launch.sh to
 # prefer.  The raw binary is linked as work/mame.raw for explicit diagnostics.

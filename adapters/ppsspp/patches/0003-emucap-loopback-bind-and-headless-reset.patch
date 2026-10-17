@@ -1,9 +1,9 @@
-diff --git c/Common/Net/HTTPServer.cpp w/Common/Net/HTTPServer.cpp
-index c69aae0125..e931676991 100644
---- c/Common/Net/HTTPServer.cpp
-+++ w/Common/Net/HTTPServer.cpp
-@@ -158,18 +158,25 @@ void Server::SetFallbackHandler(UrlHandlerFunc handler) {
- 	fallback_ = handler;
+diff --git a/Common/Net/HTTPServer.cpp b/Common/Net/HTTPServer.cpp
+index 04db0acf9c..52f0482956 100644
+--- a/Common/Net/HTTPServer.cpp
++++ b/Common/Net/HTTPServer.cpp
+@@ -199,18 +199,25 @@ static void SetPortReusePolicy(int sock) {
+ #endif
  }
  
 -bool Server::Listen(int port, const char *reason, net::DNSType type) {
@@ -32,7 +32,7 @@ index c69aae0125..e931676991 100644
  	listenerSock_ = socket(AF_INET, SOCK_STREAM, 0);
  	if (listenerSock_ < 0)
  		return false;
-@@ -177,7 +184,8 @@ bool Server::Listen4(int port, const char *reason) {
+@@ -218,7 +225,8 @@ bool Server::Listen4(int port, const char *reason) {
  	struct sockaddr_in server_addr;
  	memset(&server_addr, 0, sizeof(server_addr));
  	server_addr.sin_family = AF_INET;
@@ -41,8 +41,8 @@ index c69aae0125..e931676991 100644
 +	server_addr.sin_addr.s_addr = htonl(loopbackOnly ? INADDR_LOOPBACK : INADDR_ANY);
  	server_addr.sin_port = htons(port);
  
- 	int opt = 1;
-@@ -215,7 +223,7 @@ bool Server::Listen4(int port, const char *reason) {
+ 	SetPortReusePolicy(listenerSock_);
+@@ -254,7 +262,7 @@ bool Server::Listen4(int port, const char *reason) {
  	return true;
  }
  
@@ -51,7 +51,7 @@ index c69aae0125..e931676991 100644
  #if !PPSSPP_PLATFORM(SWITCH)
  	listenerSock_ = socket(AF_INET6, SOCK_STREAM, 0);
  	if (listenerSock_ < 0)
-@@ -224,7 +232,8 @@ bool Server::Listen6(int port, bool ipv6_only, const char *reason) {
+@@ -263,7 +271,8 @@ bool Server::Listen6(int port, bool ipv6_only, const char *reason) {
  	struct sockaddr_in6 server_addr;
  	memset(&server_addr, 0, sizeof(server_addr));
  	server_addr.sin6_family = AF_INET6;
@@ -60,12 +60,12 @@ index c69aae0125..e931676991 100644
 +	server_addr.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any;
  	server_addr.sin6_port = htons(port);
  
- 	int opt = 1;
-diff --git c/Common/Net/HTTPServer.h w/Common/Net/HTTPServer.h
-index a60b061b7f..facd32065d 100644
---- c/Common/Net/HTTPServer.h
-+++ w/Common/Net/HTTPServer.h
-@@ -89,7 +89,9 @@ class Server {
+ 	SetPortReusePolicy(listenerSock_);
+diff --git a/Common/Net/HTTPServer.h b/Common/Net/HTTPServer.h
+index b6d1be7fc9..9c29b16f17 100644
+--- a/Common/Net/HTTPServer.h
++++ b/Common/Net/HTTPServer.h
+@@ -104,7 +104,9 @@ class Server {
  	// May run for (significantly) longer than timeout, but won't wait longer than that
  	// for a new connection to handle.
  	bool RunSlice(double timeout);
@@ -76,7 +76,7 @@ index a60b061b7f..facd32065d 100644
  	void Stop();
  
  	void RegisterHandler(const char *url_path, UrlHandlerFunc handler);
-@@ -111,8 +113,8 @@ class Server {
+@@ -126,8 +128,8 @@ class Server {
  	}
  
  private:
@@ -87,59 +87,13 @@ index a60b061b7f..facd32065d 100644
  
  	void HandleConnection(int conn_fd);
  
-diff --git c/Core/Debugger/WebSocket.cpp w/Core/Debugger/WebSocket.cpp
-index e282588150..0d3fb30885 100644
---- c/Core/Debugger/WebSocket.cpp
-+++ w/Core/Debugger/WebSocket.cpp
-@@ -94,6 +94,16 @@ static std::condition_variable stopCond;
- static bool lifecycleLockSetup = false;
- static std::mutex lifecycleLock;
- 
-+// emucap: see WebSocket.h. A WS command handler that must wait for a core reboot (headless
-+// game.reset) releases this lock for the wait so the reboot's PSP_Shutdown (which takes it via the
-+// STOPPING lifecycle notification) can proceed, then reacquires it before returning to the dispatch.
-+void WebSocketReleaseLifecycleLock() {
-+	lifecycleLock.unlock();
-+}
-+void WebSocketReacquireLifecycleLock() {
-+	lifecycleLock.lock();
-+}
-+
- static void UpdateConnected(int delta) {
- 	std::lock_guard<std::mutex> guard(stopLock);
- 	debuggersConnected += delta;
-diff --git c/Core/Debugger/WebSocket.h w/Core/Debugger/WebSocket.h
-index f05856db20..c4e067d30e 100644
---- c/Core/Debugger/WebSocket.h
-+++ w/Core/Debugger/WebSocket.h
-@@ -24,3 +24,12 @@ class ServerRequest;
- void HandleDebuggerRequest(const http::ServerRequest &request);
- // Note: blocks.
- void StopAllDebuggers();
-+
-+// emucap: the WS command dispatch runs each handler holding an internal "lifecycle" lock that also
-+// guards core startup/shutdown. A handler that must wait for a core reboot (headless game.reset) has
-+// to release that lock while waiting — the reboot's PSP_Shutdown takes the same lock via its STOPPING
-+// lifecycle notification, so a blocked handler still holding it would deadlock. These let such a
-+// handler drop the lock for the wait and reacquire it before returning to the dispatch (whose guard
-+// then releases it normally). Only valid to call from within a WS command handler on the WS thread.
-+void WebSocketReleaseLifecycleLock();
-+void WebSocketReacquireLifecycleLock();
-diff --git c/Core/Debugger/WebSocket/GameSubscriber.cpp w/Core/Debugger/WebSocket/GameSubscriber.cpp
-index b738bd1d9b..7fc0261efb 100644
---- c/Core/Debugger/WebSocket/GameSubscriber.cpp
-+++ w/Core/Debugger/WebSocket/GameSubscriber.cpp
-@@ -17,6 +17,7 @@
- 
- #include "Common/System/System.h"
- #include "Core/Config.h"
-+#include "Core/Debugger/WebSocket.h"
- #include "Core/Debugger/WebSocket/GameSubscriber.h"
- #include "Core/Debugger/WebSocket/WebSocketUtils.h"
- #include "Core/ELF/ParamSFO.h"
-@@ -49,10 +50,29 @@ void WebSocketGameReset(DebuggerRequest &req) {
- 	if (needBreak)
- 		PSP_CoreParameter().startBreak = true;
+diff --git a/Core/Debugger/WebSocket/GameSubscriber.cpp b/Core/Debugger/WebSocket/GameSubscriber.cpp
+index a9c1c8508d..3f38b8d0fe 100644
+--- a/Core/Debugger/WebSocket/GameSubscriber.cpp
++++ b/Core/Debugger/WebSocket/GameSubscriber.cpp
+@@ -90,10 +90,21 @@ void WebSocketGameReset(DebuggerRequest &req) {
+ 	if (!running)
+ 		return req.Fail("Game not running");
  
 +	// emucap: snapshot the completed-reset generation *before* requesting, so a reset that finishes
 +	// between here and the wait below is still observed (the wait predicate is already satisfied).
@@ -149,17 +103,9 @@ index b738bd1d9b..7fc0261efb 100644
  	// and we are not on it here.
  	System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
  
-+	// emucap: in headless the reset runs on the emu-thread run loop (there is no UI message pump).
-+	// Block until that reboot actually completes so the client's ack means "rebooted", not merely
-+	// "reset queued" — otherwise game.reset would look successful while nothing happened. The reboot's
-+	// PSP_Shutdown takes the WS lifecycle lock (its STOPPING notification), which the dispatch is
-+	// holding for us right now, so we drop it for the wait and reacquire before returning (else the
-+	// blocked handler would deadlock the reboot). No-op in GUI builds — the mode is never enabled and
-+	// the UI pump handles the reset itself.
++	// Wait outside the CPU queue so the run loop can perform and acknowledge reboot.
 +	if (Core_HeadlessResetMode()) {
-+		WebSocketReleaseLifecycleLock();
 +		bool completed = Core_WaitHeadlessReset(resetGen, 30.0);
-+		WebSocketReacquireLifecycleLock();
 +		if (!completed)
 +			return req.Fail("Reset timed out waiting for the headless reboot to complete");
 +	}
@@ -167,11 +113,11 @@ index b738bd1d9b..7fc0261efb 100644
  	req.Respond();
  }
  
-diff --git c/Core/System.cpp w/Core/System.cpp
-index 43b40967ea..4333b8e9fb 100644
---- c/Core/System.cpp
-+++ w/Core/System.cpp
-@@ -28,6 +28,9 @@
+diff --git a/Core/System.cpp b/Core/System.cpp
+index 7c9567ade7..a4a93ad5af 100644
+--- a/Core/System.cpp
++++ b/Core/System.cpp
+@@ -29,6 +29,9 @@
  #endif
  
  #include <mutex>
@@ -181,7 +127,7 @@ index 43b40967ea..4333b8e9fb 100644
  
  #include "ext/lua/lapi.h"
  
-@@ -786,6 +789,63 @@ void PSP_Shutdown(bool success) {
+@@ -941,6 +944,63 @@ void PSP_Shutdown(bool success) {
  	IncrementDebugCounter(DebugCounter::GAME_SHUTDOWN);
  }
  
@@ -245,10 +191,10 @@ index 43b40967ea..4333b8e9fb 100644
  void PSP_RunLoopWhileState() {
  	// We just run the CPU until we get to vblank. This will quickly sync up pretty nicely.
  	// The actual number of cycles doesn't matter so much here as we will break due to CORE_NEXTFRAME, most of the time hopefully...
-diff --git c/Core/System.h w/Core/System.h
-index a5dd39489d..d6e08dde6c 100644
---- c/Core/System.h
-+++ w/Core/System.h
+diff --git a/Core/System.h b/Core/System.h
+index 8e241d294f..ec0fa56ec6 100644
+--- a/Core/System.h
++++ b/Core/System.h
 @@ -80,6 +80,20 @@ BootState PollBootState();
  
  void PSP_Shutdown(bool success);
@@ -270,32 +216,34 @@ index a5dd39489d..d6e08dde6c 100644
  FileLoader *PSP_LoadedFile();
  
  void PSP_RunLoopWhileState();
-diff --git c/Core/WebServer.cpp w/Core/WebServer.cpp
-index 9c0c469495..a44f64db4d 100644
---- c/Core/WebServer.cpp
-+++ w/Core/WebServer.cpp
-@@ -767,8 +767,14 @@ static void WebServerThread() {
+diff --git a/Core/WebServer.cpp b/Core/WebServer.cpp
+index 9b511a09fb..9eea648b86 100644
+--- a/Core/WebServer.cpp
++++ b/Core/WebServer.cpp
+@@ -828,7 +828,8 @@ static void WebServerThread() {
  	http->RegisterHandler("/debugger", &ForwardDebuggerRequest);
  	http->RegisterHandler("/upload_file", &HandleUploadPost);
  
 -	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver")) {
--		if (!http->Listen(0, "debugger-webserver")) {
-+	// emucap: when this web server exists only to serve the debugger control channel (no LAN disc
-+	// sharing requested), bind loopback only. Otherwise the debugger — which can memory.read/write
-+	// and, via the fork's savestate.save with a host path, write arbitrary files — is reachable
-+	// unauthenticated from any host on the network. Disc sharing (DISCS) legitimately needs the LAN,
-+	// so it keeps the all-interfaces bind.
 +	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) && !(serverFlags & WebServerFlags::DISCS);
 +	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
+ 		if (serverRequireExactPort) {
+ 			// Someone asked for this specific port (--debugger=PORT) - see
+ 			// WebServerSetRequireExactPort(). Coming up on a different one would just look like
+@@ -842,7 +843,7 @@ static void WebServerThread() {
+ 			UpdateStatus(ServerStatus::FINISHED);
+ 			return;
+ 		}
+-		if (!http->Listen(0, "debugger-webserver")) {
 +		if (!http->Listen(0, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
  			ERROR_LOG(Log::FileSystem, "Unable to listen on any port (debugger - webserver)");
  			UpdateStatus(ServerStatus::FINISHED);
  			return;
-diff --git c/headless/Headless.cpp w/headless/Headless.cpp
-index 945c46d9ce..44e996f6a1 100644
---- c/headless/Headless.cpp
-+++ w/headless/Headless.cpp
-@@ -96,7 +96,14 @@ bool System_GetPropertyBool(SystemProperty prop) {
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+index 71ac9604f9..6a7cd3eead 100644
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -146,7 +146,14 @@ bool System_GetPropertyBool(SystemProperty prop) {
  	}
  }
  void System_Notify(SystemNotification notification) {}
@@ -309,10 +257,19 @@ index 945c46d9ce..44e996f6a1 100644
 +	}
 +}
  void System_RunOnMainThread(std::function<void()>) {}
- bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
- 	switch (type) {
-@@ -246,6 +253,46 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
- 		// Frame() early-returns unless a breakpoint change is pending, so this is cheap.
+ std::vector<std::string> System_GetCameraDeviceList() { return std::vector<std::string>(); }
+ void System_AskForPermission(SystemPermission permission) {}
+@@ -496,7 +503,7 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
+ 	// times slower than real time and a near-idle one much faster, so a wall-clock budget says
+ 	// something quite different depending on what's on screen. Wall-clock is what stops a hang from
+ 	// hanging the machine. Either, both or neither may be set.
+-	const double wallDeadline = startTime + opt.timeoutWall;
++	double wallDeadline = startTime + opt.timeoutWall;
+ 	// Late enough that the game is past booting, early enough to leave the run some time after -
+ 	// against whichever limit is actually set, and the earlier of the two if both are.
+ 	const double wallSaveStateAt = startTime + opt.timeoutWall * 0.7;
+@@ -533,6 +540,48 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
+ 
  		g_breakpoints.Frame();
  
 +		// emucap fork: service a real reset requested over the debugger (game.reset). Headless has
@@ -344,7 +301,9 @@ index 945c46d9ce..44e996f6a1 100644
 +				// fresh boot entry so the caller can inspect / re-arm breakpoints before running (and
 +				// so the reset is verifiable — pc is back at the entry path). Resume to run it.
 +				coreState = coreParameter.startBreak ? CORE_STEPPING_CPU : CORE_RUNNING_CPU;
-+				deadline = time_now_d() + opt.timeout;
++				wallDeadline = time_now_d() + opt.timeoutWall;
++				emulatedElapsed = 0.0;
++				lastEmulatedTime = CoreTiming::GetGlobalTimeUs() / 1000000.0;
 +			} else {
 +				fprintf(stderr, "headless reset failed to reboot: %s\n", reset_error.c_str());
 +				Core_Stop();
@@ -358,13 +317,11 @@ index 945c46d9ce..44e996f6a1 100644
  		int blockTicks = (int)usToCycles(1000000 / 10);
  		PSP_RunLoopFor(blockTicks);
  
-@@ -629,6 +676,9 @@ int main(int argc, const char* argv[])
- 	if (debuggerPort > 0) {
- 		g_Config.iRemoteISOPort = debuggerPort;
- 		coreParameter.startBreak = true;
-+		// emucap: let the debugger's game.reset drive a real reboot on the headless run loop and
-+		// block its ack until the reboot completes.
+@@ -1258,6 +1307,7 @@ int main(int argc, const char* argv[]) {
+ 			fprintf(stderr, "--debugger: breaking at the entry point, waiting for a client to "
+ 				"resume the CPU (cpu.resume). Use --debugger-run to start running instead.\n");
+ 		}
 +		Core_EnableHeadlessResetMode();
  		StartWebServer(WebServerFlags::DEBUGGER);
- 	}
- 
+ 		// We break at start and wait for a debugger to drive us, so coming up without one just
+ 		// hangs until the timeout. Better to say why and bail - see WebServerSetRequireExactPort().

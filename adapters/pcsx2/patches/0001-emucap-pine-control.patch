@@ -1,7 +1,7 @@
-diff --git i/pcsx2/DebugTools/Breakpoints.cpp w/pcsx2/DebugTools/Breakpoints.cpp
-index c6b7a5e62..8bc669fd7 100644
---- i/pcsx2/DebugTools/Breakpoints.cpp
-+++ w/pcsx2/DebugTools/Breakpoints.cpp
+diff --git c/pcsx2/DebugTools/Breakpoints.cpp i/pcsx2/DebugTools/Breakpoints.cpp
+index 8001fa1..f5953af 100644
+--- c/pcsx2/DebugTools/Breakpoints.cpp
++++ i/pcsx2/DebugTools/Breakpoints.cpp
 @@ -15,10 +15,44 @@ bool CBreakPoints::pendingClearSkipFirstAtEE_ = false;
  bool CBreakPoints::pendingClearSkipFirstAtIop_ = false;
  std::vector<MemCheck> CBreakPoints::memChecks_;
@@ -47,10 +47,10 @@ index c6b7a5e62..8bc669fd7 100644
  // called from the dynarec
  u32 standardizeBreakpointAddress(u32 addr)
  {
-diff --git i/pcsx2/DebugTools/Breakpoints.h w/pcsx2/DebugTools/Breakpoints.h
-index b65506c88..b84a2624d 100644
---- i/pcsx2/DebugTools/Breakpoints.h
-+++ w/pcsx2/DebugTools/Breakpoints.h
+diff --git c/pcsx2/DebugTools/Breakpoints.h i/pcsx2/DebugTools/Breakpoints.h
+index 69d8bac..1a7b407 100644
+--- c/pcsx2/DebugTools/Breakpoints.h
++++ i/pcsx2/DebugTools/Breakpoints.h
 @@ -4,6 +4,8 @@
  #pragma once
  
@@ -108,10 +108,10 @@ index b65506c88..b84a2624d 100644
  };
  
  
-diff --git i/pcsx2/Interpreter.cpp w/pcsx2/Interpreter.cpp
-index f538cf7cf..0cce0c2ce 100644
---- i/pcsx2/Interpreter.cpp
-+++ w/pcsx2/Interpreter.cpp
+diff --git c/pcsx2/Interpreter.cpp i/pcsx2/Interpreter.cpp
+index 70cd58d..27752ff 100644
+--- c/pcsx2/Interpreter.cpp
++++ i/pcsx2/Interpreter.cpp
 @@ -77,6 +77,7 @@ void intBreakpoint(bool memcheck)
  		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_EE, pc);
  		if (cond && !cond->Evaluate())
@@ -134,10 +134,40 @@ index f538cf7cf..0cce0c2ce 100644
  	}
  }
  
-diff --git i/pcsx2/PINE.cpp w/pcsx2/PINE.cpp
-index f8d251cf8..925cf6297 100644
---- i/pcsx2/PINE.cpp
-+++ w/pcsx2/PINE.cpp
+@@ -159,14 +166,22 @@ static void execI()
+ 	// not yet usable with the interpreter
+ //#define EXTRA_DEBUG
+ #if defined(EXTRA_DEBUG) || defined(PCSX2_DEVBUILD)
+-	// check if any breakpoints or memchecks are triggered by this instruction
+-	if (isBreakpointNeeded(cpuRegs.pc))
+-		intBreakpoint(false);
+-
+-	intCheckMemcheck();
+-
+-	CBreakPoints::CommitClearSkipFirst(BREAKPOINT_EE);
++	const bool run_debug_checks = true;
++#else
++	// Release builds without the EE recompiler still advertise these debugger operations.
++	const bool run_debug_checks =
++		CBreakPoints::GetNumBreakpoints() != 0 || CBreakPoints::GetNumMemchecks() != 0;
+ #endif
++	if (run_debug_checks)
++	{
++		// check if any breakpoints or memchecks are triggered by this instruction
++		if (isBreakpointNeeded(cpuRegs.pc))
++			intBreakpoint(false);
++
++		intCheckMemcheck();
++
++		CBreakPoints::CommitClearSkipFirst(BREAKPOINT_EE);
++	}
+ 
+ 	const u32 pc = cpuRegs.pc;
+ 	// We need to increase the pc before executing the memRead32. An exception could appears
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index dd4059a..e3e6e74 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
 @@ -3,16 +3,25 @@
  
  #include "BuildVersion.h"
@@ -146,7 +176,6 @@ index f8d251cf8..925cf6297 100644
 +#include "DebugTools/DebugInterface.h"
 +#include "DebugTools/MipsStackWalk.h"
  #include "Host.h"
- #include "Memory.h"
 +#include "MTGS.h"
  #include "Elfheader.h"
 +#include "PerformanceMetrics.h"
@@ -154,6 +183,7 @@ index f8d251cf8..925cf6297 100644
 +#include "SIO/Pad/Pad.h"
  #include "PINE.h"
  #include "VMManager.h"
+ #include "vtlb.h"
  #include "common/Error.h"
 +#include "common/Image.h"
 +#include "common/Path.h"
@@ -257,7 +287,7 @@ index f8d251cf8..925cf6297 100644
  		safe_close_portable(s_msgsock);
  	}
  }
-@@ -748,6 +813,551 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+@@ -746,6 +811,551 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
  				ret_cnt += 4;
  				break;
  			}
@@ -415,7 +445,7 @@ index f8d251cf8..925cf6297 100644
 +					for (u32 index = 0; index < count; index++)
 +					{
 +						bool valid = false;
-+						const u32 encoding = r5900Debug.read32(current, valid);
++						const u32 encoding = r5900Debug.Read32(current, &valid);
 +						if (!valid)
 +							break;
 +						rows.push_back({current, encoding, r5900Debug.disasm(current, true)});
@@ -755,7 +785,7 @@ index f8d251cf8..925cf6297 100644
 +							&r5900Debug, r5900Debug.getPC(),
 +							r5900Debug.getRegister(EECAT_GPR, 31).lo,
 +							r5900Debug.getRegister(EECAT_GPR, 29).lo,
-+							thread->EntryPoint(), thread->StackTop());
++							thread->EntryPoint());
 +						valid = true;
 +						break;
 +					}
@@ -809,10 +839,10 @@ index f8d251cf8..925cf6297 100644
  			default:
  			{
  			error:
-diff --git i/pcsx2/Pcsx2Config.cpp w/pcsx2/Pcsx2Config.cpp
-index 51ec1f788..9e60e8149 100644
---- i/pcsx2/Pcsx2Config.cpp
-+++ w/pcsx2/Pcsx2Config.cpp
+diff --git c/pcsx2/Pcsx2Config.cpp i/pcsx2/Pcsx2Config.cpp
+index 6dba18b..92b192b 100644
+--- c/pcsx2/Pcsx2Config.cpp
++++ i/pcsx2/Pcsx2Config.cpp
 @@ -18,6 +18,7 @@
  #include "USB/USB.h"
  
@@ -821,10 +851,11 @@ index 51ec1f788..9e60e8149 100644
  #ifdef _WIN32
  #include "common/RedtapeWindows.h"
  #include <KnownFolders.h>
-@@ -2183,7 +2184,14 @@ std::string EmuFolders::GetPortableModePath()
+@@ -2205,8 +2206,14 @@ std::string EmuFolders::GetPortableModePath()
  
  bool EmuFolders::SetDataDirectory(Error* error)
  {
+-	// Portable mode has the absolute priority.
 -	if (!ShouldUsePortableMode())
 +	// emucap launches each PCSX2 process with a private data root. This keeps settings, memory
 +	// cards, logs, and caches out of both the user's profile and other concurrent sessions.
@@ -835,12 +866,12 @@ index 51ec1f788..9e60e8149 100644
 +	}
 +	else if (!ShouldUsePortableMode())
  	{
- #if defined(_WIN32)
- 		// On Windows, use My Documents\PCSX2 to match old installs.
-diff --git i/pcsx2/SIO/Pad/Pad.cpp w/pcsx2/SIO/Pad/Pad.cpp
-index 92eea97ee..4cdd6bb31 100644
---- i/pcsx2/SIO/Pad/Pad.cpp
-+++ w/pcsx2/SIO/Pad/Pad.cpp
+ 		// Also check if the user has overriden the DataRoot path.
+ 		if (EmuConfig.CustomDataPath.empty())
+diff --git c/pcsx2/SIO/Pad/Pad.cpp i/pcsx2/SIO/Pad/Pad.cpp
+index 7065e2c..6b3a799 100644
+--- c/pcsx2/SIO/Pad/Pad.cpp
++++ i/pcsx2/SIO/Pad/Pad.cpp
 @@ -26,6 +26,7 @@
  
  #include "fmt/format.h"
@@ -885,7 +916,7 @@ index 92eea97ee..4cdd6bb31 100644
  	for (auto& port : s_controllers)
  		port.reset();
  }
-@@ -547,9 +565,51 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
+@@ -548,9 +566,51 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
  	if (controller >= NUM_CONTROLLER_PORTS)
  		return;
  
@@ -937,7 +968,7 @@ index 92eea97ee..4cdd6bb31 100644
  bool Pad::Freeze(StateWrapper& sw)
  {
  	if (sw.IsReading())
-@@ -729,10 +789,9 @@ void Pad::SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool sta
+@@ -730,10 +790,9 @@ void Pad::SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool sta
  void Pad::ApplyMacroButton(u32 controller, const Pad::MacroButton& mb)
  {
  	const float value = mb.toggle_state ? mb.pressure : 0.0f;
@@ -949,7 +980,7 @@ index 92eea97ee..4cdd6bb31 100644
  }
  
  void Pad::UpdateMacroButtons()
-@@ -760,4 +819,23 @@ void Pad::UpdateMacroButtons()
+@@ -761,4 +820,23 @@ void Pad::UpdateMacroButtons()
  			ApplyMacroButton(pad, mb);
  		}
  	}
@@ -973,10 +1004,10 @@ index 92eea97ee..4cdd6bb31 100644
 +	if (s_emucap_input_remaining > 0 && --s_emucap_input_remaining == 0)
 +		Pad::SetEmuCapInput(0, 0);
  }
-diff --git i/pcsx2/SIO/Pad/Pad.h w/pcsx2/SIO/Pad/Pad.h
-index 97114274c..d6ba73645 100644
---- i/pcsx2/SIO/Pad/Pad.h
-+++ w/pcsx2/SIO/Pad/Pad.h
+diff --git c/pcsx2/SIO/Pad/Pad.h i/pcsx2/SIO/Pad/Pad.h
+index a8480a0..29e064b 100644
+--- c/pcsx2/SIO/Pad/Pad.h
++++ i/pcsx2/SIO/Pad/Pad.h
 @@ -66,6 +66,19 @@ namespace Pad
  	// Sets the specified bind on a controller to the specified pressure (normalized to 0..1).
  	void SetControllerState(u32 controller, u32 bind, float value);
@@ -997,12 +1028,12 @@ index 97114274c..d6ba73645 100644
  	bool Freeze(StateWrapper& sw);
  
  	// Sets the state of the specified macro button.
-diff --git i/pcsx2/VMManager.cpp w/pcsx2/VMManager.cpp
-index 3e13593a4..b3d5826b0 100644
---- i/pcsx2/VMManager.cpp
-+++ w/pcsx2/VMManager.cpp
-@@ -1698,7 +1698,7 @@ void VMManager::Shutdown(bool save_resume_state)
- 	LoadSettings();
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index 23c8b44..6c1b214 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -1761,7 +1761,7 @@ bool VMManager::RequestReset()
+ 	return true;
  }
  
 -void VMManager::Reset()
@@ -1010,7 +1041,7 @@ index 3e13593a4..b3d5826b0 100644
  {
  	pxAssert(HasValidVM());
  
-@@ -1713,7 +1713,7 @@ void VMManager::Reset()
+@@ -1776,7 +1776,7 @@ void VMManager::Reset()
  		return;
  	}
  
@@ -1019,13 +1050,13 @@ index 3e13593a4..b3d5826b0 100644
  		return;
  
  	// Re-enforce hardcode mode constraints if we're now enabling it.
-diff --git i/pcsx2/VMManager.h w/pcsx2/VMManager.h
-index 8df625386..5a3c57ed6 100644
---- i/pcsx2/VMManager.h
-+++ w/pcsx2/VMManager.h
-@@ -121,8 +121,8 @@ namespace VMManager
- 	/// Destroys all system components.
- 	void Shutdown(bool save_resume_state);
+diff --git c/pcsx2/VMManager.h i/pcsx2/VMManager.h
+index ca98b2b..054a077 100644
+--- c/pcsx2/VMManager.h
++++ i/pcsx2/VMManager.h
+@@ -127,8 +127,8 @@ namespace VMManager
+ 	/// Resets all subsystems to a cold boot if it's safe to do so.
+ 	bool RequestReset();
  
 -	/// Resets all subsystems to a cold boot.
 -	void Reset();
@@ -1034,11 +1065,11 @@ index 8df625386..5a3c57ed6 100644
  
  	/// Runs the VM until the CPU execution is canceled.
  	void Execute();
-diff --git i/pcsx2/x86/ix86-32/iR5900.cpp w/pcsx2/x86/ix86-32/iR5900.cpp
-index 06f957fdd..26f9abafa 100644
---- i/pcsx2/x86/ix86-32/iR5900.cpp
-+++ w/pcsx2/x86/ix86-32/iR5900.cpp
-@@ -1505,6 +1505,7 @@ void dynarecCheckBreakpoint()
+diff --git c/pcsx2/x86/ix86-32/iR5900.cpp i/pcsx2/x86/ix86-32/iR5900.cpp
+index fd9ead8..3390063 100644
+--- c/pcsx2/x86/ix86-32/iR5900.cpp
++++ i/pcsx2/x86/ix86-32/iR5900.cpp
+@@ -1535,6 +1535,7 @@ void dynarecCheckBreakpoint()
  
  	const int bpFlags = isBreakpointNeeded(pc);
  	bool hit = false;
@@ -1046,7 +1077,7 @@ index 06f957fdd..26f9abafa 100644
  	//check breakpoint at current pc
  	if (bpFlags & 1)
  	{
-@@ -1515,16 +1516,20 @@ void dynarecCheckBreakpoint()
+@@ -1545,16 +1546,20 @@ void dynarecCheckBreakpoint()
  		}
  	}
  	//check breakpoint in delay slot
@@ -1068,7 +1099,7 @@ index 06f957fdd..26f9abafa 100644
  	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_EE);
  	VMManager::SetPaused(true);
  	recExitExecution();
-@@ -1556,6 +1561,33 @@ void dynarecMemcheck(size_t i)
+@@ -1586,6 +1591,33 @@ void dynarecMemcheck(size_t i)
  			DevCon.WriteLn("Hit load breakpoint @0x%x", cpuRegs.pc);
  	}
  

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from package_windows import verify_payload, matching_source
 from package_native import source_archive, sha
-from native_build import payload_hashes
+from native_build import identity, payload_hashes
 
 
 class WindowsPackageTests(unittest.TestCase):
@@ -45,6 +45,27 @@ class WindowsPackageTests(unittest.TestCase):
 
     def test_shared_mame_source_authority(self):
         self.check_source('mame-neogeo', 'mame-pc98')
+
+    def test_msvc_payload_cannot_supply_only_a_subset_of_required_inputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            source, payload, _ = self.fixture(Path(d))
+            lock = source / 'adapters/ppsspp/upstream.lock'
+            lock.parent.mkdir(parents=True)
+            lock.write_text('pinned')
+            recipe = lock.with_name('build.ps1')
+            recipe.write_text('build')
+            subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
+            (payload / 'game.exe').rename(payload / 'PPSSPPHeadless.exe')
+            key, inputs = identity(source, 'ppsspp', 'toolchain')
+            record = dict(identity=key, build_inputs=inputs, files=payload_hashes(payload))
+            (payload / 'NATIVE-BUILD.json').write_text(json.dumps(record))
+            self.assertEqual(verify_payload(payload, source, 'ppsspp'), 'PPSSPPHeadless.exe')
+            inputs['inputs'].pop('adapters/ppsspp/build.ps1')
+            import hashlib
+            record['identity'] = hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            (payload / 'NATIVE-BUILD.json').write_text(json.dumps(record))
+            with self.assertRaisesRegex(ValueError, 'build identity mismatch'):
+                verify_payload(payload, source, 'ppsspp')
 
     def test_source_digest_and_patch_identity_required(self):
         self.check_source('example', 'example')

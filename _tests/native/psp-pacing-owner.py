@@ -8,6 +8,7 @@ import tempfile
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--source', type=Path, required=True, help='patched Core/EmucapPacing.h')
 parser.add_argument('--sanitizer', choices=['address,undefined', 'thread'], default='address,undefined')
+parser.add_argument('--debugger-speed', action='store_true', help='check the upstream debugger override owner')
 args = parser.parse_args()
 network_source = (args.source.parent / 'HLE/sceNet.cpp').read_text()
 start = network_source.index('bool NetworkAllowSpeedControl()')
@@ -291,6 +292,25 @@ int main() {
     puts("PSP pacing owner: coherent snapshots and serialized previous/applied transitions passed");
 }
 '''
+if args.debugger_speed:
+    code = code.replace('    puts("PSP pacing owner:', r'''    EmucapPacingOwner debugger;
+    assert(debugger.ApplyDebuggerSpeed(true,true,true,false,30));
+    auto override = debugger.Read();
+    assert(override.fastForward && override.fpsLimit == FPSLimit::DEBUGGER);
+    auto agent = debugger.ApplySpeed(1);
+    assert(agent.accepted && agent.previous.debuggerFpsLimit == 30);
+    assert(agent.applied.percent == 1 && !agent.applied.fastForward);
+    assert(agent.applied.fpsLimit == FPSLimit::NORMAL && agent.applied.debuggerFpsLimit == 0);
+    debugger.ChangeLimit(FPSLimit::NORMAL,FPSLimit::CUSTOM1);
+    assert(debugger.ApplyDebuggerSpeed(false,false,true,true,0));
+    assert(debugger.Read().fpsLimit == FPSLimit::CUSTOM1);
+    uint32_t state=0;
+    debugger.PublishApctlState(state,4,true);
+    auto restricted=debugger.Read();
+    assert(!debugger.ApplyDebuggerSpeed(true,true,true,false,240));
+    assert(debugger.Read().revision == restricted.revision);
+    assert(debugger.Read().fpsLimit == restricted.fpsLimit);
+    puts("PSP pacing owner:''')
 with tempfile.TemporaryDirectory(prefix='emucap-psp-owner-') as temporary:
     path = Path(temporary)
     (path / 'EmucapPacing.h').write_text(args.source.read_text())

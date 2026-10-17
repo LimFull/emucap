@@ -1,0 +1,14 @@
+--- a/SDL/SDLMain.cpp
++++ b/SDL/SDLMain.cpp
+@@ -2011,7 +2011,10 @@
+ 	}
+ 	g_DesktopWidth = displayMode->w;
+ 	g_DesktopHeight = displayMode->h;
+-	g_RefreshRate = displayMode->refresh_rate;
++	// SDL reports zero when the display refresh rate is unknown (for example Xvfb).
++	// Keep host presentation throttling finite without changing the guest clock.
++	g_RefreshRate = std::isfinite(displayMode->refresh_rate) && displayMode->refresh_rate >= 1.0f
++		? displayMode->refresh_rate : 60.0f;
+ 	SDL_free(displayIDs);
+ 
+ 	// TODO: Should only call this if we actually intend to use OpenGL.

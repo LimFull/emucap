@@ -51,9 +51,6 @@ impl<G: GdbTransport> NdsBridge<G> {
         if let Some(name) = &self.env.name {
             obj.insert("name".into(), json!(name));
         }
-        if let Some(token) = &self.env.session_token {
-            obj.insert("session_token".into(), json!(token));
-        }
         if let Some(launch_id) = &self.env.launch_id {
             obj.insert("launch_id".into(), json!(launch_id));
         }

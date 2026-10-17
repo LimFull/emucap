@@ -7,10 +7,46 @@ import json
 import tarfile
 import plistlib
 import sys
-from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive, restore_package, sha, select_outputs
+import shutil
+from package_native import copy_dolphin_gui, copy_pcsx2_qt_plugins, files_manifest, one, format_of, copy_library, move_app_metadata, refresh_executable_metadata, macho_dependencies, source_archive, restore_package, sha, select_outputs, linux_dependencies
 
 
 class PackageBoundaries(unittest.TestCase):
+    def test_dolphin_gui_materializes_verified_source_license_links(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            src, stage = root / 'dolphin', root / 'package'
+            gui = src / 'build-emucap-gui/Binaries'
+            gui.mkdir(parents=True)
+            stage.mkdir()
+            (gui / 'dolphin-emu').write_bytes(b'executable')
+            (src / 'COPYING').write_bytes(b'license')
+            (src / 'LICENSES').mkdir()
+            (src / 'LICENSES/MIT.txt').write_bytes(b'mit')
+            (gui / 'COPYING').symlink_to(src / 'COPYING')
+            (gui / 'Licenses').symlink_to(src / 'LICENSES', target_is_directory=True)
+
+            copy_dolphin_gui(src, stage)
+
+            self.assertFalse((stage / 'gui/COPYING').is_symlink())
+            self.assertFalse((stage / 'gui/Licenses').is_symlink())
+            self.assertEqual((stage / 'gui/COPYING').read_bytes(), b'license')
+            self.assertEqual((stage / 'gui/Licenses/MIT.txt').read_bytes(), b'mit')
+            files_manifest(stage)
+
+    def test_dolphin_gui_rejects_license_link_outside_verified_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            src, stage = root / 'dolphin', root / 'package'
+            gui = src / 'build-emucap-gui/Binaries'
+            gui.mkdir(parents=True)
+            stage.mkdir()
+            outside = root / 'outside-license'
+            outside.write_bytes(b'host data')
+            (gui / 'COPYING').symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, 'escapes its verified source tree'):
+                copy_dolphin_gui(src, stage)
+
     def test_internal_link_and_content_identity(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -67,6 +103,25 @@ class PackageBoundaries(unittest.TestCase):
             metadata.write_bytes(b'conflicting identity')
             with self.assertRaisesRegex(ValueError, 'conflicting app metadata'):
                 move_app_metadata(root)
+
+    def test_relocated_executable_refreshes_every_identity_field(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            executable = root / 'np2kai_libretro.so'
+            executable.write_bytes(b'relocated executable')
+            metadata = root / 'emucap-np2kai-build.json'
+            metadata.write_text(json.dumps({
+                'core_sha256': '1' * 64,
+                'binary_sha256': '2' * 64,
+                'patchset_sha256': '3' * 64,
+            }))
+
+            refresh_executable_metadata(root, executable)
+
+            value = json.loads(metadata.read_text())
+            self.assertEqual(value['core_sha256'], sha(executable))
+            self.assertEqual(value['binary_sha256'], sha(executable))
+            self.assertEqual(value['patchset_sha256'], '3' * 64)
 
     @unittest.skipUnless(sys.platform == 'darwin', 'Mach-O loader fixture')
     def test_relocated_library_resolves_original_loader_relative_dependency(self):
@@ -144,6 +199,59 @@ class PackageBoundaries(unittest.TestCase):
             linux = build / 'pcsx2-qt/pcsx2-qt'
             linux.write_bytes(b'native')
             self.assertEqual(select_outputs(root, 'pcsx2', False)[2:], (linux.parent, linux))
+
+    def test_pcsx2_linux_package_carries_producer_qt_plugins(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            plugins = root / 'native-dependencies/pcsx2/plugins'
+            (plugins / 'platforms').mkdir(parents=True)
+            (plugins / 'platforms/libqxcb.so').write_bytes(b'xcb')
+            (plugins / 'imageformats').mkdir()
+            (plugins / 'imageformats/libqpng.so').write_bytes(b'png')
+            executable = root / 'package/runtime/pcsx2-qt'
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b'native')
+
+            copy_pcsx2_qt_plugins(root, executable)
+
+            self.assertEqual((executable.parent / 'plugins/platforms/libqxcb.so').read_bytes(), b'xcb')
+            self.assertEqual((executable.parent / 'plugins/imageformats/libqpng.so').read_bytes(), b'png')
+            self.assertEqual((executable.parent / 'qt.conf').read_text(), '[Paths]\nPlugins = plugins\n')
+
+    def test_pcsx2_linux_package_requires_xcb_plugin(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            executable = root / 'package/runtime/pcsx2-qt'
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b'native')
+            with self.assertRaisesRegex(ValueError, 'missing PCSX2 Qt platform plugin'):
+                copy_pcsx2_qt_plugins(root, executable)
+
+    @unittest.skipUnless(sys.platform == 'linux' and shutil.which('patchelf'), 'ELF loader fixture')
+    def test_linux_closure_uses_producer_libraries_for_transitive_imports(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            producer, system, stage = root / 'producer', root / 'system', root / 'stage'
+            for p in (producer, system, stage): p.mkdir()
+            for directory, value in ((producer, 7), (system, 99)):
+                code = directory / 'value.c'
+                code.write_text(f'int value(void) {{ return {value}; }}')
+                subprocess.run(['cc', '-shared', '-fPIC', str(code), '-Wl,-soname,libvalue.so.1',
+                                '-o', str(directory / 'libvalue.so.1')], check=True)
+            wrapper = system / 'wrapper.c'
+            wrapper.write_text('int value(void); int wrapper(void) { return value(); }')
+            subprocess.run(['cc', '-shared', '-fPIC', str(wrapper), str(system / 'libvalue.so.1'),
+                            '-Wl,-soname,libwrapper.so.1', '-Wl,-rpath,' + str(system),
+                            '-o', str(system / 'libwrapper.so.1')], check=True)
+            main = root / 'main.c'
+            main.write_text('int value(void); int wrapper(void); int main(void) { return value()!=7 || wrapper()!=7; }')
+            binary = stage / 'probe'
+            subprocess.run(['cc', str(main), str(producer / 'libvalue.so.1'), str(system / 'libwrapper.so.1'),
+                            '-Wl,-rpath,' + str(producer), '-Wl,-rpath,' + str(system), '-o', str(binary)], check=True)
+            linux_dependencies(stage, [producer])
+            producer.rename(root / 'unavailable-producer')
+            system.rename(root / 'unavailable-system')
+            subprocess.run([str(binary)], check=True)
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:

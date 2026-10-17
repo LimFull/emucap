@@ -1,8 +1,8 @@
-diff --git i/UI/NativeApp.cpp w/UI/NativeApp.cpp
-index 2804ec2..227747c 100644
---- i/UI/NativeApp.cpp
-+++ w/UI/NativeApp.cpp
-@@ -558,6 +558,20 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
+diff --git a/UI/NativeApp.cpp b/UI/NativeApp.cpp
+index cdc5528810..e03f342172 100644
+--- a/UI/NativeApp.cpp
++++ b/UI/NativeApp.cpp
+@@ -667,6 +667,20 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
  	}
  #endif
  

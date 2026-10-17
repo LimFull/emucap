@@ -11,7 +11,7 @@ once per field. IRQs are disabled. Initialized backdrop colours alternate red/wh
 | `0xC102..0xC103` | Fields with button 2 held, little-endian u16 |
 | `0xC104` | Alternating border register value |
 
-The field and held-input counters must advance by `(p + 1 + q, p)` for a frozen
+The field and held-input counters must advance by `(p + q, p)` for a frozen
 `tap(a, press_frames=p, after_frames=q)`. Without input only the field counter
 advances. Compare from one saved instruction boundary; counters wrap modulo 65536.
 This is a scheduler/input fixture, not a commercial-game compatibility test.

@@ -32,6 +32,8 @@ mod controlled;
 mod mame_neogeo;
 #[path = "launch/media.rs"]
 mod media;
+#[path = "launch/mednafen.rs"]
+mod mednafen;
 #[path = "launch/mesen.rs"]
 mod mesen;
 #[path = "launch/openmsx.rs"]
@@ -56,6 +58,7 @@ pub(crate) use plan::make_launch_plan;
 pub(crate) use run::{make_launch, occupied_graceful};
 
 use controlled::*;
+use mednafen::*;
 use mesen::*;
 use pc98::*;
 use pc98_preconditions::*;

@@ -130,6 +130,10 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         }
 
         let snapshots = parse_snapshots(self.profile, params.get("snapshot"))?;
+        let id = self.next_breakpoint_id;
+        let next_id = id
+            .checked_add(1)
+            .ok_or_else(|| BridgeError::BadParams("breakpoint id space exhausted".into()))?;
         let mut breakpoint = NeoGeoBreakpoint {
             kind: kind.into(),
             start,
@@ -150,8 +154,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         }
         breakpoint.backend_id = Some(backend_id);
         breakpoint.arm_state = NeoGeoArmState::Armed;
-        let id = self.next_breakpoint_id;
-        self.next_breakpoint_id = self.next_breakpoint_id.saturating_add(1);
+        self.next_breakpoint_id = next_id;
         self.breakpoints.insert(id, breakpoint);
         Ok(json!({"id":id, "set":true, "arm_state":"armed"}))
     }

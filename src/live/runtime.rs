@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,8 +133,8 @@ impl Default for LeaseView {
 }
 
 impl RuntimeStore {
-    pub fn discover() -> Self {
-        Self::new(crate::launch::emu_home_base().join("sessions"))
+    pub fn discover() -> io::Result<Self> {
+        Ok(Self::new(crate::launch::emu_home_base()?.join("sessions")))
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -212,6 +212,20 @@ impl RuntimeStore {
             .join(format!("session-token-{port}"))
     }
 
+    pub fn broker_controller_token_path(&self, port: u16) -> PathBuf {
+        self.root
+            .join("compatibility")
+            .join(format!("broker-controller-token-{port}"))
+    }
+
+    pub fn write_broker_controller_token(&self, port: u16, token: &str) -> io::Result<()> {
+        self.write_private_token(&self.broker_controller_token_path(port), token)
+    }
+
+    pub fn read_broker_controller_token(&self, port: u16) -> io::Result<Option<String>> {
+        Self::read_private_token(&self.broker_controller_token_path(port))
+    }
+
     pub fn persisted_port_path(&self, identity: &str, base: u16) -> io::Result<PathBuf> {
         validate_compatibility_identity(identity)?;
         if base == 0 {
@@ -227,21 +241,36 @@ impl RuntimeStore {
     }
 
     pub fn write_compatibility_token(&self, port: u16, token: &str) -> io::Result<()> {
+        self.write_private_token(&self.compatibility_token_path(port), token)
+    }
+
+    fn prepare_private_file_parent(&self, path: &Path) -> io::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "runtime file has no parent")
+        })?;
+        self.create_managed_dir(parent)
+    }
+
+    fn write_private_token(&self, path: &Path, token: &str) -> io::Result<()> {
         if token.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "refusing to write an empty compatibility token",
+                "refusing to write an empty runtime token",
             ));
         }
-        let path = self.compatibility_token_path(port);
-        validate_existing_private_file(&path)?;
-        write_atomic_bytes(&path, token.as_bytes())
+        validate_existing_private_file(path)?;
+        self.prepare_private_file_parent(path)?;
+        validate_existing_private_file(path)?;
+        write_atomic_bytes(path, token.as_bytes())
     }
 
     pub fn read_compatibility_token(&self, port: u16) -> io::Result<Option<String>> {
-        let path = self.compatibility_token_path(port);
-        validate_existing_private_file(&path)?;
-        let Some(bytes) = read_bounded_if_exists(&path)? else {
+        Self::read_private_token(&self.compatibility_token_path(port))
+    }
+
+    fn read_private_token(path: &Path) -> io::Result<Option<String>> {
+        validate_existing_private_file(path)?;
+        let Some(bytes) = read_bounded_if_exists(path)? else {
             return Ok(None);
         };
         let token = String::from_utf8(bytes)
@@ -250,7 +279,7 @@ impl RuntimeStore {
         if token.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("empty compatibility token file: {}", path.display()),
+                format!("empty runtime token file: {}", path.display()),
             ));
         }
         Ok(Some(token.to_string()))
@@ -258,6 +287,8 @@ impl RuntimeStore {
 
     pub fn write_persisted_port(&self, identity: &str, base: u16, port: u16) -> io::Result<()> {
         let path = self.persisted_port_path(identity, base)?;
+        validate_existing_private_file(&path)?;
+        self.prepare_private_file_parent(&path)?;
         validate_existing_private_file(&path)?;
         write_atomic_bytes(&path, port.to_string().as_bytes())
     }
@@ -515,7 +546,7 @@ impl RuntimeStore {
                         ),
                     ));
                 }
-                Ok(_) => {}
+                Ok(_) => crate::private_fs::verify_private_dir(&current)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     create_private_dir(&current)?;
                 }
@@ -537,6 +568,10 @@ impl PreparedGeneration {
 
     pub fn adapter_failure_path(&self) -> PathBuf {
         self.store.adapter_failure_path(self.port, &self.launch_id)
+    }
+
+    pub fn generation_dir(&self) -> PathBuf {
+        self.store.generation_dir(self.port, &self.launch_id)
     }
 
     pub fn manifest(&self, spec: ManifestSpec) -> CurrentManifest {
@@ -873,22 +908,10 @@ pub fn control_session_key() -> Option<String> {
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("refusing symlink runtime directory: {}", path.display()),
-        ));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    crate::private_fs::ensure_private_dir(path)
 }
 
 fn validate_compatibility_identity(identity: &str) -> io::Result<()> {
@@ -924,31 +947,7 @@ fn validate_existing_private_file(path: &Path) -> io::Result<()> {
             format!("runtime path is not a regular file: {}", path.display()),
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let owner = metadata.uid();
-        let current = unsafe { libc::geteuid() };
-        if owner != current {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "runtime file is owned by uid {owner}, current uid is {current}: {}",
-                    path.display()
-                ),
-            ));
-        }
-        if metadata.mode() & 0o077 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "runtime file is accessible by group or other users: {}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
+    crate::private_fs::verify_private_file(path)
 }
 
 pub(crate) fn write_atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -968,31 +967,8 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "runtime path has no parent"))?;
     create_private_dir(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("capsule"),
-        ulid::Ulid::generate().to_string().to_lowercase()
-    ));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        crate::path_safety::replace_file_atomically(&tmp, path)?;
-        sync_parent(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    crate::private_fs::write_private_file(path, bytes)?;
+    sync_parent(parent)
 }
 
 fn open_private_lock(path: &Path) -> io::Result<File> {

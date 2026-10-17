@@ -62,3 +62,52 @@ fn load_rejects_a_symlink_region_member() {
     .unwrap();
     assert!(matches!(load(tmp.path()), Err(DumpError::UnsafeMember(_))));
 }
+
+#[test]
+fn declared_region_size_is_enforced_on_the_read_handle() {
+    for (declared, bytes, accepted) in [
+        (0, vec![], true),
+        (1, vec![1], true),
+        (0, vec![1], false),
+        (2, vec![1], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ram.bin"), bytes).unwrap();
+        fs::write(
+            dir.path().join("regions.json"),
+            serde_json::to_vec(&vec![RegionMeta {
+                name: "ram".into(),
+                memory_type: "ram".into(),
+                base_address: 0,
+                size: declared,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let result = load(dir.path());
+        if accepted {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(DumpError::SizeMismatch(_))));
+        }
+    }
+}
+
+#[test]
+fn aggregate_dump_admission_precedes_member_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let entries: Vec<_> = (0..2)
+        .map(|index| RegionMeta {
+            name: format!("ram{index}"),
+            memory_type: "ram".into(),
+            base_address: 0,
+            size: MAX_DUMP_BYTES / 2 + 1,
+        })
+        .collect();
+    fs::write(
+        dir.path().join("regions.json"),
+        serde_json::to_vec(&entries).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(load(dir.path()), Err(DumpError::SizeMismatch(_))));
+}

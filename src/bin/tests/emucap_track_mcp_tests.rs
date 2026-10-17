@@ -442,3 +442,243 @@ async fn log_finding_requires_rom_or_active() {
         .await;
     assert_ne!(r.is_error, Some(true));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tracking_writes_preserve_every_entry() {
+    let (dir, _env) = temp_env();
+    let server = Arc::new(EmucapTrack::new());
+    let started = server
+        .run_start(Parameters(TrackRunStartArgs {
+            rom_sha1: "concurrent".into(),
+            connection_ref: None,
+            goal: None,
+            description: None,
+            tags: vec![],
+        }))
+        .await;
+    assert_ne!(started.is_error, Some(true));
+    let run_id = server
+        .active_run
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .run_id
+        .clone();
+    let mut workers = Vec::new();
+    for index in 0..32 {
+        let server = server.clone();
+        workers.push(tokio::spawn(async move {
+            server
+                .log_metric(Parameters(LogMetricArgs {
+                    key: format!("metric-{index}"),
+                    value: index as f64,
+                }))
+                .await
+        }));
+    }
+    for worker in workers {
+        assert_ne!(worker.await.unwrap().is_error, Some(true));
+    }
+    let run = emucap::track::store::load_run(dir.path(), "concurrent", &run_id).unwrap();
+    assert_eq!(run.metrics.len(), 32);
+    let unique: std::collections::BTreeSet<_> = run.metrics.iter().map(|entry| &entry.id).collect();
+    assert_eq!(unique.len(), 32);
+}
+
+#[test]
+fn cancelled_artifact_request_keeps_ledger_owned_until_worker_finishes() {
+    let (dir, _env) = temp_env();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server = Arc::new(EmucapTrack::new());
+        server
+            .run_start(Parameters(TrackRunStartArgs {
+                rom_sha1: "artifact-race".into(),
+                connection_ref: None,
+                goal: None,
+                description: None,
+                tags: vec![],
+            }))
+            .await;
+        let run_id = server
+            .active_run
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .run_id
+            .clone();
+        let path = dir.path().join("evidence.bin");
+        std::fs::write(&path, b"evidence").unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        ready.await.unwrap();
+        let artifact_server = server.clone();
+        let artifact = tokio::spawn(async move {
+            artifact_server
+                .log_artifact(Parameters(LogArtifactArgs {
+                    kind: "evidence".into(),
+                    path: path.to_string_lossy().into_owned(),
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.transaction_gate.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        artifact.abort();
+        assert!(artifact.await.unwrap_err().is_cancelled());
+        let finish_server = server.clone();
+        let mut finish = tokio::spawn(async move {
+            finish_server
+                .run_finish(Parameters(RunFinishArgs {
+                    status: Some("done".into()),
+                    run_id: None,
+                }))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut finish)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        assert_ne!(finish.await.unwrap().is_error, Some(true));
+        let run = emucap::track::store::load_run(dir.path(), "artifact-race", &run_id).unwrap();
+        assert_eq!(run.status, emucap::track::model::RunStatus::Done);
+        assert_eq!(run.artifacts.len(), 1);
+        assert!(server.active_run.lock().unwrap().is_none());
+    });
+}
+
+#[tokio::test]
+async fn aggregate_admission_failure_preserves_active_run_and_reports_bootstrap_lookup() {
+    let (dir, _g) = temp_env();
+    let root = dir.path();
+    let server = EmucapTrack::new();
+    let started = server
+        .run_start(Parameters(TrackRunStartArgs {
+            rom_sha1: "sha-a".into(),
+            connection_ref: Some("conn".into()),
+            goal: None,
+            description: None,
+            tags: vec![],
+        }))
+        .await;
+    let started: serde_json::Value = serde_json::from_str(&body_text(&started)).unwrap();
+    let id = started["run_id"].as_str().unwrap();
+    let mut run = emucap::track::store::load_run(root, "sha-a", id).unwrap();
+    run.tags = vec![String::new(); 262_145];
+    emucap::track::store::save_run(root, &run).unwrap();
+    let path = emucap::track::store::run_dir(root, "sha-a", id)
+        .unwrap()
+        .join("run.json");
+    let before = std::fs::read(&path).unwrap();
+    let refused = server
+        .run_start(Parameters(TrackRunStartArgs {
+            rom_sha1: "sha-b".into(),
+            connection_ref: Some("conn".into()),
+            goal: None,
+            description: None,
+            tags: vec![],
+        }))
+        .await;
+    let refused: serde_json::Value = serde_json::from_str(&body_text(&refused)).unwrap();
+    assert_eq!(refused["error"]["code"], "resource_limit");
+    assert_eq!(
+        server.active_run.lock().unwrap().as_ref().unwrap().run_id,
+        id
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!root.join("roms/sha-b").exists());
+    let direct = server
+        .get_run(Parameters(GetRunArgs {
+            rom_sha1: "sha-a".into(),
+            run_id: id.into(),
+        }))
+        .await;
+    assert_ne!(direct.is_error, Some(true));
+    let bootstrap = server.bootstrap(Parameters(EmptyArgs::default())).await;
+    let bootstrap: serde_json::Value = serde_json::from_str(&body_text(&bootstrap)).unwrap();
+    assert_eq!(bootstrap["ok"], true);
+    assert_eq!(bootstrap["running_runs_error"]["code"], "resource_limit");
+    assert_eq!(bootstrap["active_run"]["run_id"], id);
+    // output_path is not a bypass and cannot overwrite an existing result on refusal.
+    let output = root.join("query.json");
+    std::fs::write(&output, b"previous").unwrap();
+    let result = server
+        .query_runs(Parameters(QueryRunsArgs {
+            rom_sha1: None,
+            goal: None,
+            status: None,
+            output_path: Some(output.display().to_string()),
+        }))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(std::fs::read(output).unwrap(), b"previous");
+}
+
+#[tokio::test]
+async fn direct_run_lifecycle_remains_available_above_scan_element_budget() {
+    let (dir, _g) = temp_env();
+    let server = EmucapTrack::new();
+    let started = server
+        .run_start(Parameters(TrackRunStartArgs {
+            rom_sha1: "large-direct-run".into(),
+            connection_ref: None,
+            goal: None,
+            description: None,
+            tags: vec![String::new(); 262_144],
+        }))
+        .await;
+    assert_ne!(started.is_error, Some(true));
+    let started: serde_json::Value = serde_json::from_str(&body_text(&started)).unwrap();
+    let id = started["run_id"].as_str().unwrap();
+    let logged = server
+        .log_metric(Parameters(LogMetricArgs {
+            key: "frames".into(),
+            value: 1.0,
+        }))
+        .await;
+    assert_ne!(logged.is_error, Some(true));
+    let finished = server
+        .run_finish(Parameters(RunFinishArgs {
+            status: Some("done".into()),
+            run_id: None,
+        }))
+        .await;
+    assert_ne!(finished.is_error, Some(true));
+    let run = emucap::track::store::load_run(dir.path(), "large-direct-run", id).unwrap();
+    assert_eq!(run.status, emucap::track::model::RunStatus::Done);
+    assert_eq!(run.metrics.len(), 1);
+    assert!(server.active_run.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn heavy_queries_share_the_tracking_transaction_gate() {
+    let (_dir, _g) = temp_env();
+    let server = EmucapTrack::new();
+    let guard = server.transaction_gate.lock().await;
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        server.bootstrap(Parameters(EmptyArgs::default()))
+    )
+    .await
+    .is_err());
+    drop(guard);
+    let response = server.bootstrap(Parameters(EmptyArgs::default())).await;
+    assert_ne!(response.is_error, Some(true));
+}

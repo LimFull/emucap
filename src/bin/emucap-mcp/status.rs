@@ -207,7 +207,9 @@ fn public_method_names(methods: &[String]) -> Vec<String> {
                     push_unique(&mut normalized, public_name);
                 }
             }
-            "step" | "step_instructions" => push_unique(&mut normalized, "step"),
+            "step" | "step_instructions" | "step_input_polls" => {
+                push_unique(&mut normalized, "step")
+            }
             method => push_unique(&mut normalized, method),
         }
     }
@@ -322,10 +324,13 @@ fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contract
                 .is_some_and(|units| units.iter().any(|unit| unit == "frames"))
         })
         .unwrap_or(true);
-    let tap_ready =
-        frame_step_available && raw_has("set_input") && raw_has("step") && raw_has("pause");
-    let hold_until_ready = tap_ready && raw_has("read_memory");
-    let click_pointer_ready = tap_ready && pointer_button_available;
+    let tap_ready = ((frame_step_available && raw_has("step")) || raw_has("step_input_polls"))
+        && raw_has("set_input")
+        && raw_has("pause");
+    let hold_until_ready =
+        frame_step_available && raw_has("step") && tap_ready && raw_has("read_memory");
+    let click_pointer_ready =
+        frame_step_available && raw_has("step") && tap_ready && pointer_button_available;
     let drag_pointer_ready = click_pointer_ready && raw_has("move_pointer");
     let raw_method_names = methods
         .iter()
@@ -363,7 +368,12 @@ fn redact_identity(identity: &EmulatorIdentity) -> serde_json::Value {
 fn token_file_status(port: Option<u16>) -> serde_json::Value {
     match port {
         Some(p) => {
-            let path = tcp::session_token_path(p);
+            let path = match tcp::session_token_path(p) {
+                Ok(path) => path,
+                Err(error) => {
+                    return serde_json::json!({"path": null, "present": false, "error": error.to_string()})
+                }
+            };
             serde_json::json!({
                 "path": path.display().to_string(),
                 "present": path.is_file(),
@@ -413,7 +423,12 @@ fn abs_path_json(root: &Path, parts: &[&str]) -> serde_json::Value {
 }
 
 pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
-    let runtime_store = emucap::live::runtime::RuntimeStore::discover();
+    let runtime_store = match emucap::live::runtime::RuntimeStore::discover() {
+        Ok(store) => store,
+        Err(error) => {
+            return serde_json::json!({"runtime_capsule": null, "error": error.to_string()})
+        }
+    };
     let capsule_paths = serde_json::json!({
         "root": runtime_store.root().display().to_string(),
         "current": port.map(|p| runtime_store.current_path(p).display().to_string()),
@@ -426,7 +441,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "error": "emucap repo root not found from EMUCAP_REPO_ROOT, current_exe, or cwd",
         });
     };
-    let token_file = port.map(tcp::session_token_path);
+    let token_file = port.map(|p| runtime_store.compatibility_token_path(p));
     serde_json::json!({
         "repo_root": root.display().to_string(),
         "repo_root_env": "EMUCAP_REPO_ROOT",
@@ -529,7 +544,7 @@ fn build_supported_systems_value() -> serde_json::Value {
             "aliases": ["nintendo64", "nintendo-64"],
             "adapter": "mupen64plus",
             "content": ["z64", "n64", "v64"],
-            "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, a bounded frozen best-effort R4300 call stack, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
+            "notes": "The pinned Mupen64Plus pure-interpreter adapter keeps the Rice renderer in both modes; display controls window visibility. Both modes expose rendered-frame, input-poll, and R4300 instruction stepping together with input, PNG capture, native save/load, pause/resume/reset, R4300 state and memory, breakpoints, events, disassembly, and a bounded frozen best-effort call stack. RSP state is not exposed."
         },
         {
             "system": "msx",
@@ -818,7 +833,7 @@ fn reconcile_runtime_instance_entry(status: &mut serde_json::Value, disposition:
 pub(crate) fn reconcile_connected_recording(
     link: &mut dyn EmulatorLink,
 ) -> Result<bool, emucap::live::recording::RecordingError> {
-    reconcile_connected_recording_with_store(link, emucap::live::runtime::RuntimeStore::discover())
+    reconcile_connected_recording_with_store(link, emucap::live::runtime::RuntimeStore::discover()?)
 }
 
 fn reconcile_connected_recording_with_store(
@@ -1073,12 +1088,14 @@ pub(crate) fn enrich_link_status(
             "launcher_contract": "Use the MCP launch tool with status.listening_port. It passes the per-port session token automatically.",
         }),
     );
-    if let Some(port) = port {
-        if let Ok(Some(current)) =
-            emucap::live::runtime::RuntimeStore::discover().read_current(port)
-        {
-            obj.insert("runtime_instance".into(), current.public_value());
-        }
+    let runtime_current = port.and_then(|port| {
+        emucap::live::runtime::RuntimeStore::discover()
+            .and_then(|store| store.read_current(port))
+            .ok()
+            .flatten()
+    });
+    if let Some(current) = runtime_current.as_ref() {
+        obj.insert("runtime_instance".into(), current.public_value());
     }
     if let Some(identity) = identity {
         // 실행 중 에뮬레이터(어댑터)가 빌드/로드된 emucap git hash — server_build와 대칭. 운영자가
@@ -1090,30 +1107,35 @@ pub(crate) fn enrich_link_status(
         // 소유 인스턴스 정리 정보: 이 포트의 pidfile에서 이 세션이 띄운 프로세스 PID를 재발견해준다. agent가
         // launch 응답을 지나쳐도(다음 턴 등) 여기 pids만 kill하면 되므로, 자기 것을 못 찾아 broad pkill로
         // 도망쳐 타 세션 에뮬레이터를 죽이는 사고를 막는다.
-        if let (Some(p), Some(emu_dir)) = (
+        if let (Some(p), Some(current), Some(system), Some(launch_id)) = (
             port,
-            identity.system.as_deref().and_then(emu_dir_for_system),
+            runtime_current.as_ref(),
+            identity.system.as_deref(),
+            identity.launch_id.as_deref(),
         ) {
-            obj.insert("owned_instance".into(), owned_instance_json(emu_dir, p));
+            if system_has_owned_pidfiles(system) && current.launch_id == launch_id {
+                obj.insert(
+                    "owned_instance".into(),
+                    owned_instance_json(p, &current.launch_id),
+                );
+            }
         }
     }
 }
 
-/// `status.emulator_identity.system` → 런처가 pidfile을 쓰는 emu 홈 디렉터리 이름(pidfile이 사는 곳).
-/// 아직 런처가 per-port pidfile을 남기는 어댑터만 매핑한다(그 외는 None → owned_instance 생략).
-fn emu_dir_for_system(system: &str) -> Option<&'static str> {
-    match system {
-        "nds" => Some("desmume-nds"),
-        "psp" => Some("ppsspp"),
-        "ps2" => Some("pcsx2"),
-        _ => None,
-    }
+fn system_has_owned_pidfiles(system: &str) -> bool {
+    matches!(system, "nds" | "psp" | "ps2")
 }
 
-/// 이 포트 RUN_DIR의 `*.pid`를 읽어 소유 인스턴스 PID + 정리 규칙을 반환한다. best-effort(디렉터리/파일이
-/// 없으면 빈 pids). PID는 launch 시 기록된 값이라 프로세스가 이미 죽었을 수 있으니 kill 전 확인은 agent 몫.
-fn owned_instance_json(emu_dir: &str, port: u16) -> serde_json::Value {
-    let run_dir = emucap::launch::emu_home_dir(emu_dir, port);
+/// Read diagnostic PID files from the exact current generation. PID files do not replace the
+/// runtime manifest's launch and process-start identities.
+fn owned_instance_json(port: u16, launch_id: &str) -> serde_json::Value {
+    let run_dir = match emucap::live::runtime::RuntimeStore::discover() {
+        Ok(store) => store.generation_dir(port, launch_id),
+        Err(error) => {
+            return serde_json::json!({"run_dir": null, "pids": [], "error": error.to_string()})
+        }
+    };
     let mut pids = Vec::new();
     let mut pidfiles = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&run_dir) {

@@ -54,6 +54,15 @@ $MutexName = "Local\emucap-build-$mutexSuffix"
 $BuildMutex = [System.Threading.Mutex]::new($false, $MutexName)
 $MutexHeld = $false
 $OwnerFile = Join-Path $Work ".build-owner.json"
+$BuildEnvironmentNames = @(
+    'CL', 'DOTNET_ROOT', 'DOTNET_ROOT_X64', 'DOTNET_HOST_PATH',
+    'DOTNET_MSBUILD_SDK_RESOLVER_CLI_DIR', 'MSBuildSDKsPath',
+    'MSBuildEnableWorkloadResolver'
+)
+$PreviousBuildEnvironment = @{}
+foreach ($Name in $BuildEnvironmentNames) {
+    $PreviousBuildEnvironment[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
+}
 
 try {
     try {
@@ -135,7 +144,8 @@ try {
         (Join-Path $Here "patches/0023-add-native-control-service-and-progress.patch"),
         (Join-Path $Here "patches/0024-preserve-gba-input-observation.patch"),
         (Join-Path $Here "patches/0025-fix-windows-native-build.patch"),
-        (Join-Path $Here "patches/0026-publish-windows-input-devices-before-use.patch")
+        (Join-Path $Here "patches/0026-publish-windows-input-devices-before-use.patch"),
+        (Join-Path $Here "patches/0027-safe-callback-removal-during-dispatch.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {
@@ -174,10 +184,39 @@ try {
     }
     if (-not $MsBuild) { throw "Visual Studio 2022 MSBuild was not found" }
 
+    $DotNet = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+    if (-not $DotNet) { throw ".NET 8 SDK was not found" }
+    $SdkLine = @(& $DotNet.Source --list-sdks | Where-Object { $_ -match '^8\.0\.' }) | Select-Object -Last 1
+    if (-not $SdkLine -or $SdkLine -notmatch '^(\S+) \[(.+)\]$') {
+        throw ".NET 8 SDK was not found through $($DotNet.Source)"
+    }
+    $SdkVersion = $Matches[1]
+    $SdkBase = $Matches[2]
+    $DotNetRoot = Split-Path -Parent $SdkBase
+    $SdkRoot = Join-Path $SdkBase $SdkVersion
+    $SdkDirectory = Join-Path $SdkRoot 'Sdks'
+    if (-not (Test-Path -LiteralPath $SdkDirectory -PathType Container)) {
+        throw ".NET SDK directory is missing: $SdkDirectory"
+    }
+
     Write-Host "Building MesenCE locally with Visual Studio Release/x64"
+    # Upstream has comments in both UTF-8 and legacy Japanese encodings. The
+    # executable tokens are ASCII, but /WX otherwise turns Visual C++'s
+    # locale-dependent source-decoding diagnostics into build failures.
+    $env:CL = (($PreviousBuildEnvironment['CL'], '/wd4819', '/wd4828' | Where-Object { $_ }) -join ' ').Trim()
+    $env:DOTNET_ROOT = $DotNetRoot
+    $env:DOTNET_ROOT_X64 = $DotNetRoot
+    $env:DOTNET_HOST_PATH = $DotNet.Source
+    $env:DOTNET_MSBUILD_SDK_RESOLVER_CLI_DIR = $DotNetRoot
+    $env:MSBuildSDKsPath = $SdkDirectory
+    # The standalone SDK has no optional workload manifests. Mesen uses none;
+    # disabling that resolver lets Visual Studio MSBuild consume the SDK tree.
+    $env:MSBuildEnableWorkloadResolver = 'false'
     Get-ChildItem -Recurse -File -Filter "emucap-mesen-build.json" -Path (Join-Path $Source "bin") -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
-    Invoke-Native $MsBuild @((Join-Path $Source "Mesen.sln"), "/restore", "/m", "/t:Rebuild", "/p:Configuration=Release", "/p:Platform=x64")
+    # Build workers belong to this invocation. Disable MSBuild node reuse and
+    # Roslyn's shared compiler so a completed build leaves no helper processes.
+    Invoke-Native $MsBuild @((Join-Path $Source "Mesen.sln"), "/restore", "/m", "/nr:false", "/t:Rebuild", "/p:Configuration=Release", "/p:Platform=x64", "/p:UseSharedCompilation=false")
     $Binary = Get-ChildItem -Recurse -File -Filter "Mesen.exe" -Path (Join-Path $Source "bin/win-x64/Release") |
         Select-Object -First 1
     if (-not $Binary) { throw "Mesen build completed without Mesen.exe under bin/win-x64/Release" }
@@ -197,6 +236,9 @@ try {
     Write-Host "OK: $($Binary.FullName)"
     Write-Host "metadata: $Metadata"
 } finally {
+    foreach ($Name in $BuildEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($Name, $PreviousBuildEnvironment[$Name], 'Process')
+    }
     Remove-Item -Force -LiteralPath $OwnerFile -ErrorAction SilentlyContinue
     if ($MutexHeld) {
         $BuildMutex.ReleaseMutex()

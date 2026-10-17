@@ -2,18 +2,42 @@
 //!
 //! Flycast reads its config from a per-OS location: macOS uses `$HOME`, Linux uses XDG, and Windows
 //! uses the executable directory. To avoid touching the user's real install we run an emucap-owned
-//! runtime copy and seed an emucap-owned config: copy the user's emu.cfg into it when available and set
-//! only the emucap needs — interpreter, mute, and GDB — on that copy.
+//! runtime copy and seed an emucap-owned config. An operator config is imported only through the
+//! explicit `EMUCAP_FLYCAST_CONFIG` input; interpreter, mute, and GDB are set on the private copy.
 
 use super::spec::{flycast_spec, SpecOpts};
 use std::path::{Path, PathBuf};
 
+const MAX_IMPORTED_CONFIG_BYTES: u64 = 1024 * 1024;
+
+fn imported_config() -> std::io::Result<String> {
+    let Some(raw) = std::env::var_os("EMUCAP_FLYCAST_CONFIG") else {
+        return Ok(String::new());
+    };
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "EMUCAP_FLYCAST_CONFIG must be an absolute regular file",
+        ));
+    }
+    let bytes =
+        crate::path_safety::read_bounded_regular_file_no_follow(&path, MAX_IMPORTED_CONFIG_BYTES)?;
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("EMUCAP_FLYCAST_CONFIG is not UTF-8: {error}"),
+        )
+    })
+}
+
 /// Resolve the Flycast binary: `FLYCAST_APP` override, else the emucap-owned build output,
 /// a legacy `$HOME/flycast/build` build, or the first Flycast executable on PATH.
-pub fn build_home() -> PathBuf {
-    std::env::var_os("EMUCAP_FLYCAST_BUILD_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| super::emu_home_base().join("flycast-build"))
+pub fn build_home() -> std::io::Result<PathBuf> {
+    match std::env::var_os("EMUCAP_FLYCAST_BUILD_HOME") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(super::emu_home_base()?.join("flycast-build")),
+    }
 }
 
 pub fn resolve_binary() -> Option<PathBuf> {
@@ -28,7 +52,7 @@ pub fn resolve_binary() -> Option<PathBuf> {
             }
         }
     }
-    let build_home = build_home();
+    let build_home = build_home().ok()?;
     for candidate in [
         "work/build/Flycast.app/Contents/MacOS/Flycast",
         "work/build/flycast",
@@ -39,8 +63,11 @@ pub fn resolve_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let base = PathBuf::from(home).join("flycast/build");
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    {
+        let base = home.join("flycast/build");
         for candidate in ["Flycast.app/Contents/MacOS/Flycast", "flycast"] {
             let p = base.join(candidate);
             if super::is_runnable_file(&p) {
@@ -82,7 +109,10 @@ pub fn default_install_candidates() -> Vec<PathBuf> {
             "ProgramFiles(x86)",
             "USERPROFILE",
         ] {
-            if let Some(base) = std::env::var_os(key).map(PathBuf::from) {
+            if let Some(base) = std::env::var_os(key)
+                .map(PathBuf::from)
+                .filter(|base| base.is_absolute())
+            {
                 candidates.push(base.join("Programs/Flycast/Flycast.exe"));
                 candidates.push(base.join("Flycast/Flycast.exe"));
             }
@@ -90,7 +120,10 @@ pub fn default_install_candidates() -> Vec<PathBuf> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+        {
             candidates.push(home.join(".local/bin/flycast"));
         }
     }
@@ -131,7 +164,7 @@ fn app_bundle_root(binary: &Path) -> Option<(&Path, PathBuf)> {
     None
 }
 
-/// Run Flycast from an emucap-owned copy. This keeps rebuilds, per-port config writes, and Windows'
+/// Run Flycast from an emucap-owned copy. This keeps rebuilds, generation config writes, and Windows'
 /// executable-directory config model away from the user's real install.
 pub fn prepare_runtime_binary(
     source_binary: &Path,
@@ -187,35 +220,20 @@ pub fn prepare_runtime_binary(
 /// Seed the isolated config and launch Flycast detached, pointed at the emucap-owned home so the user's
 /// real Flycast config is untouched. Returns the child pid.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
-    let iso_home = super::emu_home_dir("flycast", l.port);
+    let iso_home = super::emu_generation_dir("flycast", l.port, l.runtime)?;
     let runtime = prepare_runtime_binary(l.binary, &iso_home)?;
     let launch_binary = runtime.binary.clone();
 
-    // Per-OS: where Flycast reads config, which env redirects it there, and where the user's real cfg is.
+    // Per-OS: where Flycast reads config and which environment redirects it there.
     #[cfg(target_os = "macos")]
-    let (iso_cfg_dir, iso_env, user_srcs): (PathBuf, Vec<(String, String)>, Vec<PathBuf>) = {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let srcs = home
-            .iter()
-            .flat_map(|h| {
-                [
-                    h.join(".flycast/emu.cfg"),
-                    h.join("Library/Application Support/flycast/emu.cfg"),
-                    h.join("Library/Application Support/Flycast/emu.cfg"),
-                ]
-            })
-            .collect();
+    let (iso_cfg_dir, iso_env): (PathBuf, Vec<(String, String)>) = {
         (
             iso_home.join(".flycast"),
             vec![("HOME".into(), iso_home.to_string_lossy().into_owned())],
-            srcs,
         )
     };
     #[cfg(all(unix, not(target_os = "macos")))]
-    let (iso_cfg_dir, iso_env, user_srcs): (PathBuf, Vec<(String, String)>, Vec<PathBuf>) = {
-        let cfg_base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    let (iso_cfg_dir, iso_env): (PathBuf, Vec<(String, String)>) = {
         (
             iso_home.join("config/flycast"),
             vec![
@@ -228,31 +246,15 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
                     iso_home.join("data").to_string_lossy().into_owned(),
                 ),
             ],
-            cfg_base
-                .map(|b| b.join("flycast/emu.cfg"))
-                .into_iter()
-                .collect(),
         )
     };
     #[cfg(target_os = "windows")]
-    let (iso_cfg_dir, iso_env, user_srcs): (PathBuf, Vec<(String, String)>, Vec<PathBuf>) = {
-        let srcs = l
-            .binary
-            .parent()
-            .map(|p| p.join("emu.cfg"))
-            .into_iter()
-            .collect();
-        (runtime.portable_dir.clone(), Vec::new(), srcs)
-    };
+    let (iso_cfg_dir, iso_env): (PathBuf, Vec<(String, String)>) =
+        { (runtime.portable_dir.clone(), Vec::new()) };
 
     std::fs::create_dir_all(&iso_cfg_dir)?;
     let iso_cfg = iso_cfg_dir.join("emu.cfg");
-    // Copy the user's real cfg (BIOS path, controls) if present; else start minimal.
-    let mut text = user_srcs
-        .iter()
-        .find(|p| p.is_file())
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
+    let mut text = imported_config()?;
     if !text.contains("[config]") {
         text = format!("[config]\n{text}");
     }

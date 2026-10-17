@@ -38,6 +38,28 @@ impl FakeGdb {
 }
 
 impl GdbTransport for FakeGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> Result<String, GdbError> {
         // Status reads pacing on every call; answer it outside the scripted exchange.
         if payload == "qEmucap,pacing"
@@ -2011,6 +2033,31 @@ fn status_transport_failure_cannot_publish_cached_frozen_state() {
         calls: Vec<String>,
     }
     impl GdbTransport for StatusFailure {
+        fn send_with_timeout(
+            &mut self,
+            payload: &str,
+            budget: Duration,
+        ) -> crate::gdb_rsp::GdbResult<String> {
+            assert!(!budget.is_zero());
+            self.send(payload)
+        }
+
+        fn recv_reply_with_timeout(
+            &mut self,
+            budget: Duration,
+        ) -> crate::gdb_rsp::GdbResult<String> {
+            assert!(!budget.is_zero());
+            self.recv_reply()
+        }
+
+        fn recv_nonblocking_with_timeout(
+            &mut self,
+            budget: Duration,
+        ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+            assert!(!budget.is_zero());
+            self.recv_nonblocking()
+        }
+
         fn send(&mut self, packet: &str) -> Result<String, GdbError> {
             self.calls.push(packet.into());
             if packet == "?" {
@@ -2126,4 +2173,37 @@ fn batch_epochs_separate_same_clock_load_and_reset_dispatch() {
         previous = current;
     }
     assert!(host.arm9.gdb.replies.is_empty());
+}
+#[test]
+fn demultiplexing_flood_quarantines_without_resume() {
+    for (packet, polling, delayed) in [
+        ("S05", false, false),
+        ("S02", true, false),
+        ("S05", false, true),
+    ] {
+        let gdb = crate::gdb_rsp::tests::DemuxFlood::new(packet, polling, delayed);
+        let mut bridge = NdsBridge::new(gdb, None, GdbBridgeEnv::default());
+        bridge.arm9.frozen = false;
+        let result = if polling {
+            bridge.arm9.query_running_safe("qEmucap,pacing")
+        } else {
+            bridge.arm9.send_cmd("g")
+        };
+        assert!(result.is_err());
+        assert!(bridge.backend_terminal());
+        assert!(bridge.arm9.gdb.budgets.len() <= 1025);
+        assert_eq!(bridge.arm9.gdb.resumes, 0);
+        assert!(bridge.arm9.resume().is_err());
+        assert!(bridge.arm9.send_cmd("g").is_err());
+    }
+}
+
+#[test]
+fn base64_demultiplexing_flood_cannot_return_a_stop_as_data() {
+    let gdb = crate::gdb_rsp::tests::DemuxFlood::new("S02", false, false);
+    let mut bridge = NdsBridge::new(gdb, None, GdbBridgeEnv::default());
+    bridge.arm9.frozen = false;
+    assert!(bridge.arm9.send_b64_reply("qEmucap,ss").is_err());
+    assert!(bridge.backend_terminal());
+    assert_eq!(bridge.arm9.gdb.resumes, 0);
 }

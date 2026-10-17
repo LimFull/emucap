@@ -32,7 +32,7 @@ does not inherit xemu's audible default.
 
 The generation-local settings also bind xemu's keyboard controller to physical port 1, which is API
 port 0. This creates the guest-visible XID device without depending on a user's profile and keeps
-native keyboard input available whenever emucap does not own the input override. The fork rejects
+native keyboard input available whenever emucap does not own the input override. The native patch rejects
 an engaged override if that controller is not bound instead of reporting a false success.
 `debug(operation="describe")` reports the callable analog axes and their exact integer
 ranges. `set_input` replaces the complete port-0 state: omitted axes are neutral, an explicitly
@@ -61,7 +61,8 @@ reconciles owned breakpoints and input, and proves both QMP and GDB serviceabili
 rolled back to the prior frozen state or marked unresolved if recovery cannot be proved.
 NV2A snapshot format 4 preserves PGRAPH command attributes and active inline vertices,
 rebuilds renderer cache state, and releases FIFO ownership on decode failures. Earlier
-native NV2A formats omit required command state and are rejected. The host API remains 3.
+native NV2A formats omit required command state and are rejected. Host API 4 mutually
+authenticates both native control transports before QMP sends its greeting or GDB attaches.
 The negotiated debug `probe` operation validates its bounded frame and memory request before
 mutation, then loads one such container, advances by exact NV2A boundaries, and reads the resulting
 frozen memory without a public-request gap. Breakpoint preemption returns the interrupted boundary
@@ -73,7 +74,7 @@ are parked for the copy. Repeated and overlapping ranges retain request order. T
 the generation, stop epoch, frame counter and guest virtual clock. Rebuild with
 `adapters/xemu/build.sh`.
 
-The Xbox profile uses host API 3 and fixed instruction-count scheduling for
+The Xbox profile uses host API 4 and fixed instruction-count scheduling for
 `debug.execution_speed`: integer 1–1000% or unlimited, while running or frozen. Managed launch
 selects single-thread TCG with `shift=3,align=off,sleep=off`; pacing changes only host waits.
 The bridge verifies the complete native clock profile against the managed generation.
@@ -104,3 +105,7 @@ interruption. Release runtime validation is a separate gate.
 
 Only `status.methods` and the negotiated MCP drawers describe callable operations. The adapter does
 not expose unimplemented operations as a future-method list.
+
+Published state snapshots remain on the managed generation disk until that generation is
+removed. Overwriting a container preserves the backing snapshot for any copied containers;
+repeated saves can therefore increase the generation disk's size.

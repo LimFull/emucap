@@ -41,7 +41,10 @@ pub(super) fn launch_mesen(
         _ => "adapters/mesen2/emucap-snes.lua",
     };
     let lua = root.join(entry);
-    let log = adapter_log_path("mesen2", port, "mesen.log");
+    let log = match adapter_log_path(port, runtime, "mesen.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let repeatable = args.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
     let spec = emucap::launch::mesen::Launch {
         binary: &binary,
@@ -66,7 +69,7 @@ pub(super) fn launch_mesen(
             "binary": binary.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
-            "emucap_home": emucap::launch::emu_home_dir("mesen2", port).display().to_string(),
+            "emucap_home": log.parent().map(|path| path.display().to_string()),
             "isolation": "Mesen runs from an emucap-owned portable copy; user settings.json is not edited.",
             "execution_profile": repeatable.then(|| ExecutionProfileIdentity {
                 id: emucap::launch::mesen::REPEATABLE_PROFILE_ID.into(),

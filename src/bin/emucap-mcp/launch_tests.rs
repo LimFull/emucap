@@ -47,6 +47,7 @@ fn marker_scan_does_not_follow_a_selected_file_symlink() {
 #[cfg(unix)]
 fn test_runtime_binding(port: u16) -> RuntimeBinding {
     let current_launch_id = emucap::live::runtime::RuntimeStore::discover()
+        .unwrap()
         .read_current(port)
         .ok()
         .flatten()
@@ -151,7 +152,18 @@ fn write_dolphin_sidecar(binary: &Path) {
 }
 
 #[test]
-fn adapter_logs_live_under_per_port_emucap_home() {
+fn adapter_logs_live_under_the_exact_runtime_generation() {
+    let _lock = env_lock();
+    let _env = EnvRestore::new(&["EMUCAP_EMU_HOME"]);
+    let temp = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", temp.path());
+    let store = emucap::live::runtime::RuntimeStore::new(temp.path().join("sessions"));
+    let prepared = store.prepare(47911).unwrap();
+    let failure = prepared.adapter_failure_path();
+    let runtime = emucap::launch::RuntimeEnv {
+        launch_id: prepared.launch_id(),
+        adapter_failure_path: &failure,
+    };
     let cases = [
         ("mesen2", "mesen.log"),
         ("flycast", "flycast.log"),
@@ -160,13 +172,9 @@ fn adapter_logs_live_under_per_port_emucap_home() {
         ("ppsspp", "ppsspp.log"),
         ("dolphin", "dolphin.log"),
     ];
-    for (adapter, file) in cases {
-        let path = adapter_log_path(adapter, 47911, file);
-        assert!(
-            path.ends_with(Path::new(adapter).join("47911").join(file)),
-            "{}",
-            path.display()
-        );
+    for (_, file) in cases {
+        let path = adapter_log_path(47911, runtime, file).unwrap();
+        assert_eq!(path, prepared.generation_dir().join(file));
     }
 }
 
@@ -1403,6 +1411,10 @@ fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
         .as_str()
         .unwrap()
         .contains("headless by default"));
+    assert!(plan["headless_contract"]
+        .as_str()
+        .unwrap()
+        .contains("Both modes load the pinned Rice renderer"));
 }
 
 #[test]
@@ -2022,7 +2034,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
-    let store = emucap::live::runtime::RuntimeStore::discover();
+    let store = emucap::live::runtime::RuntimeStore::discover().unwrap();
     let old = store.prepare(port).unwrap();
 
     let mut exited_emulator = std::process::Command::new("/bin/sleep")
@@ -2189,12 +2201,19 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     assert_eq!(first["ready"], true, "{first}");
     assert_eq!(first["connected"], true, "{first}");
     let launch_id = first["launch_id"].as_str().unwrap();
-    let store = emucap::live::runtime::RuntimeStore::discover();
+    let store = emucap::live::runtime::RuntimeStore::discover().unwrap();
     let current = store.read_current(port).unwrap().unwrap();
     assert_eq!(current.launch_id, launch_id);
     assert_eq!(current.process_state(), ProcessState::Alive);
     let auth = store.read_auth(port, launch_id).unwrap().unwrap();
     assert_eq!(auth, link.token);
+    let front_key = emucap::live::producer_auth::derive_front_key(
+        &auth,
+        emucap::live::producer_auth::Boundary::Direct,
+        port,
+        launch_id,
+    )
+    .unwrap();
 
     // The detached child can be scheduled late while all-target test binaries are starting.
     // Keep the common path immediate, but allow enough wall time for it to publish both files.
@@ -2204,7 +2223,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(std::fs::read_to_string(&capture).unwrap(), auth);
+    assert_eq!(std::fs::read_to_string(&capture).unwrap(), front_key);
     let runtime_lines = std::fs::read_to_string(&runtime_capture).unwrap();
     let mut runtime_lines = runtime_lines.lines();
     assert_eq!(runtime_lines.next(), Some(launch_id));
@@ -2325,7 +2344,7 @@ fn controlled_launch_publishes_only_after_a_frozen_ready_boundary() {
     assert_eq!(outcome["launched"], true, "{outcome}");
     assert_eq!(outcome["ready"], true, "{outcome}");
     assert_eq!(outcome["state"], "frozen", "{outcome}");
-    let store = emucap::live::runtime::RuntimeStore::discover();
+    let store = emucap::live::runtime::RuntimeStore::discover().unwrap();
     let current = store.read_current(port).unwrap().unwrap();
     assert_eq!(current.process_state(), ProcessState::Alive);
     assert_eq!(current.execution_profile, None);
@@ -2380,6 +2399,7 @@ fn controlled_launch_fails_closed_and_terminates_a_running_entry() {
     );
     assert!(
         emucap::live::runtime::RuntimeStore::discover()
+            .unwrap()
             .read_current(port)
             .unwrap()
             .is_none(),
@@ -2498,6 +2518,7 @@ fn dolphin_audio_failure_terminates_only_the_owned_launch_and_aborts_admission()
     assert_eq!(link.token, original_token);
     assert!(link.staged_token.is_none());
     assert!(emucap::live::runtime::RuntimeStore::discover()
+        .unwrap()
         .read_current(port)
         .unwrap()
         .is_none());

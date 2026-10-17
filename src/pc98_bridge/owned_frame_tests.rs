@@ -13,6 +13,14 @@ impl Native {
     }
 }
 impl GdbTransport for Native {
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send_with_timeout(
         &mut self,
         payload: &str,

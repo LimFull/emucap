@@ -1,6 +1,6 @@
 //! Managed PC-98 compatibility backend backed by a pinned NP2kai libretro core.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -28,6 +28,9 @@ use support::*;
 
 const MAX_SYNC_FRAMES: u64 = crate::live::temporal::MAX_SYNC_ADVANCE_COUNT;
 const MAX_INPUT_PULSE_FRAMES: u64 = 120;
+const MAX_PENDING_EVENTS: usize = 256;
+const MAX_STATE_BYTES: u64 = crate::live::recording_capability::CORE_MAX_RECORDING_STATE_BYTES;
+const MAX_STATE_SIDECAR_BYTES: u64 = 96 * 1024;
 const HOST_FEATURES: &[&str] = &["controlled_start"];
 const INSTRUCTION_STEP_FAILED: i32 = 0;
 const INSTRUCTION_STEP_EXECUTED: i32 = 1;
@@ -182,7 +185,6 @@ pub struct Np2kaiHost {
     build_profile: String,
     frontend_build: String,
     name: Option<String>,
-    session_token: Option<String>,
     launch_id: Option<String>,
     runtime_home: PathBuf,
     held_buttons: BTreeSet<String>,
@@ -195,7 +197,8 @@ pub struct Np2kaiHost {
     loaded: bool,
     core_initialized: bool,
     breakpoints: BTreeMap<u64, DebugBreakpoint>,
-    pending_events: Vec<Value>,
+    pending_events: VecDeque<Value>,
+    dropped_pending_events: u64,
     next_breakpoint_id: u64,
     break_on_reset_id: Option<u64>,
     tracing: bool,
@@ -214,6 +217,7 @@ impl Np2kaiHost {
     pub fn open(
         content_path: &Path,
         core_path: &Path,
+        expected_core_sha256: &str,
         firmware_dir: &Path,
         runtime_home: &Path,
         upstream_commit: &str,
@@ -225,6 +229,12 @@ impl Np2kaiHost {
             return Err(Np2kaiError::BadParams(format!(
                 "NP2kai core not found: {}",
                 core_path.display()
+            )));
+        }
+        let admitted_core_sha256 = sha256_file(core_path)?;
+        if admitted_core_sha256 != expected_core_sha256 {
+            return Err(Np2kaiError::BadParams(format!(
+                "NP2kai staged core digest mismatch: expected {expected_core_sha256}, got {admitted_core_sha256}"
             )));
         }
         fs::create_dir_all(runtime_home)?;
@@ -335,13 +345,12 @@ impl Np2kaiHost {
             content_sha1,
             content_sha256,
             firmware_sha256,
-            core_sha256: sha256_file(core_path)?,
+            core_sha256: admitted_core_sha256,
             upstream_commit: upstream_commit.to_string(),
             patchset_sha256: patchset_sha256.to_string(),
             build_profile: build_profile.to_string(),
             frontend_build: crate::build_identity::BUILD_HASH.to_string(),
             name: std::env::var("EMUCAP_NAME").ok(),
-            session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
             runtime_home: runtime_home.to_path_buf(),
             held_buttons: BTreeSet::new(),
@@ -354,7 +363,8 @@ impl Np2kaiHost {
             loaded: true,
             core_initialized: true,
             breakpoints: BTreeMap::new(),
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
+            dropped_pending_events: 0,
             next_breakpoint_id: 1,
             break_on_reset_id: None,
             tracing: false,

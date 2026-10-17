@@ -67,7 +67,7 @@
  
  	void enqueue(MessageType type, FramebufferInfo config = FramebufferInfo())
  	{
-@@ -106,12 +148,15 @@
+@@ -129,12 +171,15 @@
  
  	void reset() {
  		const lock_guard lock(mutex);
@@ -83,7 +83,7 @@
  		for (auto it = queue.begin(); it != queue.end(); )
  		{
  			if (it->type != Render)
-@@ -150,6 +195,21 @@
+@@ -173,6 +218,21 @@
  	}
  
  	bool execute(Message msg)
@@ -105,7 +105,7 @@
  	{
  		switch (msg.type)
  		{
-@@ -162,7 +222,12 @@
+@@ -185,7 +245,12 @@
  		case Present:
  			present();
  			return true;
@@ -118,7 +118,15 @@
  		case NoMessage:
  		default:
  			return false;
-@@ -251,6 +316,7 @@
+@@ -266,6 +331,7 @@
+ 		if (renderer->Present())
+ 		{
+ 			presented = true;
++			emucap_capture_latest();
+ 			if (!config::ThreadedRendering && !ggpo::active())
+ 				emu.getSh4Executor()->Stop();
+ #ifdef LIBRETRO
+@@ -274,6 +340,7 @@
  		}
  	}
  
@@ -126,7 +134,7 @@
  	std::mutex mutex;
  	cResetEvent enqueueEvent;
  	cResetEvent dequeueEvent;
-@@ -258,6 +324,14 @@
+@@ -281,6 +348,14 @@
  };
  
  static PvrMessageQueue pvrQueue;

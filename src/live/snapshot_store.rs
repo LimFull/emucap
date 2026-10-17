@@ -6,7 +6,7 @@ use crate::bundle::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -22,6 +22,10 @@ pub(super) struct Request {
 pub(super) struct Store {
     pub directory: PathBuf,
     _lock: File,
+}
+
+pub(super) struct Export {
+    slot: crate::rooted_fs::OutputSlot,
 }
 fn error(message: &str) -> io::Error {
     io::Error::other(message)
@@ -45,13 +49,7 @@ impl Store {
         }
         let directory = root.join(key);
         let fresh = if create {
-            let builder = &mut fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&directory) {
+            match crate::private_fs::create_private_dir(&directory) {
                 Ok(()) => true,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
                 Err(e) => return Err(e),
@@ -63,6 +61,7 @@ impl Store {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(error("unsafe snapshot directory"));
         }
+        crate::private_fs::verify_private_dir(&directory)?;
         if fresh {
             // Persist both directory entries before the request can trigger serialization.
             super::runtime::sync_parent(&root)?;
@@ -74,6 +73,7 @@ impl Store {
         let lock = match private_file(&lock_path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                crate::private_fs::verify_private_file(&lock_path)?;
                 crate::path_safety::open_regular_file_no_follow(&lock_path)?
             }
             Err(e) => return Err(e),
@@ -116,7 +116,7 @@ impl Store {
     }
     pub fn publish(&self, receipt: &Receipt, bytes: &[u8]) -> io::Result<()> {
         let stage = self.directory.join("staging");
-        fs::create_dir(&stage)?;
+        crate::private_fs::create_private_dir(&stage)?;
         let result = (|| {
             write_new(&stage.join("state.bin"), bytes)?;
             write_new(&stage.join("receipt.json"), &serde_json::to_vec(receipt)?)?;
@@ -154,62 +154,24 @@ impl Store {
     }
 }
 fn private_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).read(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    crate::private_fs::create_private_file(path)
 }
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = private_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
-pub(super) fn export(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if !path.is_absolute() {
-        return Err(error("snapshot destination must be absolute"));
+impl Export {
+    /// Acquire the existing destination parent before native serialization starts. The retained
+    /// directory handle is the only publication authority used after this point.
+    pub(super) fn prepare(runtime: &RuntimeStore, path: &Path) -> io::Result<Self> {
+        let slot = crate::rooted_fs::OutputSlot::admit(path)?;
+        slot.reject_parent_within(runtime.root())
+            .map_err(|_| error("snapshot export cannot replace producer-owned runtime storage"))?;
+        Ok(Self { slot })
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| error("missing destination parent"))?;
-    let temporary = parent.join(format!(".emucap-snapshot-{}.tmp", ulid::Ulid::generate()));
-    let result = (|| {
-        write_new(&temporary, bytes)?;
-        crate::path_safety::replace_file_atomically(&temporary, path)?;
-        super::runtime::sync_parent(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
-}
 
-/// Export must not overwrite producer-retained evidence or lifecycle metadata, including aliases.
-pub(super) fn validate_destination(runtime: &RuntimeStore, path: &Path) -> io::Result<()> {
-    if !path.is_absolute() {
-        return Err(error("snapshot destination must be absolute"));
-    }
-    let root = fs::canonicalize(runtime.root())?;
-    let mut parent = path
-        .parent()
-        .ok_or_else(|| error("missing destination parent"))?;
-    loop {
-        match fs::canonicalize(parent) {
-            Ok(resolved) => {
-                if resolved.starts_with(&root) {
-                    return Err(error(
-                        "snapshot export cannot replace producer-owned runtime storage",
-                    ));
-                }
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                parent = parent.parent().ok_or(e)?;
-            }
-            Err(e) => return Err(e),
-        }
+    pub(super) fn publish(&self, bytes: &[u8]) -> io::Result<()> {
+        self.slot.publish(bytes)
     }
 }

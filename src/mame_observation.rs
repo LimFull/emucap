@@ -14,6 +14,8 @@ use crate::live::pacing::{self, ExecutionSpeedCapability, SpeedRequest};
 pub(crate) const FEATURE_PEEK: &str = "peek_block";
 pub(crate) const FEATURE_THROTTLE_HOOK: &str = "throttle_wait_hook";
 pub(crate) const FEATURE_FASTFORWARD: &str = "fastforward_readback";
+pub(crate) const FEATURE_VALIDATED_PACING: &str = "validated_pacing";
+pub(crate) const FEATURE_OPERATION_DEADLINE: &str = "operation_deadline_v1";
 const HALT_KIND: &str = "debugger_stop_and_machine_pause";
 /// Wall budget assumed for one guest frame at 100 percent when estimating a paced advance. Every
 /// supported MAME screen refreshes at 50 Hz or faster.
@@ -30,8 +32,16 @@ pub(crate) fn supports_batch(features: &BTreeSet<String>) -> bool {
     features.contains(FEATURE_PEEK)
 }
 
-pub(crate) fn supports_pacing(features: &BTreeSet<String>) -> bool {
+pub(crate) fn supports_pacing_readback(features: &BTreeSet<String>) -> bool {
     features.contains(FEATURE_THROTTLE_HOOK) && features.contains(FEATURE_FASTFORWARD)
+}
+
+pub(crate) fn supports_pacing(features: &BTreeSet<String>) -> bool {
+    supports_pacing_readback(features) && features.contains(FEATURE_VALIDATED_PACING)
+}
+
+pub(crate) fn supports_operation_deadline(features: &BTreeSet<String>) -> bool {
+    features.contains(FEATURE_OPERATION_DEADLINE)
 }
 
 pub(crate) fn batch_capability(windows: Vec<MemoryWindow>) -> MemoryBatchCapability {
@@ -153,11 +163,18 @@ impl MamePacing {
             "0" => Some(false),
             _ => None,
         };
-        rate.parse::<f64>().ok().filter(|rate| rate.is_finite())?;
+        // The native setter takes int/float. Host-clock-dependent period validation stays native.
+        let speed_per_mille = speed
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v <= i32::MAX as u64)?;
+        rate.parse::<f32>()
+            .ok()
+            .filter(|rate| rate.is_finite() && *rate > 0.0 && *rate < 1_000_000_000.0)?;
         Some(Self {
             revision: revision.parse().ok()?,
             throttled: flag(throttled)?,
-            speed_per_mille: speed.parse().ok()?,
+            speed_per_mille,
             rate: rate.into(),
             fastforward: flag(fastforward)?,
             refresh_speed: flag(refresh_speed)?,

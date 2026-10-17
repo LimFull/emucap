@@ -1,0 +1,96 @@
+diff --git a/Core/Debugger/ScriptingContext.h b/Core/Debugger/ScriptingContext.h
+--- a/Core/Debugger/ScriptingContext.h
++++ b/Core/Debugger/ScriptingContext.h
+@@ -59,6 +59,25 @@
+ 	string _scriptName;
+ 	bool _initDone = false;
+ 
++	// Active dispatches use indices so erasing a callback can repair every nested
++	// cursor. The captured end excludes registrations added during that dispatch.
++	struct CallbackIteration
++	{
++		CallbackIteration*& Active;
++		CallbackIteration* Previous;
++		const void* Collection;
++		size_t Index = 0;
++		size_t End;
++
++		CallbackIteration(CallbackIteration*& active, const void* collection, size_t end)
++			: Active(active), Previous(active), Collection(collection), End(end) { Active = this; }
++		~CallbackIteration() { Active = Previous; }
++		CallbackIteration(const CallbackIteration&) = delete;
++		CallbackIteration& operator=(const CallbackIteration&) = delete;
++	};
++	CallbackIteration* _callbackIteration = nullptr;
++	void CallbackRemoved(const void* collection, size_t index);
++
+ 	vector<MemoryCallback> _callbacks[3];
+ 	vector<int> _eventCallbacks[(int)EventType::LastValue + 1];
+ 
+diff --git a/Core/Debugger/ScriptingContext.cpp b/Core/Debugger/ScriptingContext.cpp
+--- a/Core/Debugger/ScriptingContext.cpp
++++ b/Core/Debugger/ScriptingContext.cpp
+@@ -304,6 +304,16 @@
+ 	}
+ }
+ 
++void ScriptingContext::CallbackRemoved(const void* collection, size_t index)
++{
++	for(CallbackIteration* cursor = _callbackIteration; cursor; cursor = cursor->Previous) {
++		if(cursor->Collection == collection) {
++			if(index < cursor->Index) cursor->Index--;
++			if(index < cursor->End) cursor->End--;
++		}
++	}
++}
++
+ void ScriptingContext::UnregisterMemoryCallback(CallbackType type, int startAddr, int endAddr, MemoryType memType, CpuType cpuType, int reference)
+ {
+ 	if(endAddr < startAddr) {
+@@ -321,6 +331,7 @@
+ 
+ 		if(isMatch) {
+ 			_callbacks[(int)type].erase(_callbacks[(int)type].begin() + i);
++			CallbackRemoved(&_callbacks[(int)type], i);
+ 			break;
+ 		}
+ 	}
+@@ -336,7 +347,14 @@
+ void ScriptingContext::UnregisterEventCallback(EventType type, int reference)
+ {
+ 	vector<int>& callbacks = _eventCallbacks[(int)type];
+-	callbacks.erase(std::remove(callbacks.begin(), callbacks.end(), reference), callbacks.end());
++	for(size_t i = 0; i < callbacks.size();) {
++		if(callbacks[i] == reference) {
++			callbacks.erase(callbacks.begin() + i);
++			CallbackRemoved(&callbacks, i);
++		} else {
++			i++;
++		}
++	}
+ 	luaL_unref(_lua, LUA_REGISTRYINDEX, reference);
+ }
+ 
+@@ -356,7 +374,10 @@
+ 	bool needTimerReset = true;
+ 	lua_setwatchdogtimer(_lua, ScriptingContext::ExecutionCountHook, 1000);
+ 	LuaApi::SetContext(this);
+-	for(MemoryCallback& callback : _callbacks[(int)type]) {
++	CallbackIteration cursor(_callbackIteration, &_callbacks[(int)type], _callbacks[(int)type].size());
++	while(cursor.Index < cursor.End) {
++		// Lua can add/remove callbacks, including this one, before pcall returns.
++		MemoryCallback callback = _callbacks[(int)type][cursor.Index++];
+ 		if(callback.Cpu != cpuType) {
+ 			continue;
+ 		}
+@@ -406,7 +427,9 @@
+ 	lua_setwatchdogtimer(_lua, ScriptingContext::ExecutionCountHook, 1000);
+ 	LuaApi::SetContext(this);
+ 	LuaCallHelper l(_lua);
+-	for(int& ref : _eventCallbacks[(int)type]) {
++	CallbackIteration cursor(_callbackIteration, &_eventCallbacks[(int)type], _eventCallbacks[(int)type].size());
++	while(cursor.Index < cursor.End) {
++		int ref = _eventCallbacks[(int)type][cursor.Index++];
+ 		lua_rawgeti(_lua, LUA_REGISTRYINDEX, ref);
+ 		lua_pushinteger(_lua, (int)cpuType);
+ 		if(lua_pcall(_lua, 1, 0, 0) != 0) {

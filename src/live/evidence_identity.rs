@@ -16,11 +16,32 @@ pub(super) fn runtime_identity(
     max_bytes: u64,
 ) -> Result<RuntimeIdentity, std::io::Error> {
     let content_path = Path::new(&current.content);
-    let metadata = fs::symlink_metadata(content_path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(std::io::Error::other("artifact must be a regular file"));
-    }
-    let (sha1, sha256, bytes) = hash_content(content_path, max_bytes)?;
+    let content = if let Some(graph) = current.content_identity.as_ref() {
+        ContentIdentity {
+            sha1: None,
+            sha256: Some(graph.digest.clone()),
+            bytes: graph.size,
+            path_hint: content_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(String::from),
+        }
+    } else {
+        let metadata = fs::symlink_metadata(content_path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(std::io::Error::other("artifact must be a regular file"));
+        }
+        let (sha1, sha256, bytes) = hash_content(content_path, max_bytes)?;
+        ContentIdentity {
+            sha1: Some(sha1),
+            sha256: Some(sha256),
+            bytes,
+            path_hint: content_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(String::from),
+        }
+    };
     let host = identity
         .host_build
         .as_ref()
@@ -57,15 +78,7 @@ pub(super) fn runtime_identity(
         emulator_patchset_sha256: patchset,
         launch_id: current.launch_id.clone(),
         capability_revision: revision.into(),
-        content: ContentIdentity {
-            sha1: Some(sha1),
-            sha256: Some(sha256),
-            bytes,
-            path_hint: content_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(String::from),
-        },
+        content,
     })
 }
 

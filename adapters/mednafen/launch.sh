@@ -58,55 +58,15 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   exit 2
 fi
 
-emucap_data_root() {
-  if [ -n "${EMUCAP_EMU_HOME:-}" ]; then
-    printf '%s\n' "$EMUCAP_EMU_HOME"
-    return
-  fi
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin)
-      if [ -n "${HOME:-}" ]; then
-        printf '%s\n' "$HOME/Library/Application Support/emucap"
-      else
-        printf '%s\n' "/tmp/emucap"
-      fi
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      if [ -n "${LOCALAPPDATA:-}" ]; then
-        printf '%s\n' "$LOCALAPPDATA/emucap"
-      elif [ -n "${APPDATA:-}" ]; then
-        printf '%s\n' "$APPDATA/emucap"
-      elif [ -n "${USERPROFILE:-}" ]; then
-        printf '%s\n' "$USERPROFILE/AppData/Local/emucap"
-      elif [ -n "${HOME:-}" ]; then
-        printf '%s\n' "$HOME/AppData/Local/emucap"
-      else
-        printf '%s\n' "/tmp/emucap"
-      fi
-      ;;
-    *)
-      if [ -n "${XDG_DATA_HOME:-}" ]; then
-        printf '%s\n' "$XDG_DATA_HOME/emucap"
-      elif [ -n "${HOME:-}" ]; then
-        printf '%s\n' "$HOME/.local/share/emucap"
-      else
-        printf '%s\n' "/tmp/emucap"
-      fi
-      ;;
-  esac
-}
 
-EMUCAP_DATA_ROOT="$(emucap_data_root)"
+EMUCAP_DATA_ROOT="$(emucap_runtime_base)"
 RUN_DIR="$EMUCAP_DATA_ROOT/mednafen/$PORT"
 WAIT="${EMUCAP_LAUNCH_WAIT:-20}"
 POST_CONNECT_GRACE="${EMUCAP_POST_CONNECT_GRACE:-3}"
 LOG="${EMUCAP_LOG:-$RUN_DIR/mednafen.log}"
 PIDFILE="$RUN_DIR/mednafen.pid"
-TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
-if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SESSION_TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
-fi
+emucap_require_front_identity "$SESSION_TOKEN" "${EMUCAP_LAUNCH_ID:-}" || exit 2
 
 default_mednafen_name() {
   case "$(uname -s 2>/dev/null || echo unknown)" in
@@ -332,8 +292,7 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
   echo "  content=$CONTENT"
   echo "  port=$PORT"
   echo "  name=${NAME:-<none>}"
-  echo "  session_token=${SESSION_TOKEN:+present}"
-  echo "  token_file=$TOKEN_FILE"
+  echo "  front_key=${SESSION_TOKEN:+present}"
   echo "  module=${MODULE:-<auto>}"
   echo "  profile=$RUN_DIR"
   echo "  bin=$BIN"

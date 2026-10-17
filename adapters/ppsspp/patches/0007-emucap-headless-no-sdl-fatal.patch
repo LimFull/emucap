@@ -1,14 +1,10 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4dfcc74d53..d454b93479 100644
+index 2ddad0dac9..ec5f6ef2e1 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -324,33 +324,26 @@ set(SDL_TTF_LIB_TARGET "")
- set(FONTCONFIG_LIB_TARGET "")
+@@ -335,32 +335,22 @@ set(FONTCONFIG_LIB_TARGET "")
  
- if(NOT LIBRETRO AND NOT IOS AND NOT LOONGARCH64_DEVICE AND NOT ANDROID)
-+	# emucap: SDL3/SDL3_ttf back the desktop GUI (PPSSPPSDL) frontend only. When missing, warn and
-+	# leave SDL_LIB_TARGET empty; the PPSSPPSDL target below is guarded on it, so a headless-only host
-+	# (no SDL3) still configures and builds PPSSPPHeadless instead of failing the configure.
+ if(NOT LIBRETRO AND NOT IOS AND NOT HEADLESS_CROSS AND NOT ANDROID)
  	find_package(SDL3 QUIET)
 -	if(NOT SDL3_FOUND)
 -		if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (EXISTS "/usr/bin/apt" OR EXISTS "/usr/bin/apt-get" OR EXISTS "/etc/debian_version"))

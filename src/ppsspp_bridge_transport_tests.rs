@@ -7,16 +7,42 @@ use tungstenite::handshake::server::{
 };
 use tungstenite::{accept_hdr, Message};
 
+const TEST_NATIVE_DEBUG_TOKEN: &str = "transport-test-token";
+
 #[allow(clippy::result_large_err)]
 fn select_ppsspp_subprotocol(
-    _request: &WsRequest,
+    request: &WsRequest,
     mut response: WsResponse,
 ) -> Result<WsResponse, WsErrorResponse> {
+    let expected_authorization = format!("Bearer {TEST_NATIVE_DEBUG_TOKEN}");
+    assert_eq!(
+        request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_authorization.as_str())
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(super::transport::PPSSPP_MANAGED_ORIGIN)
+    );
     response.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         tungstenite::http::HeaderValue::from_static(PPSSPP_SUBPROTOCOL),
     );
     Ok(response)
+}
+
+#[test]
+fn empty_native_debug_token_is_rejected_before_tcp_connect() {
+    let error = match TungsteniteWs::connect(1, Duration::from_millis(10), "") {
+        Ok(_) => panic!("empty native debugger token unexpectedly connected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("EMUCAP_NATIVE_DEBUG_TOKEN"));
 }
 
 fn websocket_server(
@@ -75,7 +101,8 @@ fn delayed_error_cannot_become_the_next_calls_error() {
             .unwrap();
     });
 
-    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     let first = ws.call_with_timeout("slow.command", json!({}), Duration::from_millis(30));
     assert!(first.as_ref().is_err_and(is_timeout_error));
     assert!(
@@ -112,7 +139,8 @@ fn asynchronous_ack_must_echo_the_requests_ticket() {
             .unwrap();
     });
 
-    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     let response = ws
         .call_and_wait_for("cpu.stepInto", json!({}), "cpu.stepping")
         .unwrap();
@@ -128,7 +156,8 @@ fn websocket_close_marks_the_transport_terminal() {
         socket.close(None).unwrap();
     });
 
-    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     assert!(ws.call("version", json!({})).is_err());
     assert!(ws.is_terminal());
     server.join().unwrap();
@@ -197,7 +226,8 @@ fn frame_cancel_drains_both_tickets_in_either_order_and_keeps_breakpoint_event()
                 ))
                 .unwrap();
         });
-        let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+        let mut ws =
+            TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
         let result = ws
             .frame_step_cancellable(120, Duration::from_secs(3), &cancellation)
             .unwrap();
@@ -237,7 +267,8 @@ fn frame_protocol_rejects_old_native_before_guest_dispatch() {
             ))
             .unwrap();
     });
-    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     assert!(ws
         .frame_step_cancellable(120, Duration::from_secs(3), &Default::default())
         .is_err());
@@ -269,7 +300,8 @@ fn unverified_frame_terminal_retires_native_channel() {
                 "uncertain producer channel must close"
             );
         });
-        let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+        let mut ws =
+            TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
         assert!(
             ws.frame_step_cancellable(120, Duration::from_secs(3), &Default::default())
                 .is_err(),
@@ -295,7 +327,8 @@ fn cancellation_ack_without_native_terminal_cannot_certify_stop() {
             "unverified stop must close the native connection"
         );
     });
-    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     let result = ws.frame_step_cancellable(120, Duration::from_secs(5), &cancellation);
     assert!(result
         .unwrap_err()
@@ -318,7 +351,8 @@ fn cancelled_before_admission_does_not_send_native_request() {
             ))
             .unwrap();
     });
-    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     let cancellation = crate::live::link::RequestCancellation::default();
     cancellation.cancel();
     assert!(ws
@@ -363,7 +397,8 @@ fn pacing_reply_timeout_keeps_bridge_retired_after_late_native_success() {
             .unwrap();
         sent.send(()).unwrap();
     });
-    let ws = TungsteniteWs::connect(port, Duration::from_millis(100)).unwrap();
+    let ws =
+        TungsteniteWs::connect(port, Duration::from_millis(100), TEST_NATIVE_DEBUG_TOKEN).unwrap();
     let mut bridge = PpssppBridge::new(ws);
     let result = bridge.execution_speed(&json!({"mode":"limited","percent":50}));
     assert!(result.is_err());
@@ -375,5 +410,295 @@ fn pacing_reply_timeout_keeps_bridge_retired_after_late_native_success() {
         bridge.control_unverified && bridge.backend_terminal(),
         "late success cannot restore healthy control"
     );
+    server.join().unwrap();
+}
+
+#[test]
+fn frame_poll_retains_partial_reply_and_restores_blocking_calls() {
+    use std::io::Write;
+    let (port, server) = websocket_server(|socket| {
+        frame_protocol_capability(socket);
+        let step = read_json(socket);
+        assert_eq!(step["event"], "emucap.frameStep");
+        let payload = json!({"event":"emucap.frameStep", "ticket":step["ticket"],
+            "operation_id":step["operation_id"], "unit":"frames", "count":120,
+            "completed":120, "status":"completed", "state":"frozen"})
+        .to_string();
+        let mut frame = vec![0x81, 126];
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        socket.get_mut().write_all(&frame[..3]).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        socket.get_mut().write_all(&frame[3..17]).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        socket.get_mut().write_all(&frame[17..]).unwrap();
+        let next = read_json(socket);
+        assert_eq!(next["event"], "version");
+        std::thread::sleep(Duration::from_millis(80));
+        socket
+            .send(Message::Text(
+                json!({"event":"version", "ticket":next["ticket"],
+            "version":"after-partial-frame"})
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+    });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    let result = ws
+        .frame_step_cancellable(120, Duration::from_secs(3), &Default::default())
+        .unwrap();
+    assert_eq!(result["completed"], 120);
+    assert!(!ws.is_terminal());
+    assert_eq!(
+        ws.call("version", json!({})).unwrap()["version"],
+        "after-partial-frame"
+    );
+    server.join().unwrap();
+}
+#[test]
+fn continuous_notifications_do_not_extend_a_request_deadline() {
+    let (port, server) = websocket_server(|socket| {
+        let _ = read_json(socket);
+        for i in 0..60 {
+            if socket
+                .send(Message::Text(
+                    json!({"event":"notice","i":i}).to_string().into(),
+                ))
+                .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    let start = std::time::Instant::now();
+    let result = ws.call_with_timeout("version", json!({}), Duration::from_millis(40));
+    assert!(result.as_ref().is_err_and(is_timeout_error));
+    assert!(start.elapsed() < Duration::from_millis(200));
+    assert!(!ws.is_terminal());
+    drop(ws);
+    server.join().unwrap();
+}
+
+#[test]
+fn fragmented_frame_deadline_preserves_late_ticket_recovery() {
+    use std::io::Write;
+    let (port, server) = websocket_server(|socket| {
+        let first = read_json(socket);
+        let payload =
+            json!({"event":"slow","ticket":first["ticket"],"padding":"x".repeat(300)}).to_string();
+        let mut frame = vec![0x81, 126];
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        for chunk in frame.chunks(20) {
+            socket.get_mut().write_all(chunk).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let second = read_json(socket);
+        socket
+            .send(Message::Text(
+                json!({"event":"version","ticket":second["ticket"]})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+    });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    let result = ws.call_with_timeout("slow", json!({}), Duration::from_millis(30));
+    assert!(result.as_ref().is_err_and(is_timeout_error));
+    assert!(!ws.is_terminal());
+    assert!(ws.call("version", json!({})).is_ok());
+    assert!(ws
+        .drain_events()
+        .iter()
+        .any(|event| event["event"] == "slow"));
+    server.join().unwrap();
+}
+
+#[test]
+fn pending_events_have_count_and_byte_budgets() {
+    for bytes in [0, 1024 * 1024] {
+        let (port, server) = websocket_server(move |socket| {
+            let _ = read_json(socket);
+            let event = json!({"event":"notice","data":"x".repeat(bytes)}).to_string();
+            let sends = if bytes == 0 {
+                transport::MAX_PENDING_EVENTS + 1
+            } else {
+                transport::MAX_PENDING_BYTES / event.len() + 2
+            };
+            for _ in 0..sends {
+                if socket.send(Message::Text(event.clone().into())).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut ws =
+            TungsteniteWs::connect(port, Duration::from_secs(5), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+        let error = ws.call("version", json!({})).unwrap_err();
+        assert!(
+            error.to_string().contains("pending event budget"),
+            "{error}"
+        );
+        assert!(ws.is_terminal());
+        assert!(ws.drain_events().len() <= if bytes == 0 { 1024 } else { 8 });
+        assert!(ws.call("version", json!({})).is_err());
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn oversized_websocket_frame_is_rejected_before_payload() {
+    use std::io::Write;
+    let (port, server) = websocket_server(|socket| {
+        let _ = read_json(socket);
+        let mut header = vec![0x81, 127];
+        header.extend_from_slice(&(8 * 1024 * 1024 + 1u64).to_be_bytes());
+        socket.get_mut().write_all(&header).unwrap();
+    });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    assert!(ws.call("version", json!({})).is_err());
+    assert!(ws.is_terminal());
+    server.join().unwrap();
+}
+#[test]
+fn host_deadline_allows_cancellation_grace_and_next_request() {
+    let (port, server) =
+        websocket_server(|socket| {
+            frame_protocol_capability(socket);
+            let step = read_json(socket);
+            let cancel = read_json(socket);
+            assert_eq!(cancel["event"], "emucap.frameStep.cancel");
+            socket.send(Message::Text(json!({
+            "event":"emucap.frameStep", "ticket":step["ticket"],
+            "operation_id":step["operation_id"], "unit":"frames", "count":20,
+            "completed":2, "status":"interrupted", "reason":"cancelled", "state":"frozen"
+        }).to_string().into())).unwrap();
+            socket.send(Message::Text(json!({
+            "event":"emucap.frameStep.cancel", "ticket":cancel["ticket"], "status":"requested"
+        }).to_string().into())).unwrap();
+            let next = read_json(socket);
+            socket
+                .send(Message::Text(
+                    json!({"event":"version", "ticket":next["ticket"]})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+        });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    let result = ws
+        .frame_step_cancellable(
+            20,
+            Duration::from_millis(80),
+            &crate::live::link::RequestCancellation::default(),
+        )
+        .unwrap();
+    assert_eq!(result["reason"], "host_deadline");
+    assert!(!ws.is_terminal());
+    assert!(ws.call("version", json!({})).is_ok());
+    server.join().unwrap();
+}
+
+#[test]
+fn draining_events_has_a_finite_batch_and_preserves_the_remainder() {
+    let (sent, received) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (port, server) = websocket_server(move |socket| {
+        for i in 0..1100 {
+            socket
+                .send(Message::Text(
+                    json!({"event":"notice","i":i}).to_string().into(),
+                ))
+                .unwrap();
+        }
+        sent.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(3)).unwrap();
+    });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let started = std::time::Instant::now();
+    let mut all = ws.drain_events();
+    assert!(all.len() <= 1024);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    for _ in 0..20 {
+        if all.len() == 1100 {
+            break;
+        }
+        all.extend(ws.drain_events());
+    }
+    assert_eq!(all.len(), 1100);
+    for (i, event) in all.iter().enumerate() {
+        assert_eq!(event["i"], i);
+    }
+    assert!(!ws.is_terminal());
+    release.send(()).unwrap();
+    server.join().unwrap();
+}
+#[test]
+fn cancellation_interrupts_a_continuously_readable_fragmented_message() {
+    use std::io::Write;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let (started, ready) = std::sync::mpsc::channel();
+    let (port, server) = websocket_server(move |socket| {
+        frame_protocol_capability(socket);
+        let step = read_json(socket);
+        socket.get_mut().write_all(&[0x01, 0]).unwrap();
+        let mut stream = socket.get_ref().try_clone().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let writer_running = running.clone();
+        let writer = thread::spawn(move || {
+            let continuations = [0u8; 4096]; // Non-final, empty continuation frames.
+            while writer_running.load(Ordering::Relaxed) {
+                if stream.write_all(&continuations).is_err() {
+                    break;
+                }
+            }
+        });
+        started.send(()).unwrap();
+        let cancel = read_json(socket);
+        assert_eq!(cancel["event"], "emucap.frameStep.cancel");
+        running.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+        let payload = json!({
+            "event":"emucap.frameStep", "ticket":step["ticket"],
+            "operation_id":step["operation_id"], "unit":"frames", "count":20,
+            "completed":1, "status":"interrupted", "reason":"cancelled", "state":"frozen"
+        })
+        .to_string();
+        let mut terminal = vec![0x80, 126]; // Finish the outstanding text message.
+        terminal.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        terminal.extend_from_slice(payload.as_bytes());
+        socket.get_mut().write_all(&terminal).unwrap();
+        socket.send(Message::Text(json!({
+            "event":"emucap.frameStep.cancel", "ticket":cancel["ticket"], "status":"requested"
+        }).to_string().into())).unwrap();
+    });
+    let cancellation = crate::live::link::RequestCancellation::default();
+    let cancel = cancellation.clone();
+    let trigger = thread::spawn(move || {
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        cancel.cancel();
+    });
+    let mut ws =
+        TungsteniteWs::connect(port, Duration::from_secs(1), TEST_NATIVE_DEBUG_TOKEN).unwrap();
+    let start = std::time::Instant::now();
+    let result = ws
+        .frame_step_cancellable(20, Duration::from_secs(3), &cancellation)
+        .unwrap();
+    assert_eq!(result["reason"], "cancelled");
+    assert!(start.elapsed() < Duration::from_secs(1));
+    trigger.join().unwrap();
     server.join().unwrap();
 }

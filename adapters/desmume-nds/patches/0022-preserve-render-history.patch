@@ -1,6 +1,6 @@
 --- a/desmume/src/gfx3d.cpp
 +++ b/desmume/src/gfx3d.cpp
-@@ -3921,10 +3921,99 @@
+@@ -3924,10 +3924,99 @@
  	memcpy(gfx3d.legacySave.stateApplied.toonTable16, gfx3d.appliedState.toonTable16, sizeof(gfx3d.appliedState.toonTable16));
  }
  
@@ -101,7 +101,7 @@
  
  	//dump the render lists
  	os.write_32LE((u32)gfx3d.gList[gfx3d.pendingListIndex].rawVertCount);
-@@ -3945,13 +4034,19 @@
+@@ -3948,14 +4037,19 @@
  	_gEngine.SaveState_v2(os);
  	gxf_hardware.savestate(os);
  	_gEngine.SaveState_v4(os);
@@ -117,34 +117,16 @@
  	int version;
  	if (is.read_32LE(version) != 1) return false;
  	if (size == 8) version = 0;
+-	if (version < 0 || version > 4) return false;
 +	if (version < 0 || version > 5) return false;
  
  	if (CurrentRenderer->GetRenderNeedsFinish())
  	{
-@@ -3967,7 +4062,7 @@
- 		float loadingSortYMin = 0.0f;
- 		float loadingSortYMax = 0.0f;
- 		
--		is.read_32LE(vertListCount32);
-+		if (!is.read_32LE(vertListCount32) || vertListCount32 > VERTLIST_SIZE) return false;
- 		gfx3d.gList[gfx3d.pendingListIndex].rawVertCount = vertListCount32;
- 		gfx3d.gList[gfx3d.appliedListIndex].rawVertCount = vertListCount32;
- 		for (size_t i = 0; i < gfx3d.gList[gfx3d.appliedListIndex].rawVertCount; i++)
-@@ -3976,7 +4071,7 @@
- 			gfx3d.gList[gfx3d.appliedListIndex].rawVtxList[i] = gfx3d.gList[gfx3d.pendingListIndex].rawVtxList[i];
- 		}
- 		
--		is.read_32LE(polyListCount32);
-+		if (!is.read_32LE(polyListCount32) || polyListCount32 > POLYLIST_SIZE) return false;
- 		gfx3d.gList[gfx3d.pendingListIndex].rawPolyCount = polyListCount32;
- 		gfx3d.gList[gfx3d.appliedListIndex].rawPolyCount = polyListCount32;
- 		for (size_t i = 0; i < gfx3d.gList[gfx3d.appliedListIndex].rawPolyCount; i++)
-@@ -4010,8 +4105,16 @@
+@@ -4017,6 +4111,14 @@
+ 	if (version >= 4)
  	{
  		_gEngine.LoadState_v4(is);
- 	}
--
--	return true;
++	}
 +	if (version == 5)
 +	{
 +		if (!GFX3D_LoadExactState(gfx3d.pendingState, is) ||
@@ -152,13 +134,10 @@
 +			!GFX3D_LoadExactList(gfx3d.gList[gfx3d.pendingListIndex], is) ||
 +			!GFX3D_LoadExactList(gfx3d.gList[gfx3d.appliedListIndex], is)) return false;
 +		gfx3d_hasExactLoadedState = true;
-+	}
-+
-+	return !is.fail();
- }
+ 	}
  
- void gfx3d_FinishLoadStateBufferRead()
-@@ -4027,6 +4130,14 @@
+ 	return !is.fail();
+@@ -4057,6 +4159,14 @@
  	gfx3d.isSwapBuffersPending = (gfx3d.legacySave.isSwapBuffersPending) ? true : false;
  	gfx3d.isDrawPending = (gfx3d.legacySave.isDrawPending) ? true : false;
  	

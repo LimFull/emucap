@@ -480,11 +480,7 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
 }
 
 #[test]
-fn hello_echoes_session_token_and_name_when_launcher_set_them() {
-    // The launcher (`src/launch/ppsspp.rs`) sets EMUCAP_NAME/EMUCAP_SESSION_TOKEN on the
-    // bridge process; emucap-mcp's TCP handshake (`live/tcp.rs`) sends a "hello" and rejects
-    // the connection with IdentityMismatch unless the reply echoes back the same
-    // session_token. `with_identity` supplies both without mutating process env.
+fn hello_reports_name_without_disclosing_session_token() {
     let mut bridge = PpssppBridge::with_identity(
         FakeWs::with(&[]),
         Some(PathBuf::from("/tmp/managed-psp.iso")),
@@ -495,12 +491,12 @@ fn hello_echoes_session_token_and_name_when_launcher_set_them() {
     assert!(resp.ok, "{:?}", resp.error);
     let result = resp.result.unwrap();
     assert_eq!(result["name"], "psp_session");
-    assert_eq!(result["session_token"], "tok-abc123");
+    assert!(result.get("session_token").is_none());
     assert_eq!(result["content"], "/tmp/managed-psp.iso");
 }
 
 #[test]
-fn hello_omits_name_and_session_token_when_unset() {
+fn hello_omits_name_when_unset() {
     let mut bridge = PpssppBridge::with_content(FakeWs::with(&[]), None);
     let resp = bridge.handle_request(Request::new(1, "hello", json!({})));
     assert!(resp.ok, "{:?}", resp.error);
@@ -983,6 +979,49 @@ fn set_breakpoint_exec_calls_cpu_breakpoint_add_and_tracks_id() {
     assert_eq!(params["address"], 0x0880_4128u32);
     assert_eq!(params["enabled"], true);
     assert!(params.get("condition").is_none());
+}
+
+#[test]
+fn breakpoint_budget_counts_duplicates_and_returns_capacity_after_clear() {
+    let mut ws = FakeWs::default();
+    for _ in 0..129 {
+        ws.replies
+            .push_back(("cpu.breakpoint.add".into(), json!({})));
+    }
+    let mut bridge = PpssppBridge::new(ws);
+    let point = json!({"address":0x0880_1000});
+    for id in 1..=128 {
+        assert_eq!(bridge.set_breakpoint(&point).unwrap()["id"], id);
+    }
+    let next = bridge.next_bp;
+    let calls = bridge.ws.calls.len();
+    let error = bridge.set_breakpoint(&point).unwrap_err();
+    assert!(error.to_string().contains("128"), "{error}");
+    assert_eq!(bridge.next_bp, next);
+    assert_eq!(bridge.ws.calls.len(), calls);
+    assert_eq!(bridge.bps.len(), 128);
+    // An accepted duplicate owns a public slot but shares the remaining native point.
+    bridge.clear_breakpoint(&json!({"id":1})).unwrap();
+    assert_eq!(bridge.ws.calls.len(), calls);
+    assert_eq!(bridge.set_breakpoint(&point).unwrap()["id"], 129);
+    assert_eq!(bridge.bps.len(), 128);
+}
+
+#[test]
+fn breakpoint_id_exhaustion_precedes_ppsspp_native_mutation() {
+    for kind in ["exec", "read", "write"] {
+        let mut bridge = PpssppBridge::new(FakeWs::default());
+        bridge.next_bp = u64::MAX;
+        let result =
+            bridge.set_breakpoint(&json!({"kind":kind,"memory_type":"main","start":0x100}));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("id space exhausted"));
+        assert!(bridge.ws.calls.is_empty());
+        assert!(bridge.bps.is_empty());
+        assert_eq!(bridge.next_bp, u64::MAX);
+    }
 }
 
 #[test]

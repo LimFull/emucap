@@ -1,17 +1,19 @@
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index d6407f656a..1440d33cb8 100644
 --- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-@@ -14,6 +14,10 @@
- 
+@@ -15,6 +15,10 @@
  // Official git repository and contact information can be found at
  // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
-+
+ 
 +#include <chrono>
 +#include <cstdlib>
 +#include <thread>
- 
++
  #include "Common/StringUtils.h"
  #include "Core/Debugger/Breakpoints.h"
-@@ -32,11 +36,16 @@
+ #include "Core/Debugger/DisassemblyManager.h"
+@@ -33,10 +37,15 @@
  
  using namespace MIPSAnalyst;
  
@@ -23,13 +25,12 @@
  	WebSocketSteppingState() {
  		g_disassemblyManager.setCpu(currentDebugMIPS);
  	}
- 	~WebSocketSteppingState() {
-+		CloseFrame();
- 		g_disassemblyManager.clear();
- 	}
++	~WebSocketSteppingState() { CloseFrame(); }
  
-@@ -46,6 +55,13 @@
- 	void RunUntil(DebuggerRequest &req);
+ 	void Into(DebuggerRequest &req);
+ 	void Over(DebuggerRequest &req);
+@@ -45,6 +54,13 @@ struct WebSocketSteppingState : public DebuggerSubscriber {
+ 	void RunUntilTime(DebuggerRequest &req);
  	void HLE(DebuggerRequest &req);
  	void Frame(DebuggerRequest &req);
 +	void CancelFrame(DebuggerRequest &req);
@@ -42,9 +43,9 @@
  	void Pacing(DebuggerRequest &req);
  
  protected:
-@@ -62,52 +78,123 @@
- 	map["cpu.stepOut"]  = [p](DebuggerRequest &req) { p->Out(req); };
+@@ -61,52 +77,123 @@ DebuggerSubscriber *WebSocketSteppingInit(DebuggerEventHandlerMap &map) {
  	map["cpu.runUntil"] = [p](DebuggerRequest &req) { p->RunUntil(req); };
+ 	map["cpu.runUntilTime"] = [p](DebuggerRequest &req) { p->RunUntilTime(req); };
  	map["cpu.nextHLE"]  = [p](DebuggerRequest &req) { p->HLE(req); };
 +	map["emucap.frameStep.capability"] = [](DebuggerRequest &req) {
 +		JsonWriter &json = req.Respond();
@@ -102,8 +103,14 @@
 -	const bool deadline = result.status == EmucapFrameStepStatus::TimedOut;
 -	if (deadline) {
 -		// A paced advance stops at the reached VBlank once its host budget is spent.
+-		Core_Break(BreakReason::DebugBreak, 0);
+-		Core_WaitInactive();
+-		result = Core_EmucapCancelFrameStep();
+-	}
 +}
-+
+ 
+-	Core_WaitInactive();
+-	JsonWriter &json = req.Respond();
 +void WebSocketSteppingState::RequestFrameStop(const char *reason) {
 +	if (frameStopping_)
 +		return;
@@ -112,8 +119,7 @@
 +	// A completed advance or natural breakpoint keeps its original stop reason.
 +	if (Core_EmucapWaitFrameStep(0).status == EmucapFrameStepStatus::TimedOut) {
 +		frameStopReason_ = reason;
- 		Core_Break(BreakReason::DebugBreak, 0);
--		Core_WaitInactive();
++		Core_Break(BreakReason::DebugBreak, 0);
 +	}
 +}
 +
@@ -146,11 +152,7 @@
 +	if (coreState != CORE_STEPPING_CPU)
 +		std::abort();  // Powerdown/GE stepping is not an exact CPU-frame terminal.
 +	if (result.status == EmucapFrameStepStatus::TimedOut)
- 		result = Core_EmucapCancelFrameStep();
--	}
--
--	Core_WaitInactive();
--	JsonWriter &json = req.Respond();
++		result = Core_EmucapCancelFrameStep();
 +	JsonWriter json;
 +	json.begin();
 +	json.writeString("event", "emucap.frameStep");

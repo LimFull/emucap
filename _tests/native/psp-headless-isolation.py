@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Managed headless preserves guest dialogs and writes only its selected memstick."""
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[2]
-text = (root / 'adapters/ppsspp/work/ppsspp/headless/Headless.cpp').read_text()
-def function(signature):
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--source', type=Path, default=root / 'adapters/ppsspp/work/ppsspp')
+args = parser.parse_args()
+text = (args.source / 'headless/Headless.cpp').read_text()
+atlas = (args.source / 'Core/Util/PPGeDraw.cpp').read_text()
+def function(signature, text=text):
     start = text.index(signature)
     opening = text.index('{', start)
     depth = 1
@@ -28,27 +33,29 @@ struct Path {
 struct {Path memStickDirectory;}g_Config;
 std::vector<std::string> writes;
 namespace File {
- void CreateDir(const Path& p){writes.push_back(p.value);}
+ void CreateDir(const Path& p,bool){writes.push_back(p.value);}
  void CreateFullPath(const Path& p){writes.push_back(p.value);}
 }
 void CreateSysDirectories(){writes.push_back(g_Config.memStickDirectory.value+"/PSP/SYSTEM");}
 const char* selected=nullptr;
 const char* test_getenv(const char* name){return std::string(name)=="EMUCAP_PPSSPP_MEMSTICK"?selected:"operator-home";}
 #define getenv test_getenv
-enum SystemProperty{SYSPROP_CAN_JIT,SYSPROP_SKIP_UI,OTHER};
-''' + function('static void ConfigureMemstick(') + '\n' + function('bool System_GetPropertyBool(') + r'''
+enum SystemProperty{SYSPROP_CAN_JIT,SYSPROP_IS_HEADLESS,OTHER};
+''' + function('static void ConfigureMemstick(') + '\n' + function('bool System_GetPropertyBool(') + '\n' + function('static bool PPGeShouldLoadAtlas()', atlas) + r'''
 int main(){
  for(const char* root:{"generation-a/memstick","generation-b/memstick"}){
   selected=root;writes.clear();ConfigureMemstick(Path("native"));
   assert(g_Config.memStickDirectory.value==root);
   assert((writes==std::vector<std::string>{root,std::string(root)+"/PSP/SYSTEM"}));
-  assert(!System_GetPropertyBool(SYSPROP_SKIP_UI));
+  assert(System_GetPropertyBool(SYSPROP_IS_HEADLESS));
+  assert(PPGeShouldLoadAtlas());
   assert(System_GetPropertyBool(SYSPROP_CAN_JIT));
   assert(!System_GetPropertyBool(OTHER));
  }
  for(const char* empty:std::vector<const char*>{nullptr,""}){
   selected=empty;writes.clear();ConfigureMemstick(Path("native"));
-  assert(System_GetPropertyBool(SYSPROP_SKIP_UI));
+  assert(System_GetPropertyBool(SYSPROP_IS_HEADLESS));
+  assert(!PPGeShouldLoadAtlas());
 #if PPSSPP_PLATFORM_WINDOWS
   assert(g_Config.memStickDirectory.value=="native/memstick");
 #else

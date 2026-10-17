@@ -8,12 +8,12 @@ diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
 +    // Timed override status: 0=terminal/released, -1=persistent hold, >0=frames remaining.
 +    else if ( strncmp( (const char *)packet, "qEmucap,inputstatus", 19) == 0) {
 +      extern int NDS_getEmucapInputOverrideRemaining();
-+      send_size = snprintf( (char *)out_ptr, BUFMAX, "%d",
++      send_size = snprintf( (char *)out_ptr, BUFMAX - 1, "%d",
 +                            NDS_getEmucapInputOverrideRemaining());
 +    }
 +    else if ( strncmp( (const char *)packet, "qEmucap,touchstatus", 19) == 0) {
 +      extern int NDS_getEmucapTouchOverrideRemaining();
-+      send_size = snprintf( (char *)out_ptr, BUFMAX, "%d",
++      send_size = snprintf( (char *)out_ptr, BUFMAX - 1, "%d",
 +                            NDS_getEmucapTouchOverrideRemaining());
 +    }
      // emucap disassemble: qEmucap,disasm:<hexaddr>,<hexcount>[,<mode>] -> base64 of

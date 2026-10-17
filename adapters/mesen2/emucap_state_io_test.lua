@@ -51,4 +51,52 @@ ok = pcall(StateIo.load, {
 assert(not ok, "a rejected savestate must be reported")
 
 os.remove(path)
+
+write(path, "state")
+for _, fail in ipairs({
+  function() return false end,
+  function() error("partial native mutation") end,
+}) do
+  local quarantined = false
+  local ok = pcall(StateIo.load, { loadSavestate = fail }, path, function() quarantined = true end)
+  assert(not ok and quarantined, "native failures must notify the generation owner")
+end
+os.remove(path)
+local quarantined = false
+assert(not pcall(StateIo.load, { loadSavestate = function() error("must not run") end }, path,
+  function() quarantined = true end))
+assert(not quarantined, "file admission failure must not quarantine untouched native state")
+
 print("ALL EMUCAP STATE I/O TESTS PASSED")
+
+-- Fake handles prove admission happens before allocation/native mutation and reads
+-- are bounded even if the file grows after its length was sampled.
+local original_open = io.open
+for _, size in ipairs({0, 67108865, 1099511627776}) do
+  local closed = false
+  io.open = function() return {
+    seek = function() return size end,
+    read = function() error("oversized state must not be read") end,
+    close = function() closed = true; return true end,
+  } end
+  local entered, quarantined = false, false
+  assert(not pcall(StateIo.load, {loadSavestate=function() entered=true end}, "fake",
+    function() quarantined=true end))
+  assert(closed and not entered and not quarantined)
+end
+for _, data in ipairs({"ab", "abcd", "abc"}) do
+  local entered, closed = false, false
+  io.open = function() return {
+    seek = function(_, where) return where == "end" and 3 or 0 end,
+    read = function(_, n) assert(n == 4); return data end,
+    close = function() closed=true; return true end,
+  } end
+  local ok = pcall(StateIo.load, {loadSavestate=function(actual) entered=true; assert(actual==data) end}, "fake")
+  assert(ok == (#data == 3) and entered == ok and closed)
+end
+io.open = original_open
+-- A sparse file exercises the real boundary without writing a 64 MiB fixture.
+local f = assert(io.open(path, "wb"))
+assert(f:seek("set", 67108863)); assert(f:write("x")); assert(f:close())
+assert(StateIo.load({loadSavestate=function(data) assert(#data == 67108864) end}, path) == 67108864)
+os.remove(path)

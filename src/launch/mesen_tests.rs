@@ -2,6 +2,49 @@ use super::*;
 use crate::test_env::{lock_env, EnvGuard};
 use serde_json::{json, Value};
 
+#[test]
+fn media_admission_rejects_scripts_and_directories_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["payload.lua", "payload.LuA", ".lua", ".LuA"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"os.execute('unused')").unwrap();
+        let error = admitted_content_path(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("game media"));
+        let error = launch(&Launch {
+            binary: Path::new("missing-mesen"),
+            content: path.to_str().unwrap(),
+            lua: Path::new("trusted-adapter.lua"),
+            log_path: &dir.path().join("unused.log"),
+            port: 12345,
+            name: None,
+            build: None,
+            session_token: None,
+            runtime: None,
+            start_frozen: true,
+            repeatable: false,
+            sound: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("game media"));
+        assert!(!dir.path().join("unused.log").exists());
+    }
+    assert!(admitted_content_path(dir.path().to_str().unwrap()).is_err());
+    let rom = dir
+        .path()
+        .join("--debug.scriptWindow.allowIoOsAccess=false.sfc");
+    std::fs::write(&rom, b"fixture media").unwrap();
+    let admitted = admitted_content_path(rom.to_str().unwrap()).unwrap();
+    assert!(Path::new(&admitted).is_absolute());
+    assert_eq!(std::fs::read(admitted).unwrap(), b"fixture media");
+    #[cfg(unix)]
+    {
+        let alias = dir.path().join("alias.sfc");
+        std::os::unix::fs::symlink(dir.path().join("payload.lua"), &alias).unwrap();
+        assert!(admitted_content_path(alias.to_str().unwrap()).is_err());
+    }
+}
+
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -17,6 +60,13 @@ fn read(path: &Path) -> Value {
 fn with_emu_home<T>(base: &Path, f: impl FnOnce() -> T) -> T {
     let _guard = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    crate::private_fs::windows::privatize_dir(base).unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", base);
     f()
 }
@@ -91,7 +141,9 @@ fn portable_plain_binary_writes_only_emucap_home() {
         prepare_portable_binary(&source_bin, 47911).unwrap()
     });
 
-    assert_eq!(portable.home, emu_home.path().join("mesen2/47911"));
+    assert!(portable
+        .home
+        .starts_with(emu_home.path().join("mesen2/47911/manual")));
     assert_eq!(portable.binary, portable.home.join("portable/Mesen"));
     assert_eq!(
         portable.settings,
@@ -185,7 +237,7 @@ fn portable_patched_publish_copies_runtime_dependencies_and_sidecar() {
 }
 
 #[test]
-fn portable_patched_publish_refresh_preserves_guest_data() {
+fn successive_portable_generations_do_not_inherit_guest_data() {
     let src = tempfile::tempdir().unwrap();
     let emu_home = tempfile::tempdir().unwrap();
     let source_bin = src.path().join("Mesen");
@@ -213,19 +265,18 @@ fn portable_patched_publish_refresh_preserves_guest_data() {
     });
     let refreshed_data = refreshed.settings.parent().unwrap();
 
-    assert_eq!(
-        std::fs::read(refreshed_data.join("Saves/game.srm")).unwrap(),
-        b"battery state"
-    );
-    assert_eq!(
-        std::fs::read(refreshed_data.join("GameConfig/game.json")).unwrap(),
-        b"game config"
-    );
+    assert_ne!(first.home, refreshed.home);
+    assert!(!refreshed_data.join("Saves/game.srm").exists());
+    assert!(!refreshed_data.join("GameConfig/game.json").exists());
     assert_eq!(
         std::fs::read_to_string(refreshed_data.join("Mesen.dll")).unwrap(),
         "runtime v2"
     );
     assert!(!refreshed_data.join("stale-runtime.txt").exists());
+    assert_eq!(
+        std::fs::read(data.join("Saves/game.srm")).unwrap(),
+        b"battery state"
+    );
 }
 
 #[test]
@@ -264,7 +315,7 @@ fn repeatable_portable_is_separate_from_ordinary_guest_data() {
 
         request.repeatable = true;
         let repeatable = prepare_launch_portable(&request).unwrap();
-        assert_eq!(repeatable.home, ordinary.home.join("repeatable"));
+        assert_ne!(repeatable.home, ordinary.home);
         assert!(ordinary_save.is_file());
         assert!(!repeatable.settings.parent().unwrap().join("Saves").exists());
 
@@ -277,6 +328,7 @@ fn repeatable_portable_is_separate_from_ordinary_guest_data() {
         std::fs::write(&transient_save, b"discardable repeatable state").unwrap();
 
         let refreshed_repeatable = prepare_launch_portable(&request).unwrap();
+        assert_ne!(refreshed_repeatable.home, repeatable.home);
         assert!(!refreshed_repeatable
             .settings
             .parent()
@@ -335,7 +387,12 @@ fn portable_plain_binary_refuses_symlink_inside_emucap_home() {
     std::os::unix::fs::symlink(&target_bin, &portable_link).unwrap();
 
     let err = with_emu_home(emu_home.path(), || {
-        prepare_portable_binary(&portable_link, 47913)
+        prepare_portable_binary_in_home(
+            &portable_link,
+            47913,
+            emu_home.path().join("mesen2/47913"),
+            true,
+        )
     })
     .unwrap_err();
 
@@ -365,7 +422,7 @@ fn portable_plain_binary_refuses_symlinked_parent_inside_emucap_home() {
     let apparent_binary = portable_link.join("Mesen");
 
     let err = with_emu_home(emu_home.path(), || {
-        prepare_portable_binary(&apparent_binary, 47914)
+        prepare_portable_binary_in_home(&apparent_binary, 47914, port_home.clone(), true)
     })
     .unwrap_err();
 
@@ -407,17 +464,16 @@ fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
         prepare_portable_binary(&source_bin, 47912).unwrap()
     });
 
+    assert!(portable
+        .home
+        .starts_with(emu_home.path().join("mesen2/47912/manual")));
     assert_eq!(
         portable.binary,
-        emu_home
-            .path()
-            .join("mesen2/47912/Mesen.app/Contents/MacOS/Mesen")
+        portable.home.join("Mesen.app/Contents/MacOS/Mesen")
     );
     assert_eq!(
         portable.settings,
-        emu_home
-            .path()
-            .join("mesen2/47912/Mesen.app/Contents/MacOS/settings.json")
+        portable.home.join("Mesen.app/Contents/MacOS/settings.json")
     );
     assert!(portable
         .home
@@ -517,6 +573,60 @@ fn portable_ports_get_distinct_bundle_identities_without_touching_source_profile
         read(&source_settings),
         json!({"Preferences": {"SingleInstance": true}})
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn portable_same_port_generations_get_distinct_bundle_identities() {
+    let src = tempfile::tempdir().unwrap();
+    let first_home = tempfile::tempdir().unwrap();
+    let second_home = tempfile::tempdir().unwrap();
+    let app = src.path().join("Mesen.app");
+    let source_bin = app.join("Contents/MacOS/Mesen");
+    let source_info = app.join("Contents/Info.plist");
+    std::fs::create_dir_all(source_bin.parent().unwrap()).unwrap();
+    std::fs::write(&source_bin, "fake app mesen").unwrap();
+    std::fs::write(
+        &source_info,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>ca.mesen</string>
+</dict></plist>
+"#,
+    )
+    .unwrap();
+
+    let first = super::prepare_portable_binary_in_home(
+        &source_bin,
+        47931,
+        first_home.path().join("generation-a"),
+        false,
+    )
+    .unwrap();
+    let second = super::prepare_portable_binary_in_home(
+        &source_bin,
+        47931,
+        second_home.path().join("generation-b"),
+        false,
+    )
+    .unwrap();
+
+    let identifier = |portable: &super::PreparedPortable| {
+        let text =
+            std::fs::read_to_string(portable.home.join("Mesen.app/Contents/Info.plist")).unwrap();
+        text.split("<string>")
+            .nth(1)
+            .unwrap()
+            .split("</string>")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let first_id = identifier(&first);
+    let second_id = identifier(&second);
+    assert!(first_id.starts_with("ca.mesen.emucap.p47931.g"));
+    assert!(second_id.starts_with("ca.mesen.emucap.p47931.g"));
+    assert_ne!(first_id, second_id);
 }
 
 /// Run `f` with `EMUCAP_EMU_HOME` and `EMUCAP_GBA_BIOS` set as given (both restored after),
@@ -710,7 +820,7 @@ fn default_gba_bios_source_is_shared_firmware_dir_not_per_port() {
     let dir = tempfile::tempdir().unwrap();
     with_gba_env(dir.path(), None, || {
         assert_eq!(
-            default_gba_bios_source(),
+            default_gba_bios_source().unwrap(),
             dir.path().join("firmware/gba_bios.bin"),
             "default BIOS source must be the shared <home>/firmware, not under mesen2/<port>"
         );

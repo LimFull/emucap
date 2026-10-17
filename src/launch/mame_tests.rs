@@ -71,7 +71,7 @@ fn default_rompath_uses_existing_home_roms_dir() {
     std::env::remove_var("USERPROFILE");
     std::env::set_var("EMUCAP_EMU_HOME", dir.path().join("emucap"));
 
-    assert_eq!(default_rompath(), roms);
+    assert_eq!(default_rompath().unwrap(), roms);
 }
 
 #[test]
@@ -83,7 +83,10 @@ fn default_rompath_falls_back_to_emucap_home_without_user_roms() {
     std::env::remove_var("USERPROFILE");
     std::env::set_var("EMUCAP_EMU_HOME", dir.path());
 
-    assert_eq!(default_rompath(), dir.path().join("mame-pc98").join("roms"));
+    assert_eq!(
+        default_rompath().unwrap(),
+        dir.path().join("mame-pc98").join("roms")
+    );
 }
 
 #[test]
@@ -120,10 +123,14 @@ fn default_bridge_selection_uses_rust_binary() {
         cbus0: None,
     };
 
-    let selected = resolve_bridge_launch(&launch, 48800).unwrap();
+    let selected = resolve_bridge_launch(&launch, 48800, "native-token").unwrap();
     assert_eq!(selected.kind, "rust");
     assert_eq!(selected.spec.program, bridge_bin);
     assert_eq!(selected.spec.args, vec!["47800", "127.0.0.1:48800"]);
+    assert!(selected
+        .spec
+        .env
+        .contains(&("EMUCAP_NATIVE_DEBUG_TOKEN".into(), "native-token".into())));
 }
 
 #[test]
@@ -171,7 +178,7 @@ fn rust_bridge_selection_uses_explicit_binary() {
         cbus0: None,
     };
 
-    let selected = resolve_bridge_launch(&launch, 48800).unwrap();
+    let selected = resolve_bridge_launch(&launch, 48800, "native-token").unwrap();
     assert_eq!(selected.kind, "rust");
     assert_eq!(selected.spec.program, bridge_bin);
     assert_eq!(selected.spec.args, vec!["47800", "127.0.0.1:48800"]);
@@ -180,6 +187,10 @@ fn rust_bridge_selection_uses_explicit_binary() {
         .env
         .iter()
         .any(|(k, v)| k == "EMUCAP_SESSION_TOKEN" && v == "token"));
+    assert!(selected
+        .spec
+        .env
+        .contains(&("EMUCAP_NATIVE_DEBUG_TOKEN".into(), "native-token".into())));
 }
 
 #[test]
@@ -230,7 +241,7 @@ fn rust_bridge_selection_fails_before_mame_when_binary_missing() {
         cbus0: None,
     };
 
-    let err = resolve_bridge_launch(&launch, 48800).unwrap_err();
+    let err = resolve_bridge_launch(&launch, 48800, "native-token").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     assert!(err.to_string().contains("EMUCAP_PC98_BRIDGE_BIN"));
 }

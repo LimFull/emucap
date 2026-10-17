@@ -21,13 +21,18 @@ fn main() -> anyhow::Result<()> {
     eprintln!(
         "[mame-pc98-rust] connecting gdb={gdb_host}:{gdb_port} emucap=127.0.0.1:{emucap_port}"
     );
-    let gdb = GdbRspClient::connect(
+    let native_debug_token = std::env::var("EMUCAP_NATIVE_DEBUG_TOKEN")
+        .context("EMUCAP_NATIVE_DEBUG_TOKEN is required for MAME control authentication")?;
+    let mut gdb = GdbRspClient::connect(
         &gdb_host,
         gdb_port,
         Duration::from_secs(5),
         Duration::from_secs(30),
     )
     .with_context(|| format!("connect GDB stub at {gdb_host}:{gdb_port}"))?;
+    gdb.authenticate_mutual(&native_debug_token)
+        .map_err(|error| anyhow!(error.to_string()))
+        .context("authenticate the MAME native control endpoint")?;
     let mut bridge = Bridge::new(gdb, GdbBridgeEnv::from_process_env());
     let dependency =
         ProcessDependency::from_process_env().context("load emulator process dependency")?;

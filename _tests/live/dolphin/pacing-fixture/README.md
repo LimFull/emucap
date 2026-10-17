@@ -60,10 +60,10 @@ The guest reads its real SI device; the witness uses the public `tap` operation.
 
 ## Oracles
 
-From one retained instruction-boundary snapshot, `tap(A,2,3)` asks for six
-presented completions, including the release edge. Required outcomes are six
-guest scans, two consumed-input scans and twelve native VI fields. A no-input
-six-frame control must consume zero presses. Repeated 100%, 50%, 400%, 10000%,
+From one retained instruction-boundary snapshot, `tap(A,2,3)` asks for five
+presented completions: two with input held and three after release. Required
+outcomes are five guest scans, two consumed-input scans and ten native VI fields.
+A no-input five-frame control must consume zero presses. Repeated 100%, 50%, 400%, 10000%,
 unlimited and 1% cases must preserve the entire guest record and CPU register
 observation for the same input. All six record words and the full returned CPU register map participate.
 
@@ -71,7 +71,7 @@ A polling timestamp is not the exact VI edge. For the origin bracket `[L0,U0]`
 and endpoint bracket `[L1,U1]`, with unsigned 32-bit wrap handled explicitly:
 
 ```text
-L1 - U0 <= 6 * TB_per_scan <= U1 - L0
+L1 - U0 <= 5 * TB_per_scan <= U1 - L0
 0 <= Ui - Li < TB_per_half_line
 same_origin && same_input && different_pacing => identical_record_and_registers
 ```

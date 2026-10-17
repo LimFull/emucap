@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
                 Mupen64PlusHost::terminal_reason,
                 emucap::live::reconnect::cancellation::TemporalAdmission {
                     runtime,
-                    methods: vec!["step".into()],
+                    methods: vec!["step".into(), "step_input_polls".into()],
                 },
             );
         }

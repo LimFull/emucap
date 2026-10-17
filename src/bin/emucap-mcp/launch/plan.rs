@@ -139,12 +139,14 @@ pub(super) fn mesen_binary_precondition(root: &Path) -> serde_json::Value {
 
 pub(super) fn flycast_binary_precondition_from(resolved: Option<PathBuf>) -> serde_json::Value {
     let build_home = flycast_launch::build_home();
-    let legacy_home_build =
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("flycast/build"));
+    let legacy_home_build = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join("flycast/build"));
     simple_binary_precondition(resolved, |path| {
         if env_path_or_app_matches("FLYCAST_APP", path, "Flycast") {
             "FLYCAST_APP"
-        } else if path.starts_with(&build_home) {
+        } else if build_home.as_ref().is_ok_and(|home| path.starts_with(home)) {
             "emucap_build"
         } else if legacy_home_build
             .as_ref()
@@ -844,11 +846,18 @@ pub(super) fn infer_system(
     }
 }
 
-pub(super) fn adapter_log_path(adapter: &str, port: u16, filename: &str) -> PathBuf {
-    emucap::launch::emu_home_dir(adapter, port).join(filename)
+pub(super) fn adapter_log_path(
+    port: u16,
+    runtime: RuntimeEnv<'_>,
+    filename: &str,
+) -> std::io::Result<PathBuf> {
+    Ok(emucap::launch::runtime_generation_dir(port, runtime)?.join(filename))
 }
 
 pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serde_json::Value {
+    if let Err(error) = emucap::live::runtime::RuntimeStore::discover() {
+        return serde_json::json!({"ok": false, "ready_to_launch": false, "error": error.to_string()});
+    }
     let inference = infer_system(args.content_path.as_deref(), args.system.as_deref());
     let paths = runtime_paths(port);
     let Some(system) = inference.get("system").and_then(|v| v.as_str()) else {
@@ -941,17 +950,17 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     } else if adapter == "np2kai" {
         serde_json::json!({
             "EMUCAP_NP2KAI_FIRMWARE": {
-                "default": emucap::launch::np2kai::default_firmware_root().display().to_string(),
+                "default": emucap::launch::np2kai::default_firmware_root().ok().map(|path| path.display().to_string()),
                 "applies_when": "the np2kai backend is explicitly selected",
-                "reason": "only recognized PC-98 firmware files are copied into the emucap-owned per-port system directory"
+                "reason": "only recognized PC-98 firmware files are copied into the emucap-owned launch-generation system directory"
             }
         })
     } else if adapter == "mednafen" {
         serde_json::json!({
             "EMUCAP_MEDNAFEN_FIRMWARE": {
-                "default": emucap::launch::mednafen::default_firmware_root().display().to_string(),
+                "default": emucap::launch::mednafen::default_firmware_root().ok().map(|path| path.display().to_string()),
                 "applies_when": "canonical Mednafen BIOS files are available",
-                "reason": "known BIOS files are copied into the emucap-owned per-port Mednafen home; ~/.mednafen is never used"
+                "reason": "known BIOS files are copied into the emucap-owned launch-generation Mednafen home; ~/.mednafen is never used"
             }
         })
     } else if adapter == "mesen2" {
@@ -1123,15 +1132,15 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         } else if adapter == "mame_neogeo" {
             "Neo Geo MVS, AES, and CD launch headless by default and use profile-specific emucap-owned MAME homes. launch(display:true) opens a window without reading or changing the user's MAME configuration."
         } else if adapter == "mupen64plus" {
-            "Nintendo 64 launch is headless by default and uses an emucap-owned Mupen64Plus configuration. launch(display:true) explicitly loads the pinned Rice video plugin."
+            "Nintendo 64 launch is headless by default and uses an emucap-owned Mupen64Plus configuration. Both modes load the pinned Rice renderer; display controls window visibility."
         } else if adapter == "mednafen" {
-            "Mednafen Rust launch is the supported detached path. It uses an emucap-owned per-port home and does not read or change ~/.mednafen; do not hand-roll raw nohup."
+            "Mednafen Rust launch is the supported detached path. It uses an emucap-owned launch-generation home and does not read or change ~/.mednafen; do not hand-roll raw nohup."
         } else if adapter == "flycast" {
             "Flycast renders a GUI window and needs the display awake. Rust launch uses an emucap-owned isolated config copy and forces the interpreter when needed; do not run Flycast.app directly."
         } else if adapter == "ppsspp" {
             "Headless PPSSPP boots the content positionally (not -m/--mount, which only mounts a second image) and is never passed --timeout (that flag aborts the run on a wall-clock deadline regardless of debugger activity); the Rust launch path manages the process lifecycle instead."
         } else if adapter == "dolphin" {
-            "Dolphin is headless by default. launch(display:true) selects the compatible DolphinQt build and opens its render window. Both modes use a per-port portable runtime and --user directory."
+            "Dolphin is headless by default. launch(display:true) selects the compatible DolphinQt build and opens its render window. Both modes use a launch-generation portable runtime and --user directory."
         } else if adapter == "xemu" {
             "xemu keeps its GPU path active in both modes. Headless launch uses the pinned hidden-window extension; visible launch opens an isolated native window. Neither mode reads or changes the user's xemu profile."
         } else {

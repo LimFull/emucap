@@ -298,9 +298,12 @@ fn isolate_app_bundle_identity(app_root: &Path, port: u16) -> std::io::Result<()
         ));
     }
 
-    // LaunchServices and macOS saved-state storage key off this identifier. Sharing upstream's
-    // identifier can strand a rapid relaunch behind another port's or the user's open Mesen app.
-    let identifier = format!("ca.mesen.emucap.p{port}");
+    // LaunchServices and macOS saved-state storage key off this identifier. Bind the private
+    // namespace to the copied app path so same-port launch generations cannot inherit it.
+    let mut hasher = Sha256::new();
+    hasher.update(app_root.as_os_str().as_encoded_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let identifier = format!("ca.mesen.emucap.p{port}.g{}", &digest[..16]);
     let output = std::process::Command::new("/usr/bin/plutil")
         .args(["-replace", "CFBundleIdentifier", "-string", &identifier])
         .arg(&info_plist)
@@ -332,7 +335,7 @@ pub fn prepare_portable_binary(
     source_binary: &Path,
     port: u16,
 ) -> std::io::Result<PreparedPortable> {
-    let home = super::emu_home_dir("mesen2", port);
+    let home = super::emu_generation_dir("mesen2", port, None)?;
     prepare_portable_binary_in_home(source_binary, port, home, true)
 }
 
@@ -448,7 +451,7 @@ fn prepare_portable_binary_in_home(
         isolate_app_bundle_identity(app_root, port)?;
     }
 
-    // launch() installs the per-port portable marker after validating this
+    // launch() installs the generation-owned portable marker after validating this
     // copied runtime, replacing any settings file bundled with the build.
     Ok(PreparedPortable {
         binary,
@@ -459,6 +462,7 @@ fn prepare_portable_binary_in_home(
 
 /// Everything the launcher needs to bring up Mesen for emucap. `binary`/`lua` are resolved paths;
 /// `content` is the ROM; `port` is the MCP's listening_port.
+#[derive(Clone, Copy)]
 pub struct Launch<'a> {
     pub binary: &'a Path,
     pub content: &'a str,
@@ -512,19 +516,16 @@ fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> sup
 /// Prepare an emucap-owned portable Mesen copy and launch it detached with the ROM + adapter Lua and
 /// the emucap environment. Returns the child pid.
 fn prepare_launch_portable(l: &Launch<'_>) -> std::io::Result<PreparedPortable> {
-    if l.repeatable {
-        prepare_portable_binary_in_home(
-            l.binary,
-            l.port,
-            super::emu_home_dir("mesen2", l.port).join("repeatable"),
-            false,
-        )
-    } else {
-        prepare_portable_binary(l.binary, l.port)
-    }
+    let home = super::emu_generation_dir("mesen2", l.port, l.runtime)?;
+    prepare_portable_binary_in_home(l.binary, l.port, home, false)
 }
 
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
+    let content = admitted_content_path(l.content)?;
+    let l = &Launch {
+        content: &content,
+        ..*l
+    };
     let host_build = read_build_metadata(l.binary)?;
     let portable = prepare_launch_portable(l)?;
     ensure_portable_settings(&portable, l.repeatable, l.sound)?;
@@ -538,6 +539,39 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
     crate::launch::spawn_display_caffeinate(pid);
     Ok(pid)
+}
+
+fn admitted_content_path(content: &str) -> std::io::Result<String> {
+    let reject_script = |path: &Path| {
+        // C# Path.GetExtension treats `.lua` itself as an extension; Rust's
+        // Path::extension does not. Match the native filename suffix instead.
+        if path.file_name().is_some_and(|name| {
+            let bytes = name.as_encoded_bytes();
+            bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".lua")
+        }) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Mesen content must be game media; Lua scripts belong to the adapter entry point",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    reject_script(Path::new(content))?;
+    let path = std::fs::canonicalize(content)?;
+    reject_script(&path)?;
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Mesen content must be a regular file",
+        ));
+    }
+    path.into_os_string().into_string().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Mesen content path must be UTF-8",
+        )
+    })
 }
 
 const PORTABLE_SETTINGS: &str = include_str!(concat!(
@@ -554,7 +588,7 @@ fn is_gba_launch(l: &Launch) -> bool {
 }
 
 /// A settings.json beside the executable is Mesen's portable-data marker. It keeps configuration and
-/// native-library lookup in the per-port copy, and the shared template requests Mesen's built-in
+/// native-library lookup in the generation copy, and the shared template requests Mesen's built-in
 /// native input defaults. For GBA it also makes the staged Firmware directory the lookup path.
 /// Settings copied from the build are replaced so build-machine state cannot affect an isolated
 /// launch.
@@ -638,8 +672,8 @@ fn clear_repeatable_persistence(portable: &PreparedPortable) -> std::io::Result<
 /// `<emucap-home>/firmware/gba_bios.bin`. This is the shared firmware dir alongside the per-emulator
 /// homes (matching the docs and legacy launcher's `$EMUCAP_MESEN_BASE/firmware/gba_bios.bin`), NOT
 /// under `mesen2/<port>` — a per-port location would never be found at the documented path.
-fn default_gba_bios_source() -> PathBuf {
-    super::emu_home_base().join("firmware/gba_bios.bin")
+fn default_gba_bios_source() -> std::io::Result<PathBuf> {
+    Ok(super::emu_home_base()?.join("firmware/gba_bios.bin"))
 }
 
 /// GBA needs a real BIOS (gba_bios.bin), which Mesen looks for in its data folder's `Firmware`
@@ -647,7 +681,8 @@ fn default_gba_bios_source() -> PathBuf {
 /// freshly-copied portable starts with an empty Firmware. When launching the GBA entry script, stage
 /// the BIOS into the portable Firmware directory first. Source order: explicit `EMUCAP_GBA_BIOS`,
 /// else `default_gba_bios_source()`. When no explicit source is set and the destination BIOS is
-/// already staged (a prior run), accept it rather than failing if the shared source has since gone.
+/// already staged in the prepared portable copy, accept it rather than failing if the shared source
+/// has since gone.
 /// A missing *explicitly-configured* source fails fast with a clear precondition instead of hanging
 /// on the prompt.
 fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Result<()> {
@@ -675,7 +710,7 @@ fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Resul
     }
     let src = match explicit {
         Some(p) => PathBuf::from(p),
-        None => default_gba_bios_source(),
+        None => default_gba_bios_source()?,
     };
     if !src.is_file() {
         return Err(std::io::Error::new(

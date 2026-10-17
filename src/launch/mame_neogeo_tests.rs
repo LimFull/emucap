@@ -99,7 +99,10 @@ fn resolver_uses_the_neogeo_build_without_reusing_the_pc98_subset() {
 
 #[test]
 fn headless_spec_uses_isolated_home_and_neogeo_profile() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let root = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", root.path().join("emucap"));
     let game = root.path().join("game.zip");
     let bios = root.path().join("neogeo.zip");
     std::fs::write(&game, b"game").unwrap();
@@ -119,7 +122,7 @@ fn headless_spec_uses_isolated_home_and_neogeo_profile() {
         runtime: None,
         display: false,
     };
-    let spec = mame_spec(&launch, "game", 48822).unwrap();
+    let spec = mame_spec(&launch, "game", 48822, "native-token").unwrap();
     assert!(spec.args.windows(2).any(|v| v == ["-video", "none"]));
     assert_eq!(
         spec.args.iter().any(|v| v == "-videodriver"),
@@ -131,27 +134,40 @@ fn headless_spec_uses_isolated_home_and_neogeo_profile() {
         .iter()
         .any(|(key, value)| { key == "EMUCAP_MAME_PROFILE" && value == "neogeo_mvs" }));
     assert!(spec
+        .env
+        .contains(&("EMUCAP_NATIVE_DEBUG_TOKEN".into(), "native-token".into())));
+    assert!(spec
         .args
         .iter()
-        .any(|v| Path::new(v).ends_with("mame-neogeo/47822")));
-    let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap()).unwrap();
+        .any(|v| Path::new(v).starts_with(root.path().join("emucap/mame-neogeo/47822/manual"))));
+    let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap(), "native-token").unwrap();
     assert!(bridge.env.iter().any(|(key, value)| {
-        key == "EMUCAP_ADAPTER_HOME" && Path::new(value).ends_with("mame-neogeo/47822")
+        key == "EMUCAP_ADAPTER_HOME"
+            && Path::new(value).starts_with(root.path().join("emucap/mame-neogeo/47822/manual"))
     }));
+    assert!(bridge
+        .env
+        .contains(&("EMUCAP_NATIVE_DEBUG_TOKEN".into(), "native-token".into())));
 }
 
 #[test]
 fn bridge_uses_the_runtime_generation_for_temporary_artifacts() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let root = tempfile::tempdir().unwrap();
+    let emucap_home = root.path().join("emucap");
+    std::env::set_var("EMUCAP_EMU_HOME", &emucap_home);
     let game = root.path().join("game.zip");
     let bios = root.path().join("neogeo.zip");
     std::fs::write(&game, b"game").unwrap();
     std::fs::write(&bios, b"bios").unwrap();
     let log = root.path().join("mame.log");
-    let generation = root.path().join("sessions/47822/generations/launch-test");
-    let failure = generation.join("adapter-failure.json");
+    let store = crate::live::runtime::RuntimeStore::new(emucap_home.join("sessions"));
+    let prepared = store.prepare(47822).unwrap();
+    let generation = prepared.generation_dir();
+    let failure = prepared.adapter_failure_path();
     let runtime = RuntimeEnv {
-        launch_id: "launch-test",
+        launch_id: prepared.launch_id(),
         adapter_failure_path: &failure,
     };
     let launch = Launch {
@@ -169,16 +185,18 @@ fn bridge_uses_the_runtime_generation_for_temporary_artifacts() {
         display: false,
     };
 
-    let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap()).unwrap();
-    assert!(bridge
-        .env
-        .iter()
-        .any(|(key, value)| { key == "EMUCAP_ADAPTER_HOME" && Path::new(value) == generation }));
+    let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap(), "native-token").unwrap();
+    assert!(bridge.env.iter().any(|(key, value)| {
+        key == "EMUCAP_ADAPTER_HOME" && Path::new(value) == generation.join("emulators/mame-neogeo")
+    }));
 }
 
 #[test]
 fn visible_spec_explicitly_authorizes_the_safe_wrapper() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let root = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", root.path().join("emucap"));
     let game = root.path().join("game.zip");
     let bios = root.path().join("neogeo.zip");
     std::fs::write(&game, b"game").unwrap();
@@ -198,7 +216,7 @@ fn visible_spec_explicitly_authorizes_the_safe_wrapper() {
         runtime: None,
         display: true,
     };
-    let spec = mame_spec(&launch, "game", 48823).unwrap();
+    let spec = mame_spec(&launch, "game", 48823, "native-token").unwrap();
     assert!(spec
         .env
         .contains(&("MAME_ALLOW_VISIBLE".to_string(), "1".to_string())));
@@ -222,7 +240,10 @@ fn visible_spec_explicitly_authorizes_the_safe_wrapper() {
 
 #[test]
 fn aes_spec_uses_software_list_cartridge_and_a_separate_home() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let root = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", root.path().join("emucap"));
     let game = root.path().join("mslug2.zip");
     let bios = root.path().join("aes.zip");
     let hash_path = root.path().join("adapters/mame-neogeo/work/hash");
@@ -251,7 +272,7 @@ fn aes_spec_uses_software_list_cartridge_and_a_separate_home() {
         runtime: None,
         display: false,
     };
-    let spec = mame_spec(&launch, "aes", 48824).unwrap();
+    let spec = mame_spec(&launch, "aes", 48824, "native-token").unwrap();
     assert_eq!(spec.args[0], "aes");
     assert!(spec.args.windows(2).any(|pair| pair == ["-bios", "japan"]));
     assert!(spec.args.windows(2).any(|pair| pair == ["-cart", "mslug2"]));
@@ -262,10 +283,8 @@ fn aes_spec_uses_software_list_cartridge_and_a_separate_home() {
     assert!(spec
         .env
         .contains(&("EMUCAP_MAME_PROFILE".into(), "neogeo_aes".into())));
-    assert!(spec
-        .args
-        .iter()
-        .any(|value| Path::new(value).ends_with("mame-neogeo-aes/47824")));
+    assert!(spec.args.iter().any(|value| Path::new(value)
+        .starts_with(root.path().join("emucap/mame-neogeo-aes/47824/manual"))));
 }
 
 #[test]
@@ -299,19 +318,22 @@ fn aes_spec_rejects_missing_or_mvs_only_software_before_launch() {
         runtime: None,
         display: false,
     };
-    let error = mame_spec(&launch, "aes", 48824).unwrap_err();
+    let error = mame_spec(&launch, "aes", 48824, "native-token").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("not marked AES-compatible"));
 
     std::fs::write(hash_path.join("neogeo.xml"), b"<softwarelist />").unwrap();
-    let error = mame_spec(&launch, "aes", 48824).unwrap_err();
+    let error = mame_spec(&launch, "aes", 48824, "native-token").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("is absent"));
 }
 
 #[test]
 fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
     let root = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", root.path().join("emucap"));
     let cue = root.path().join("disc.cue");
     let track = root.path().join("track01.bin");
     let bios = root.path().join("neocdz.zip");
@@ -333,7 +355,7 @@ fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
         runtime: None,
         display: false,
     };
-    let spec = mame_spec(&launch, "neocdz", 48825).unwrap();
+    let spec = mame_spec(&launch, "neocdz", 48825, "native-token").unwrap();
     assert_eq!(spec.args[0], "neocdz");
     assert!(spec
         .args
@@ -346,8 +368,6 @@ fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
     assert!(spec
         .env
         .contains(&("EMUCAP_MAME_PROFILE".into(), "neogeo_cd".into())));
-    assert!(spec
-        .args
-        .iter()
-        .any(|value| Path::new(value).ends_with("mame-neogeo-cd/47825")));
+    assert!(spec.args.iter().any(|value| Path::new(value)
+        .starts_with(root.path().join("emucap/mame-neogeo-cd/47825/manual"))));
 }

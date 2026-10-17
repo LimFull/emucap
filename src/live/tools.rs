@@ -1,11 +1,8 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
-use base64::Engine;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use super::link::{EmulatorLink, LinkError};
 use super::temporal::finish_with_cleanup;
@@ -14,7 +11,18 @@ pub(crate) use super::tools_state::save_state_in_store;
 pub use super::tools_state::{save_state, save_state_for_recording, save_state_with_key};
 
 mod cancellable;
-pub use cancellable::{step_with_cancellation, tap_with_cancellation};
+mod controller;
+pub use cancellable::{
+    step_with_cancellation, tap_axes_in_unit_with_cancellation, tap_axes_with_cancellation,
+    tap_with_cancellation,
+};
+pub use controller::{tap_axes, tap_axes_in_unit};
+
+mod dump;
+pub use dump::dump_memory;
+
+mod screenshot;
+pub use screenshot::screenshot;
 
 mod pointer;
 pub use pointer::{click_pointer, drag_pointer, move_pointer};
@@ -39,6 +47,7 @@ pub enum StepUnit {
     #[default]
     Frames,
     Instructions,
+    InputPolls,
 }
 
 impl StepUnit {
@@ -46,13 +55,15 @@ impl StepUnit {
         match self {
             Self::Frames => "frames",
             Self::Instructions => "instructions",
+            Self::InputPolls => "input_polls",
         }
     }
 
-    fn capability_method(self) -> &'static str {
+    pub fn capability_method(self) -> &'static str {
         match self {
             Self::Frames => "step",
             Self::Instructions => "step_instructions",
+            Self::InputPolls => "step_input_polls",
         }
     }
 }
@@ -362,7 +373,7 @@ pub fn touch(
     Ok(ToolOutput::Json(link.call("touch", params)?))
 }
 
-/// 한 번의 frozen 탭: set_input→step(press_frames)→해제→해제에지.
+/// 한 번의 frozen 탭: set_input→step(press_frames)→정지 상태에서 해제.
 fn one_tap(
     link: &mut dyn EmulatorLink,
     port: u64,
@@ -379,11 +390,6 @@ fn one_tap(
     let press = finish_transient_input(link, port, expected_launch_id, outcome)?;
     if press.get("status").and_then(Value::as_str) == Some("interrupted") {
         return Ok(Some((press, "press")));
-    }
-    let release_edge = link.call("step", json!({ "frames": 1 }));
-    let release_edge = finish_frozen(link, expected_launch_id, release_edge)?;
-    if release_edge.get("status").and_then(Value::as_str) == Some("interrupted") {
-        return Ok(Some((release_edge, "release_edge")));
     }
     Ok(None)
 }
@@ -534,6 +540,23 @@ pub fn tap(
     press_frames: u64,
     after_frames: u64,
 ) -> Result<ToolOutput, LinkError> {
+    tap_axes(
+        link,
+        port,
+        buttons,
+        &Default::default(),
+        press_frames,
+        after_frames,
+    )
+}
+
+fn tap_buttons(
+    link: &mut dyn EmulatorLink,
+    port: u64,
+    buttons: &[String],
+    press_frames: u64,
+    after_frames: u64,
+) -> Result<ToolOutput, LinkError> {
     validate_sync_advance("tap press frame", press_frames)?;
     validate_sync_advance("tap trailing frame", after_frames)?;
     link.call("pause", json!({}))?; // 멱등
@@ -671,6 +694,7 @@ pub fn step(
     let (method, mut params) = match unit {
         StepUnit::Frames => ("step", json!({ "frames": count })),
         StepUnit::Instructions => ("step_instructions", json!({ "count": count })),
+        StepUnit::InputPolls => ("step_input_polls", json!({"count":count})),
     };
     with_cpu(link, &mut params, cpu)?;
     Ok(ToolOutput::Json(link.call(method, params)?))
@@ -922,259 +946,6 @@ pub fn break_on_reset(link: &mut dyn EmulatorLink, enabled: bool) -> Result<Tool
     Ok(ToolOutput::Json(
         link.call("break_on_reset", json!({ "enabled": enabled }))?,
     ))
-}
-
-/// 표준 메모리 리전(.bin+regions.json)과 상태 스냅샷(state.json)을 `dir`에 원자적으로 배치한다.
-///
-/// 브리지 덤프(리전 파일)와 호스트가 쓰는 state.json은 두 단계라, 예전처럼 `dir`에 바로 쓰면
-/// 리전 파일을 배치한 뒤 state.json 쓰기가 실패할 때 직전의 온전한 덤프가 파괴되고(롤백 불가)
-/// state.json 없는 덤프가 남는다. 그래서 리전 파일 + state.json 전부를 형제(sibling) 스테이징
-/// 디렉토리에 모은 뒤, 둘 다 성공했을 때만 `dir`로 원자 스왑한다 — 어느 단계가 실패하든 직전 덤프는
-/// 바이트 그대로 보존되고 스테이징 잔재도 남기지 않는다(모든 어댑터 공통, 어댑터 무관).
-pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput, LinkError> {
-    let dest = Path::new(dir);
-    // 요청 경로에 이미 심링크나 (디렉토리가 아닌) 일반 파일이 있으면 스테이징·브리지 덤프 전에
-    // 거부한다 — 원자 스왑/폴백이 그 파일을 숨은 이름으로 밀어내 요청 경로에서 사라지게 하는 것을
-    // 막는다(fail-fast, replace_dir와 동일 가드).
-    ensure_replaceable_dir(dest).map_err(|e| {
-        LinkError::Protocol(format!(
-            "dump destination is not a replaceable directory: {e}"
-        ))
-    })?;
-    let staging = dump_sibling(dest, "dump-staging")
-        .map_err(|e| LinkError::Protocol(format!("failed to create dump staging path: {e}")))?;
-    let staging_str = staging
-        .to_str()
-        .ok_or_else(|| LinkError::Protocol("dump staging path is not valid UTF-8".into()))?
-        .to_string();
-
-    // 스테이징에 리전 파일 + state.json을 모은다. 실패하면 스테이징을 버리고 `dir`은 건드리지 않는다.
-    let build = (|| -> Result<Value, LinkError> {
-        let staging_parent = staging.parent().ok_or_else(|| {
-            LinkError::Protocol("dump staging path has no parent directory".into())
-        })?;
-        std::fs::create_dir_all(staging_parent).map_err(|e| {
-            LinkError::Protocol(format!("failed to create dump output parent: {e}"))
-        })?;
-        std::fs::create_dir(&staging)
-            .map_err(|e| LinkError::Protocol(format!("failed to create staging directory: {e}")))?;
-        let regions = link.call("dump_memory", json!({ "path": staging_str }))?;
-        // 상태(레지스터/DMA/PPU) 스냅샷도 같은 디렉토리에 기록(교차-ROM 키-값 디프 입력).
-        // 교차-ROM에서는 frozen 앵커 지점에서 덤프해야 두 호출이 일관된다.
-        let state = link.call("get_state", json!({}))?;
-        let state_map = state.get("state").cloned().unwrap_or(state.clone());
-        crate::path_safety::atomic_write_file(
-            &staging.join("state.json"),
-            serde_json::to_string(&state_map)
-                .unwrap_or_default()
-                .as_bytes(),
-        )
-        .map_err(|e| LinkError::Protocol(format!("failed to write state.json: {e}")))?;
-        Ok(regions)
-    })();
-
-    let regions = match build {
-        Ok(regions) => regions,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
-        }
-    };
-
-    // 완성된 스테이징을 `dir`로 원자 스왑(직전 덤프는 스왑 성공 시에만 교체·실패 시 롤백).
-    if let Err(e) = replace_dir(&staging, dest) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(LinkError::Protocol(format!(
-            "failed to publish dump directory: {e}"
-        )));
-    }
-
-    // 브리지가 돌려준 path는 스테이징 경로이므로, 호출자가 요청한 `dir`로 정정해 보고한다.
-    let mut regions = regions;
-    if let Some(obj) = regions.as_object_mut() {
-        obj.insert("path".into(), json!(dir));
-    }
-    Ok(ToolOutput::Json(regions))
-}
-
-/// `dst`의 형제 경로(같은 부모라 이후 `rename`이 한 파일시스템 내라 원자적)를 `label`·ULID로
-/// 고유하게 만든다. 부모 디렉토리가 없으면 에러.
-fn dump_sibling(dst: &Path, label: &str) -> std::io::Result<PathBuf> {
-    let parent = dst.parent().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "dump path {} has no parent directory to stage under",
-            dst.display()
-        ))
-    })?;
-    let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("dump");
-    Ok(parent.join(format!(
-        ".{name}.{label}.{}",
-        ulid::Ulid::generate().to_string().to_ascii_lowercase()
-    )))
-}
-
-/// `dst`가 원자 스왑으로 안전히 교체 가능한 대상인지 확인한다 — 없으면(새로 생성) 또는 디렉토리면 OK,
-/// 심링크거나 (디렉토리가 아닌) 일반 파일 등 기존 항목이면 거부한다. src/launch의 copy_dir_replace와
-/// 같은 가드로, 사용자의 파일이 덤프 경로로 밀려나 요청 경로에서 사라지는 것을 막는다.
-fn ensure_replaceable_dir(dst: &Path) -> std::io::Result<()> {
-    if crate::launch::is_symlink(dst) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "destination is a symlink, refusing to replace: {}",
-                dst.display()
-            ),
-        ));
-    }
-    if dst.exists() && !dst.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("destination is not a directory: {}", dst.display()),
-        ));
-    }
-    Ok(())
-}
-
-/// 완성된 스테이징 덤프 `staging`을 `dst`로 배치한다.
-/// - `dst`가 없으면 단일 `rename`(같은 파일시스템이라 원자적).
-/// - `dst`가 있고 OS가 단일-syscall 교환을 지원하면(Linux `renameat2(RENAME_EXCHANGE)`,
-///   macOS `renamex_np(RENAME_SWAP)`) `staging`↔`dst`를 한 syscall로 맞바꾼 뒤, 이제 구 덤프를
-///   담은 `staging`을 제거한다 — 어느 순간에 죽어도 `dst`는 항상 온전한 덤프(구본 또는 신본)를 가리킨다.
-/// - 교환 프리미티브가 없거나 파일시스템이 거부하면 2-rename 폴백(백업→rename→성공 시 백업 삭제,
-///   실패 시 롤백). 폴백은 두 rename 사이 크래시에 `dst`가 잠깐 없을 수 있다(구 덤프는 백업에 보존).
-fn replace_dir(staging: &Path, dst: &Path) -> std::io::Result<()> {
-    // dst가 심링크거나 (디렉토리가 아닌) 기존 항목이면 거부한다 — 그렇지 않으면 원자 스왑/폴백이
-    // 사용자의 파일을 요청 경로에서 밀어내(숨은 이름으로 이동) 조용히 사라지게 한다. copy_dir_replace와
-    // 같은 가드로 어느 호출자가 부르든(dump_memory 등) 파일 대상을 절대 밀어내지 않게 한다.
-    ensure_replaceable_dir(dst)?;
-    if !dst.exists() {
-        return std::fs::rename(staging, dst);
-    }
-    // 지원 OS: 단일 syscall 원자 교환. 성공 후 `staging`은 구 덤프를 담으므로 제거한다.
-    if try_exchange(staging, dst)? {
-        let _ = std::fs::remove_dir_all(staging);
-        return Ok(());
-    }
-    replace_dir_fallback(staging, dst)
-}
-
-/// 교환 프리미티브가 없는 플랫폼/파일시스템용 2-rename 폴백. 두 rename 사이 크래시에 `dst`가 잠깐
-/// 비는 창이 있으나(구 덤프는 백업에 있음), 직전의 온전한 덤프가 반쯤 교체된 채 남지는 않는다.
-fn replace_dir_fallback(staging: &Path, dst: &Path) -> std::io::Result<()> {
-    let backup = dump_sibling(dst, "dump-old")?;
-    std::fs::rename(dst, &backup)?;
-    match std::fs::rename(staging, dst) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir_all(&backup);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::rename(&backup, dst);
-            Err(e)
-        }
-    }
-}
-
-/// 교환 프리미티브 syscall의 errno가 "이 커널/파일시스템이 지원 안 함"이라 2-rename 폴백으로 강등해야
-/// 하는지. 커널 미구현(ENOSYS)·플래그 거부(EINVAL/ENOTSUP)를 폴백으로 본다(그 외 errno는 경로 소멸 등
-/// 진짜 I/O 실패). macOS·Linux가 같은 errno 계열을 폴백해 어느 한 플랫폼만 좁게 하드-실패하지 않게 한다.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn is_unsupported_exchange_errno(raw: Option<i32>) -> bool {
-    matches!(raw, Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP))
-}
-
-/// 두 경로 `a`·`b`(둘 다 존재)를 단일 syscall로 원자 교환한다. 성공하면 `Ok(true)`, 이
-/// 플랫폼/파일시스템에 교환 프리미티브가 없으면 `Ok(false)`(호출자 폴백), 그 외 I/O 실패는 `Err`.
-#[cfg(target_os = "macos")]
-fn try_exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    let ca = std::ffi::CString::new(a.as_os_str().as_bytes())?;
-    let cb = std::ffi::CString::new(b.as_os_str().as_bytes())?;
-    // RENAME_SWAP: a↔b를 원자적으로 맞바꾼다(둘 다 존재해야). 성공하면 a는 옛 b, b는 옛 a를 담는다.
-    let rc = unsafe { libc::renamex_np(ca.as_ptr(), cb.as_ptr(), libc::RENAME_SWAP) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    // 파일시스템/커널이 RENAME_SWAP 미지원 → 폴백. 그 외(경로 소멸 등)는 진짜 실패.
-    if is_unsupported_exchange_errno(err.raw_os_error()) {
-        Ok(false)
-    } else {
-        Err(err)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn try_exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    let ca = std::ffi::CString::new(a.as_os_str().as_bytes())?;
-    let cb = std::ffi::CString::new(b.as_os_str().as_bytes())?;
-    // RENAME_EXCHANGE: a↔b를 원자적으로 맞바꾼다(둘 다 존재해야).
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            ca.as_ptr(),
-            libc::AT_FDCWD,
-            cb.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    // 커널(구커널 ENOSYS)·파일시스템(플래그 거부 EINVAL/ENOTSUP)이 미지원 → 폴백. 그 외는 진짜 실패.
-    if is_unsupported_exchange_errno(err.raw_os_error()) {
-        Ok(false)
-    } else {
-        Err(err)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn try_exchange(_a: &Path, _b: &Path) -> std::io::Result<bool> {
-    Ok(false) // 교환 프리미티브 없음 → 호출자가 2-rename 폴백
-}
-
-pub fn screenshot(
-    link: &mut dyn EmulatorLink,
-    save_path: Option<&Path>,
-) -> Result<ToolOutput, LinkError> {
-    let result = link.call("screenshot", json!({}))?;
-    let b64 = result
-        .get("png_base64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| LinkError::Protocol("screenshot response has no png_base64 field".into()))?
-        .to_string();
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|e| LinkError::Protocol(format!("failed to decode base64 screenshot: {e}")))?;
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    if let Some(reported) = result.get("sha256").and_then(Value::as_str) {
-        if reported != sha256 {
-            return Err(LinkError::Protocol(format!(
-                "screenshot sha256 mismatch: adapter={reported}, decoded={sha256}"
-            )));
-        }
-    }
-    let saved_path = match save_path {
-        Some(p) => {
-            crate::path_safety::atomic_write_file(p, &bytes)
-                .map_err(|e| LinkError::Protocol(format!("failed to save screenshot: {e}")))?;
-            Some(p.to_string_lossy().to_string())
-        }
-        None => None,
-    };
-    let mut provenance = result.as_object().cloned().unwrap_or_default();
-    provenance.remove("png_base64");
-    provenance.insert("sha256".into(), Value::String(sha256));
-    provenance.insert("byte_len".into(), json!(bytes.len()));
-    Ok(ToolOutput::Image {
-        png_base64: b64,
-        saved_path,
-        provenance: Value::Object(provenance),
-    })
 }
 
 #[cfg(test)]

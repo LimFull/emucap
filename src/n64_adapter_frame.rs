@@ -10,6 +10,7 @@ use super::{N64Error, N64Result, FRAME_COUNT, FRAME_SEEN, SCREENSHOT_RESULT};
 pub(super) enum FrameGateTrigger {
     #[default]
     NextFrame,
+    NextPoll,
     ScreenshotCompleted,
 }
 
@@ -87,9 +88,8 @@ fn wait_for_gate(
         }
         let now = Instant::now();
         if now >= deadline || gate.shutdown {
-            gate.arm_next = false;
-            gate.trigger = FrameGateTrigger::NextFrame;
-            return Err(N64Error::Timeout("exact frame callback barrier"));
+            // Keep the target armed until recovery proves a native stop.
+            return Err(N64Error::Timeout("exact callback barrier"));
         }
         let mut remaining = deadline.saturating_duration_since(now).min(timeout);
         if cancellation.is_some() {
@@ -239,11 +239,22 @@ pub(super) extern "C" fn frame_callback(frame: u32) {
     FRAME_COUNT.store(completed, Ordering::Release);
     FRAME_SEEN.store(true, Ordering::Release);
 
+    completed_boundary(completed, false);
+}
+
+pub(super) fn poll_callback(sequence: u64) {
+    completed_boundary(sequence, true);
+}
+
+fn completed_boundary(completed: u64, poll: bool) {
     let (lock, condvar) = frame_gate();
     let mut gate = lock.lock().unwrap_or_else(|error| error.into_inner());
     let trigger_reached = match gate.trigger {
-        FrameGateTrigger::NextFrame => true,
-        FrameGateTrigger::ScreenshotCompleted => SCREENSHOT_RESULT.load(Ordering::Acquire) != -1,
+        FrameGateTrigger::NextFrame => !poll,
+        FrameGateTrigger::NextPoll => poll,
+        FrameGateTrigger::ScreenshotCompleted => {
+            !poll && SCREENSHOT_RESULT.load(Ordering::Acquire) != -1
+        }
     };
     if gate.arm_next && trigger_reached && !gate.shutdown {
         gate.arm_next = false;
@@ -270,8 +281,10 @@ pub(super) fn validate_observed_frame(
     observed_before: u64,
     observed: u64,
 ) -> N64Result<()> {
-    if trigger == FrameGateTrigger::NextFrame
-        && observed_before_verified
+    if matches!(
+        trigger,
+        FrameGateTrigger::NextFrame | FrameGateTrigger::NextPoll
+    ) && observed_before_verified
         && observed != observed_before + 1
     {
         return Err(N64Error::BadState(format!(

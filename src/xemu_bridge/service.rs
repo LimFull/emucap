@@ -64,9 +64,6 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         if let Some(name) = &self.env.name {
             object.insert("name".into(), json!(name));
         }
-        if let Some(token) = &self.env.session_token {
-            object.insert("session_token".into(), json!(token));
-        }
         if let Some(launch_id) = &self.env.launch_id {
             object.insert("launch_id".into(), json!(launch_id));
         }

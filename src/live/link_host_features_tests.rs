@@ -34,3 +34,23 @@ fn renderer_fence_requirement_is_specific_to_flycast() {
         assert!(FeatureCapabilities::from_hello(&hello, &[], &[]).is_ok());
     }
 }
+
+#[test]
+fn scoped_input_requires_axes_and_native_cleanup() {
+    let hello = json!({"host_features":["scoped_controller_input"],
+        "input_axes":{"semantics":"complete_persistent_controller_state"},
+        "temporal_cancellation_capability":{"methods":["step"],"control_service_ms":25,"stop_host_ms":2000}});
+    let methods = ["set_input", "step", "cancel_operation"].map(String::from);
+    assert!(FeatureCapabilities::from_hello(&hello, &methods, &[]).is_ok());
+    for missing in &methods {
+        let incomplete = methods
+            .iter()
+            .filter(|m| *m != missing)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(FeatureCapabilities::from_hello(&hello, &incomplete, &[]).is_err());
+    }
+    let mut malformed = hello;
+    malformed["input_axes"] = json!(null);
+    assert!(FeatureCapabilities::from_hello(&malformed, &methods, &[]).is_err());
+}

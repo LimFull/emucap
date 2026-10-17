@@ -8,6 +8,7 @@ use crate::gdb_rsp::GdbResult;
 use crate::qmp::QmpResult;
 
 struct FakeQmp {
+    pending_events: Vec<Value>,
     replies: VecDeque<(String, QmpResult<Value>)>,
     calls: Vec<(String, Option<Value>)>,
     terminal: bool,
@@ -22,6 +23,7 @@ impl FakeQmp {
                 .map(|(command, value)| (command.into(), Ok(value)))
                 .collect(),
             calls: Vec::new(),
+            pending_events: Vec::new(),
             terminal: false,
             require_stop_before_call: None,
         }
@@ -45,6 +47,10 @@ impl FakeQmp {
 }
 
 impl QmpTransport for FakeQmp {
+    fn drain_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending_events)
+    }
+
     fn execute(&mut self, command: &str, arguments: Option<Value>) -> QmpResult<Value> {
         if let Some((index, observed)) = &self.require_stop_before_call {
             assert!(
@@ -106,6 +112,16 @@ impl FakeGdb {
 }
 
 impl GdbTransport for FakeGdb {
+    fn send_with_timeout(&mut self, payload: &str, _budget: Duration) -> GdbResult<String> {
+        self.send(payload)
+    }
+    fn recv_reply_with_timeout(&mut self, _budget: Duration) -> GdbResult<String> {
+        self.recv_reply()
+    }
+    fn recv_nonblocking_with_timeout(&mut self, _budget: Duration) -> GdbResult<Option<String>> {
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.calls.push(payload.into());
         let (expected, response) = self
@@ -335,6 +351,40 @@ fn bridge(qmp: FakeQmp, gdb: FakeGdb, root: &Path) -> XemuBridge<FakeQmp, FakeGd
     )
 }
 
+#[test]
+fn change_media_mounts_a_verified_generation_copy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("replacement.xiso");
+    std::fs::write(&source, b"replacement disc bytes").unwrap();
+    let mut bridge = bridge(
+        FakeQmp::new(vec![
+            ("query-status", machine(false)),
+            ("xemu-emucap-load-disc", json!({})),
+        ]),
+        FakeGdb::empty(),
+        temporary.path(),
+    );
+
+    let response = bridge
+        .change_media(&json!({"path":source.display().to_string()}))
+        .unwrap();
+
+    let mounted = PathBuf::from(response["current"]["path"].as_str().unwrap());
+    assert_ne!(mounted, source);
+    assert!(mounted.starts_with(temporary.path().join("removable-media")));
+    assert_eq!(std::fs::read(&mounted).unwrap(), b"replacement disc bytes");
+    assert!(std::fs::metadata(&mounted)
+        .unwrap()
+        .permissions()
+        .readonly());
+    assert_eq!(bridge.current_disc.as_deref(), Some(mounted.as_path()));
+    assert_eq!(
+        bridge.qmp.calls[1].1.as_ref().unwrap()["path"],
+        mounted.display().to_string()
+    );
+    bridge.qmp.assert_drained();
+}
+
 fn result(response: Response) -> Value {
     assert!(response.ok, "request failed: {:?}", response.error);
     response.result.unwrap()
@@ -382,7 +432,7 @@ fn hello_advertises_implemented_state_and_debug_methods() {
         ])
     );
     assert_eq!(hello["name"], "xbox-test");
-    assert_eq!(hello["session_token"], "token");
+    assert!(hello.get("session_token").is_none());
     assert!(hello["host_features"]
         .as_array()
         .unwrap()
@@ -1805,4 +1855,57 @@ fn batch_epochs_separate_same_clock_load_dispatch() {
         previous = current;
     }
     host.qmp.assert_drained();
+}
+
+#[test]
+fn completed_requests_consume_qmp_notifications_but_keep_debug_stop_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let qmp = FakeQmp::new(vec![
+        ("query-status", json!({"running":false,"status":"paused"})),
+        ("xemu-emucap-status", extension(1, false, 0, false)),
+    ]);
+    let mut bridge = bridge(qmp, FakeGdb::empty(), root.path());
+    bridge.qmp.pending_events = vec![json!({"event":"STOP"})];
+    bridge.events.push(json!({"type":"stop","signal":"05"}));
+    result(bridge.handle_request(Request::new(1, "status", json!({}))));
+    assert!(bridge.qmp.pending_events.is_empty());
+    assert_eq!(bridge.events.len(), 1);
+}
+
+#[test]
+fn endless_async_stops_retire_control_and_preserve_first_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let mut gdb = FakeGdb::empty();
+    gdb.asynchronous
+        .extend((0..1025).map(|_| Ok(Some("S05".into()))));
+    let mut bridge = bridge(FakeQmp::new(vec![]), gdb, root.path());
+    assert!(bridge.gdb_command("g").is_err());
+    assert!(bridge.backend_terminal());
+    assert_eq!(bridge.events.len(), 1);
+    assert!(bridge.gdb.calls.is_empty());
+}
+
+#[test]
+fn overwriting_a_copied_container_never_deletes_its_original_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original.json");
+    let copied = root.path().join("copy.json");
+    save_state_container(root.path(), &original);
+    std::fs::copy(&original, &copied).unwrap();
+    let original_bytes = std::fs::read(&original).unwrap();
+    // The save fixture accepts only creation/publication operations. Any attempt
+    // to delete the old copied tag fails as an unexpected native command.
+    save_state_container(root.path(), &copied);
+    assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+    let old: Value = serde_json::from_slice(&original_bytes).unwrap();
+    let new: Value = serde_json::from_slice(&std::fs::read(&copied).unwrap()).unwrap();
+    assert_ne!(
+        old["storage"]["snapshot_tag"],
+        new["storage"]["snapshot_tag"]
+    );
+    save_state_container(root.path(), &original);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(&copied).unwrap()).unwrap(),
+        new
+    );
 }

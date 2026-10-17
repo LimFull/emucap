@@ -79,6 +79,10 @@ PATCHES=(
   "$HERE/patches/0009-pure-rdram-observation.patch"
   "$HERE/patches/0010-use-standard-debugger-integer-types.patch"
   "$HERE/patches/0011-link-mingw-binutils-dependencies.patch"
+  "$HERE/patches/0012-controller-input-override.patch"
+  "$HERE/patches/0013-controller-poll-boundary.patch"
+  "$HERE/patches/0014-hidden-renderer.patch"
+  "$HERE/patches/0015-state-job-boundary.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -95,6 +99,10 @@ fi
 # Restore every locally patched source from the verified archive before applying the patch stack.
 # This prevents an ignored generated tree from silently contributing hand edits to a signed build.
 PATCHED_MEMBERS=(
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/vidext_sdl2_compat.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/backends/plugins_compat/plugins_compat.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/controllers/game_controller.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/backends/plugins_compat/input_plugin_compat.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/projects/unix/Makefile"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/debugger/dbg_decoder.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/r4300_core.h"
@@ -181,6 +189,27 @@ fi
   exit 1
 }
 
+# The Windows host loads the core and plugins with the safe DLL search flags. Those flags
+# intentionally ignore PATH, so a MinGW build must carry its non-system runtime DLLs beside the
+# native modules. `ldd` reports the transitive closure for the executable, core, and plugins; keep
+# only dependencies owned by the active MinGW toolchain.
+case "$(uname -s)" in
+  MINGW*)
+    MINGW_RUNTIME_INPUTS=("$CORE" "$SRC/test/mupen64plus.exe")
+    for native_module in "$SRC/test"/mupen64plus-*.dll; do
+      [ -f "$native_module" ] && MINGW_RUNTIME_INPUTS+=("$native_module")
+    done
+    while IFS= read -r runtime_dll; do
+      [ -n "$runtime_dll" ] || continue
+      cp -f "$runtime_dll" "$SRC/test/$(basename "$runtime_dll")"
+    done < <(
+      for native_module in "${MINGW_RUNTIME_INPUTS[@]}"; do
+        ldd "$native_module"
+      done | awk '$2 == "=>" && $3 ~ /^\/mingw[^/]*\/bin\/.*\.dll$/ { print $3 }' | sort -u
+    )
+    ;;
+esac
+
 case "$(uname -s)" in
   Darwin) CORE_SYMBOLS="$(nm -gU "$CORE")" ;;
   MINGW*|MSYS*) CORE_SYMBOLS="$(nm -g "$CORE")" ;;
@@ -191,6 +220,9 @@ printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugStep$' >/dev/null
 printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugBreakpointConsume$' >/dev/null
 printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugDecodeOp$' >/dev/null
 printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]CoreEmucapPacing$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]CoreEmucapInput$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]CoreEmucapSetPollCallback$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]CoreEmucapSetStateBoundaryCallback$' >/dev/null
 printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugMemReadRdram$' >/dev/null
 
 ROM="$SRC/test/m64p_test_rom.v64"

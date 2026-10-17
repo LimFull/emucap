@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Opt-in adapter-independent witness for exact input under agent pacing.
 
-From one origin, the same frozen `tap` runs at several paces. A pace changes only host time between
-guest frames, so every run must end with the same guest memory as the 100 percent reference, and
-that memory must differ from the same frames advanced without input. Memory that differs between two
-identical 100 percent runs is host-dependent (for example a host renderer's frame buffer copy); it
-is excluded from both claims and reported. The origin is a saved state, or a fresh launch where the
-host cannot save while frozen. The profile supplies launch arguments, warmup frames and optionally
-the buttons to tap; every check uses the public Control MCP surface and live capabilities.
+From one origin, the same frozen `tap` runs at several paces. An advertised input-poll clock is
+preferred because a short rendered-frame hold can fall entirely between controller polls. A pace
+changes only host time between guest boundaries, so every run must end with the same guest memory as
+the 100 percent reference, and that memory must differ from the same boundaries advanced without
+input. Memory that differs between two identical 100 percent runs is host-dependent (for example a
+host renderer's frame buffer copy); it is excluded from both claims and reported. The origin is a
+saved state, or a fresh launch where the host cannot save while frozen. The profile supplies launch
+arguments, warmup boundaries and optionally the buttons to tap; every check uses the public Control
+MCP surface and live capabilities.
 """
 import argparse
 import hashlib
@@ -146,24 +148,35 @@ class Origin:
         warmup(self.w, self.status, self.warmup_frames)
 
 
-def run(w, origin, batches, policy, buttons, press, after):
-    # A tap releases on its own edge frame between the press and the trailing frames.
-    frames = press + 1 + after
+def input_timing(profile, status):
+    capability = status.get('input_poll_capability')
+    if isinstance(capability, dict) and capability.get('step_method') == 'step_input_polls':
+        return 'input_polls', profile.get('poll_press', 1), profile.get('poll_after', 7)
+    return 'frames', profile.get('press_frames', 2), profile.get('after_frames', 30)
+
+
+def run(w, origin, batches, policy, buttons, press, after, unit):
+    # Release changes ownership at the frozen boundary and does not advance the guest.
+    boundaries = press + after
     origin.restore()
     w.speed(policy)
     start = w.call('status')['frame']
     if buttons:
-        reply = w.call('tap', {'buttons': buttons, 'press_frames': press, 'after_frames': after})
+        arguments = ({'buttons': buttons, 'timing': {'unit': unit, 'press': press, 'after': after}}
+                     if unit == 'input_polls' else
+                     {'buttons': buttons, 'press_frames': press, 'after_frames': after})
+        reply = w.call('tap', arguments)
         assert reply.get('state') == 'frozen' and 'status' not in reply, reply
     else:
-        reply = w.call('step', {'unit': 'frames', 'count': frames})
+        reply = w.call('step', {'unit': unit, 'count': boundaries})
         assert reply['status'] == 'completed', reply
     seconds = w.seconds()
     # status.frame may count a different unit than frame steps (e.g. VI fields), so it is compared
     # across runs rather than against the requested count.
     end = w.call('status')['frame']
     total, parts = digest(w, batches)
-    return {'policy': policy, 'input': bool(buttons), 'steps': frames, 'frames': end - start,
+    return {'policy': policy, 'input': bool(buttons), 'unit': unit,
+            'steps': boundaries, 'frames': end - start,
             'seconds': seconds, 'digest': total, 'batch_digests': parts}
 
 
@@ -172,7 +185,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--profile', type=Path, required=True,
                         help='JSON: launch_plan, launch overrides, env, warmup_frames, tap_buttons, '
-                             'press_frames, after_frames, origin_instructions, origin_breakpoint')
+                             'press_frames, after_frames, poll_press, poll_after, '
+                             'origin_instructions, origin_breakpoint')
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -197,11 +211,15 @@ def main():
         w.speed({'mode': 'unlimited'})
         warmup(w, status, profile.get('warmup_frames', 1))
         buttons = choose_buttons(profile, status)
-        press, after = profile.get('press_frames', 2), profile.get('after_frames', 30)
+        unit, press, after = input_timing(profile, status)
         capability = status['memory_batch_capability']
         ranges = [batch for window in ram_windows(capability) for batch in window_batches(capability, window)]
-        result = {'buttons': buttons, 'press_frames': press, 'after_frames': after,
+        result = {'buttons': buttons,
                   'hashed_windows': sorted({batch[0]['memory_type'] for batch in ranges})}
+        if unit == 'frames':
+            result.update(press_frames=press, after_frames=after)
+        else:
+            result['timing'] = {'unit': unit, 'press': press, 'after': after}
 
         def snapshot_origin():
             selection = profile.get('origin_breakpoint')
@@ -241,9 +259,9 @@ def main():
         def baseline():
             # Batches that differ between two identical runs hold host-dependent memory (e.g. a
             # host renderer's frame buffer copy or a host-seeded clock); claims exclude them.
-            reference = run(w, origin, ranges, normal, buttons, press, after)
-            repeat = run(w, origin, ranges, normal, buttons, press, after)
-            control = run(w, origin, ranges, normal, None, press, after)
+            reference = run(w, origin, ranges, normal, buttons, press, after, unit)
+            repeat = run(w, origin, ranges, normal, buttons, press, after, unit)
+            control = run(w, origin, ranges, normal, None, press, after, unit)
             mask = [i for i, (a, b) in enumerate(zip(reference['batch_digests'], repeat['batch_digests']))
                     if a == b]
             effect = any(reference['batch_digests'][i] != control['batch_digests'][i] for i in mask)
@@ -260,11 +278,13 @@ def main():
             origin = snapshot_origin()
             reference, repeat, control, mask, effect = baseline()
         result['seek_frames'] = seek * profile.get('seek_frames', 300)
-        paced = [run(w, origin, ranges, policy, buttons, press, after)
+        paced = [run(w, origin, ranges, policy, buttons, press, after, unit)
                  for policy in profile.get('paces', PACES)]
         # A short tap at the slowest pace keeps the wall time bounded.
-        short = run(w, origin, ranges, normal, buttons, 1, 2)
-        slowest = run(w, origin, ranges, {'mode': 'limited', 'percent': 1}, buttons, 1, 2)
+        short_after = 1 if unit == 'input_polls' else 2
+        short = run(w, origin, ranges, normal, buttons, 1, short_after, unit)
+        slowest = run(w, origin, ranges, {'mode': 'limited', 'percent': 1},
+                      buttons, 1, short_after, unit)
 
         def same(a, b):
             return a['frames'] == b['frames'] and all(

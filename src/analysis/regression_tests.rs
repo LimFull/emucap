@@ -180,3 +180,57 @@ fn summary_all_pass_is_ok() {
     let s = Summary::from_results(vec![res("a", Verdict::Pass)]);
     assert!(s.ok());
 }
+
+#[test]
+fn load_suite_rejects_more_than_the_case_limit() {
+    let suite = tempfile::tempdir().unwrap();
+    for index in 0..=MAX_SUITE_CASES {
+        let dir = suite.path().join(format!("case-{index:03}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("case.json"), b"{}").unwrap();
+    }
+
+    let error = load_suite(suite.path()).unwrap_err();
+    assert!(error.contains(&format!("exceeds {MAX_SUITE_CASES} cases")));
+}
+
+#[test]
+fn load_suite_rejects_more_than_the_entry_limit() {
+    let suite = tempfile::tempdir().unwrap();
+    for index in 0..=MAX_SUITE_ENTRIES {
+        std::fs::write(suite.path().join(format!("entry-{index:04}")), b"").unwrap();
+    }
+
+    let error = load_suite(suite.path()).unwrap_err();
+    assert!(error.contains(&format!("exceeds {MAX_SUITE_ENTRIES} directory entries")));
+}
+
+#[test]
+fn load_suite_rejects_aggregate_case_json_above_limit() {
+    let suite = tempfile::tempdir().unwrap();
+    for index in 0..17 {
+        let id = format!("case-{index:03}");
+        let dir = suite.path().join(&id);
+        let case = Case {
+            format_version: CASE_FORMAT_VERSION,
+            id,
+            description: "x".repeat(990_000),
+            rom: RomRef {
+                sha1: "deadbeef".into(),
+                path_hint: "game.rom".into(),
+            },
+            repro: Repro::Savestate {
+                state_sha1: "state-a".into(),
+                advance_frames: 0,
+            },
+            predicate: pred(1, CmpOp::Eq, 0),
+            expect: Expect::Absent,
+        };
+        save_case(&dir, &case).unwrap();
+    }
+
+    let error = load_suite(suite.path()).unwrap_err();
+    assert!(error.contains(&format!(
+        "exceeds {MAX_SUITE_CASE_JSON_BYTES} aggregate bytes"
+    )));
+}

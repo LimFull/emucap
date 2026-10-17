@@ -7,7 +7,7 @@ and PPSSPP recipes when native inputs change, or through manual dispatch. Core
 version changes do not trigger these builds. Its exact cache key includes adapter
 sources, patches, recipe, target and runner toolchain version. The three PowerShell
 recipes do not consume MSYS2 shared helpers, so those helpers do not invalidate them.
-Every retained runtime file is verified before reuse. Missing or invalid cache
+Every retained runtime file and its signed producer lineage are verified before reuse. Missing or invalid cache
 contents cause a fresh build.
 
 The workflow retains runtime payloads, file-hash manifests and build logs for seven days.
@@ -19,7 +19,24 @@ Run the cache identity and payload checks locally:
 
 ```sh
 python3 _tests/release/native_build_tests.py
+python3 _tests/release/native_provenance_tests.py
+python3 _tests/release/native_release_tests.py
+python3 _tests/release/publish_release_tests.py
+python3 _tests/release/native_unix_build_tests.py
 ```
+
+`native_provenance.py` authenticates the producing repository, workflow, approved pipeline,
+run/attempt and successful matrix job before accepting native payloads. Unix reuse, Windows
+packaging, collection and release preparation retain signed parent records. Native source,
+packaging and core revisions remain distinct; core-only changes permit reuse when native inputs
+match. Unsigned historical packages require a fresh build. The native workflows attach a signed
+`NATIVE-PROVENANCE.json` to each eligible payload.
+
+`native_release.py` prepares the exact authenticated assembly and core asset list.
+`publish_release.py` checks the complete draft asset inventory before publication, including
+previous uploads. Matching partial uploads can resume. `NATIVE-PROVENANCE.tar.gz` preserves the
+signed assembly and its parent proofs in the release. Signing and platform execution are verified
+separately from the local admission fixtures.
 
 The **Native MSYS2 adapter builds** workflow compiles Mednafen, Flycast, NP2kai,
 Mupen64Plus, openMSX, MAME PC-98, MAME Neo Geo, PCSX2, and DeSmuME on Windows from their shell

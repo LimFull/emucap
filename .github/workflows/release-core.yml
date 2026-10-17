@@ -29,7 +29,7 @@ jobs:
     outputs:
       revision: ${{ steps.tag.outputs.revision }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - id: tag
@@ -63,17 +63,31 @@ jobs:
       contents: write
       actions: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: packaging
+          fetch-depth: 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.revision }}
+          path: source
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: core-*
           merge-multiple: true
-          path: artifacts
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-release-packages
-          run-id: ${{ inputs.native_run }}
-          github-token: ${{ github.token }}
-          path: artifacts
+          path: core-artifacts
+      - name: Authenticate assembly and prepare exact release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_RUN: ${{ inputs.native_run }}
+        run: |
+          python packaging/_tests/release/native_release.py --repo "$GITHUB_REPOSITORY" --run "$NATIVE_RUN" \
+            --source source --core core-artifacts --native native-artifacts \
+            --output prepared --asset-list release-assets.json
       - name: Publish the prepared draft after all package checks pass
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,26 +96,5 @@ jobs:
           SOURCE_REVISION: ${{ needs.resolve.outputs.revision }}
         shell: bash
         run: |
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
-          actual=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha)
-          type=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.type)
-          if [ "$type" = tag ]; then
-            actual=$(gh api "repos/$GH_REPO/git/tags/$actual" --jq .object.sha)
-          fi
-          test "$actual" = "$SOURCE_REVISION"
-          cd artifacts
-          python - <<'PY'
-          import json, os
-          index = json.load(open('NATIVE-PACKAGES.json'))
-          if index['core_revision'] != os.environ['SOURCE_REVISION']:
-              raise ValueError('native assembly must match the final release revision')
-          PY
-          sha256sum --check NATIVE-SHA256SUMS
-          cat *.sha256 NATIVE-SHA256SUMS > SHA256SUMS
-          sha256sum --check SHA256SUMS
-          gh release upload "$RELEASE_TAG" *.tar.gz *.zip *.json SHA256SUMS
-          if [[ "$RELEASE_TAG" == *-rc.* ]]; then
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
-          else
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
-          fi
+          python packaging/_tests/release/publish_release.py --repo "$GH_REPO" \
+            --tag "$RELEASE_TAG" --revision "$SOURCE_REVISION" --asset-list release-assets.json

@@ -68,7 +68,7 @@ def main():
             policy = {'mode': 'limited', 'percent': percent} if percent else {'mode': 'unlimited'}
             w.speed(policy)
             before = w.call('status')['frame']
-            frames = press + 1 + after
+            frames = press + after
             if held:
                 w.call('tap', {'buttons': ['a'], 'press_frames': press, 'after_frames': after})
             else:

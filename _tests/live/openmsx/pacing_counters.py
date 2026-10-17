@@ -81,7 +81,7 @@ def main():
             assert observed_policy['mode'] == policy['mode']
             assert observed_policy['percent'] == policy.get('percent')
             assert counters() == base
-            frames = press + 1 + after
+            frames = press + after
             before_frame = w.call('status')['frame']
             if held:
                 advanced = w.call('tap', {'buttons': ['a'], 'press_frames': press, 'after_frames': after})

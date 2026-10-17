@@ -1,0 +1,30 @@
+diff --git a/Core/Util/PPGeDraw.cpp b/Core/Util/PPGeDraw.cpp
+index 625cbd977b..dea3d6534a 100644
+--- a/Core/Util/PPGeDraw.cpp
++++ b/Core/Util/PPGeDraw.cpp
+@@ -16,6 +16,7 @@
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
+ #include <algorithm>  // std::remove
++#include <cstdlib>
+ 
+ #include "ext/xxhash.h"
+ 
+@@ -237,10 +238,14 @@ void __PPGeSetupListArgs() {
+ 	}
+ }
+ 
++static bool PPGeShouldLoadAtlas() {
++	const char *managedRoot = getenv("EMUCAP_PPSSPP_MEMSTICK");
++	return !System_GetPropertyBool(SYSPROP_IS_HEADLESS) || (managedRoot && *managedRoot);
++}
++
+ void __PPGeInit() {
+-	// PPGe isn't really important for headless, and LoadZIM takes a long time (well not that long, but unnecessary).
+-	// TODO: Load it lazily.
+-	const bool skipZIM = System_GetPropertyBool(SYSPROP_IS_HEADLESS);
++	// Managed headless captures include PSP system dialogs and their text.
++	const bool skipZIM = !PPGeShouldLoadAtlas();
+ 
+ 	u8 *imageData[12]{};
+ 	int width[12]{};

@@ -1,5 +1,10 @@
 //! Initial Nintendo 64 adapter backed by a debugger-enabled Mupen64Plus core.
 
+#[path = "n64_adapter_input.rs"]
+mod input;
+#[path = "n64_adapter_poll.rs"]
+mod poll;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fs::File;
@@ -28,6 +33,7 @@ mod lifecycle;
 mod observation;
 #[path = "n64_adapter_prepare.rs"]
 mod prepare;
+use prepare::set_config_int;
 #[path = "n64_adapter_temporal_owner.rs"]
 mod temporal_owner;
 
@@ -56,8 +62,6 @@ const M64CMD_STOP: c_int = 6;
 const M64CMD_RESET: c_int = 19;
 const M64CMD_STATE_LOAD: c_int = 10;
 const M64CMD_STATE_SAVE: c_int = 11;
-const M64CMD_SEND_SDL_KEYDOWN: c_int = 13;
-const M64CMD_SEND_SDL_KEYUP: c_int = 14;
 const M64CMD_SET_FRAME_CALLBACK: c_int = 15;
 const M64CMD_TAKE_NEXT_SCREENSHOT: c_int = 16;
 const M64CORE_STATE_LOADCOMPLETE: c_int = 10;
@@ -188,6 +192,9 @@ type PluginShutdown = unsafe extern "C" fn() -> c_int;
 
 #[derive(Clone, Copy)]
 struct Api {
+    core_set_state_boundary_callback: unsafe extern "C" fn(u32, extern "C" fn()) -> c_int,
+    core_set_poll_callback: unsafe extern "C" fn(u32, extern "C" fn(u32)) -> c_int,
+    core_emucap_input: unsafe extern "C" fn(u32, u32, u32, u32, i32, i32) -> c_int,
     core_shutdown: CoreShutdown,
     core_attach_plugin: CoreAttachPlugin,
     core_detach_plugin: CoreDetachPlugin,
@@ -254,7 +261,6 @@ pub struct Mupen64PlusHost {
     plugins: Vec<Plugin>,
     rom_path: PathBuf,
     name: Option<String>,
-    session_token: Option<String>,
     launch_id: Option<String>,
     build: String,
     runtime_home: PathBuf,
@@ -264,7 +270,9 @@ pub struct Mupen64PlusHost {
     request_cancellation: crate::live::link::RequestCancellation,
     producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
     frame_clock_synchronized: bool,
-    held_buttons: BTreeSet<String>,
+    controller: input::ControllerState,
+    input_baseline: Option<(String, input::ControllerState)>,
+    parent_input_baseline: Option<input::ControllerState>,
     breakpoints: BTreeMap<u64, debug::PublicBreakpoint>,
     next_breakpoint_id: u64,
     debug_events: VecDeque<Value>,
@@ -344,14 +352,18 @@ impl Mupen64PlusHost {
             "write_memory" => self.write_memory(&request.params),
             "pause" => self.pause(&request.params),
             "resume" => self.resume(&request.params),
-            "step" if self.display => self.step(&request.params),
-            "run_frames" if self.display => self.run_frames(&request.params),
+            "step" => self.step(&request.params),
+            "step_input_polls" => {
+                self.step_with_frame_gate(&request.params, FrameGateTrigger::NextPoll)
+            }
+            "read_input_polls" => self.read_input_polls(&request.params),
+            "run_frames" => self.run_frames(&request.params),
             "step_instructions" => self.step_instructions(&request.params),
             "set_input" => self.set_input(&request.params),
-            "press_buttons" if self.display => self.press_buttons(&request.params),
-            "screenshot" if self.display => self.screenshot(),
-            "save_state" if self.display => self.save_state(&request.params),
-            "load_state" if self.display => self.load_state(&request.params),
+            "press_buttons" => self.press_buttons(&request.params),
+            "screenshot" => self.screenshot(),
+            "save_state" => self.save_state(&request.params),
+            "load_state" => self.load_state(&request.params),
             "reset" => self.reset(&request.params),
             "set_breakpoint" => self.set_breakpoint(&request.params),
             "clear_breakpoint" => self.clear_breakpoint(&request.params),
@@ -402,30 +414,26 @@ impl Mupen64PlusHost {
             "region_sizes": {"rdram": RDRAM_SIZE},
             "breakpoint_kinds": debug::breakpoint_kinds(),
             "input_buttons": INPUT_BUTTONS,
+            "input_axes": input::axes_capability(),
+            "input_poll_capability":poll::capability(),
+            "input_poll_count":poll::POLL_COUNT.load(Ordering::Acquire),
+            "host_features": if self.launch_id.is_some() { vec!["scoped_controller_input"] } else { vec![] },
             "execution_limits": {
                 "max_sync_advance_count": MAX_STEP_COUNT,
                 "max_sync_operation_ms":
                     crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
                 "frame": {
-                    "max_count": if self.display { MAX_STEP_COUNT } else { 0 }
+                    "max_count": MAX_STEP_COUNT
                 }
             },
             "contracts": crate::contracts::advertisement_value(&active_exceptions),
             "capability_notes": {
                 "implemented_methods": methods,
-                "step_units": if self.display {
-                    json!(["frames", "instructions"])
-                } else {
-                    json!(["instructions"])
-                },
+                "step_units": json!(["frames", "instructions", "input_polls"]),
                 "step_cpus": ["r4300"],
                 "execution_mode": "pure_interpreter",
                 "rsp_observation": "not_exposed",
-                "frame_source": if self.display {
-                    "rendered_frame_callback"
-                } else {
-                    "vi_callback"
-                },
+                "frame_source": "rendered_frame_callback",
                 "display": self.display
             },
             "content": self.rom_path.display().to_string(),
@@ -436,9 +444,6 @@ impl Mupen64PlusHost {
         let object = value.as_object_mut().expect("N64 hello object");
         if let Some(name) = &self.name {
             object.insert("name".into(), json!(name));
-        }
-        if let Some(token) = &self.session_token {
-            object.insert("session_token".into(), json!(token));
         }
         if let Some(launch_id) = &self.launch_id {
             object.insert("launch_id".into(), json!(launch_id));
@@ -473,24 +478,25 @@ impl Mupen64PlusHost {
             "breakpoint_kinds": debug::breakpoint_kinds()
             ,"display": self.display,
             "input_buttons": INPUT_BUTTONS,
+            "input_axes": input::axes_capability(),
+            "input_poll_capability":poll::capability(),
+            "input_poll_count":poll::POLL_COUNT.load(Ordering::Acquire),
+            "host_features": if self.launch_id.is_some() { vec!["scoped_controller_input"] } else { vec![] },
             "execution_limits": {
                 "max_sync_advance_count": MAX_STEP_COUNT,
                 "max_sync_operation_ms":
                     crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
                 "frame": {
-                    "max_count": if self.display { MAX_STEP_COUNT } else { 0 }
+                    "max_count": MAX_STEP_COUNT
                 }
             },
-            "input_override": {
-                "engaged": !self.held_buttons.is_empty(),
-                "buttons": self.held_buttons.iter().collect::<Vec<_>>(),
-                "ownership": if self.held_buttons.is_empty() {
-                    "native"
-                } else {
-                    "shared_with_native"
-                }
-            }
+            "input_override": self.controller.public(),
         });
+        if let Some((operation, baseline)) = &self.input_baseline {
+            value["input_override"]["scope"] = json!("request");
+            value["input_override"]["operation_id"] = json!(operation);
+            value["input_override"]["baseline"] = baseline.public();
+        }
         if connected {
             let object = value.as_object_mut().expect("N64 status object");
             object.insert(
@@ -682,7 +688,18 @@ impl Mupen64PlusHost {
         first_trigger: FrameGateTrigger,
     ) -> N64Result<Value> {
         require_r4300(params)?;
-        self.require_frozen("frame step")?;
+        self.require_frozen("callback step")?;
+        let polling = first_trigger == FrameGateTrigger::NextPoll;
+        let unit = if polling { "input_polls" } else { "frames" };
+        let clock = || {
+            if polling {
+                poll::POLL_COUNT.load(Ordering::Acquire)
+            } else {
+                FRAME_COUNT.load(Ordering::Acquire)
+            }
+        };
+        let public_before = self.public_frame();
+        let poll_before = poll::POLL_COUNT.load(Ordering::Acquire);
         let count = optional_num(params, "count")?
             .or(optional_num(params, "frames")?)
             .unwrap_or(1);
@@ -700,15 +717,15 @@ impl Mupen64PlusHost {
         });
 
         let mut release_debugger_pause = !self.frame_paused;
-        let mut frame_before = FRAME_COUNT.load(Ordering::Acquire);
-        let mut frame_before_verified = self.frame_clock_synchronized;
+        let mut frame_before = clock();
+        let mut frame_before_verified = polling || self.frame_clock_synchronized;
         let mut current_frame = frame_before;
         for index in 0..count {
             if self.request_cancellation.is_cancelled() {
                 // Entry is a verified frozen boundary, or the previous iteration's held gate.
                 self.frozen = true;
                 return Ok(
-                    json!({"status":"interrupted", "reason":"cancelled", "unit":"frames",
+                    json!({"status":"interrupted", "reason":"cancelled", "unit":unit,
                     "count":index,"requested":count,"completed":index,"frame":self.public_frame(),"state":"frozen"}),
                 );
             }
@@ -716,23 +733,24 @@ impl Mupen64PlusHost {
             if index > 0 && deadline.remaining_timeout().is_none() {
                 self.frozen = true;
                 return Ok(json!({
-                    "status": "interrupted", "reason": "host_deadline", "unit": "frames",
+                    "status": "interrupted", "reason": "host_deadline", "unit": unit,
                     "count": index, "requested": count, "completed": index, "cpu": "r4300",
-                    "frame": current_frame, "state": "frozen",
+                    "frame": if polling {self.public_frame()} else {current_frame}, "state": "frozen",
                 }));
             }
             let continuing_from_frame_barrier = self.frame_paused;
-            let observed_before = FRAME_COUNT.load(Ordering::Acquire);
-            let observed_before_verified = self.frame_clock_synchronized;
+            let observed_before = clock();
+            let observed_before_verified = polling || self.frame_clock_synchronized;
             let debug_before = UPDATE_COUNT.load(Ordering::Acquire);
-            let trigger = if index == 0 {
-                first_trigger
-            } else {
-                FrameGateTrigger::NextFrame
-            };
+            let trigger = first_trigger;
             arm_frame_gate(trigger)?;
 
             if self.frame_paused {
+                // A prior stop request can race with the callback park. Clear its
+                // debugger intent while the callback still owns execution.
+                check_core("DebugSetRunState(callback release)", unsafe {
+                    (self.api.debug_set_run_state)(M64P_DBG_RUNSTATE_RUNNING)
+                })?;
                 if let Err(error) = release_frame_gate() {
                     let recovery = self.recover_frame_failure(&error);
                     return recovery.and(Err(error));
@@ -791,7 +809,9 @@ impl Mupen64PlusHost {
                                 ));
                             }
                             self.frame_paused = true;
-                            self.frame_clock_synchronized = true;
+                            if !polling {
+                                self.frame_clock_synchronized = true;
+                            }
                             index + 1
                         }
                         Ok(FrameWaitOutcome::DebugUpdate(_)) => {
@@ -816,7 +836,7 @@ impl Mupen64PlusHost {
                         ));
                     }
                     return Ok(json!({"status":"interrupted", "reason":"cancelled",
-                        "unit":"frames", "count":completed, "requested":count, "completed":completed,
+                        "unit":unit, "count":completed, "requested":count, "completed":completed,
                         "frame":self.public_frame(), "state":"frozen"}));
                 }
                 Ok(FrameWaitOutcome::DebugUpdate(update)) => {
@@ -829,7 +849,7 @@ impl Mupen64PlusHost {
                             "reason":"breakpoint",
                             "breakpoint_id":event["id"],
                             "event":event,
-                            "unit":"frames",
+                            "unit":unit,
                             "count":index,
                             "requested":count,
                             "completed":index,
@@ -850,9 +870,9 @@ impl Mupen64PlusHost {
                     // the recovered debugger boundary.
                     if deadline.expired() {
                         return Ok(json!({
-                            "status": "interrupted", "reason": "host_deadline", "unit": "frames",
-                            "count": index, "requested": count, "completed": index, "cpu": "r4300",
-                            "frame": FRAME_COUNT.load(Ordering::Acquire), "state": "frozen",
+                            "status": "interrupted", "reason": "host_deadline", "unit": unit,
+                            "count": clock().saturating_sub(frame_before), "requested": count, "completed": clock().saturating_sub(frame_before), "cpu": "r4300",
+                            "frame": self.public_frame(), "state": "frozen",
                         }));
                     }
                     return Err(error);
@@ -871,7 +891,9 @@ impl Mupen64PlusHost {
                 frame_before = observed.saturating_sub(1);
                 frame_before_verified = true;
             }
-            self.frame_clock_synchronized = true;
+            if !polling {
+                self.frame_clock_synchronized = true;
+            }
             current_frame = observed;
 
             // The callback barrier is the single owner of this exact boundary.
@@ -882,13 +904,15 @@ impl Mupen64PlusHost {
         self.frozen = true;
         Ok(json!({
             "status": "completed",
-            "unit": "frames",
+            "unit": unit,
             "count": count,
             "cpu": "r4300",
             "state": "frozen",
             "pc": LAST_PC.load(Ordering::Acquire),
-            "frame_before": frame_before,
-            "frame": current_frame,
+            "frame_before": if polling {public_before} else {frame_before},
+            "input_polls_before":poll_before,
+            "input_polls_after":poll::POLL_COUNT.load(Ordering::Acquire),
+            "frame": if polling {self.public_frame()} else {current_frame},
             "frame_before_verified": frame_before_verified,
             "vi_count": VI_COUNT.load(Ordering::Acquire)
         }))
@@ -977,11 +1001,7 @@ impl Mupen64PlusHost {
     }
 
     fn public_frame(&self) -> u64 {
-        if self.display {
-            FRAME_COUNT.load(Ordering::Acquire)
-        } else {
-            VI_COUNT.load(Ordering::Acquire)
-        }
+        FRAME_COUNT.load(Ordering::Acquire)
     }
 
     fn active_exceptions(&self) -> Vec<&'static str> {
@@ -1003,9 +1023,23 @@ impl Mupen64PlusHost {
     }
 
     fn recover_frame_failure(&mut self, original: &N64Error) -> N64Result<()> {
-        cancel_frame_gate();
         let before = UPDATE_COUNT.load(Ordering::Acquire);
-        self.recover_instruction_failure(before.saturating_add(1), original)
+        let stopped=frame::park_after_cancellation(before,RECOVERY_DEADLINE,
+            ||check_core("DebugSetRunState(callback recovery)",unsafe{(self.api.debug_set_run_state)(M64P_DBG_RUNSTATE_PAUSED)}),
+            ||unsafe{(self.api.debug_get_state)(M64P_DBG_RUN_STATE)}==M64P_DBG_RUNSTATE_PAUSED);
+        match stopped {
+            Ok(FrameWaitOutcome::Frame(_)) => self.frame_paused = true,
+            Ok(FrameWaitOutcome::DebugUpdate(_)) => self.frame_paused = false,
+            Ok(FrameWaitOutcome::Cancelled) => unreachable!(),
+            Err(error) => {
+                return Err(self.stop_generation_with_unresolved_effect(
+                    "callback recovery",
+                    &N64Error::BadState(format!("{original}; {error}")),
+                ))
+            }
+        }
+        self.frozen = true;
+        Ok(())
     }
 
     fn recover_instruction_failure(
@@ -1055,33 +1089,28 @@ impl Mupen64PlusHost {
     }
 }
 
-fn methods_for(display: bool) -> Vec<&'static str> {
+fn methods_for(_display: bool) -> Vec<&'static str> {
     let mut methods = BASE_METHODS.to_vec();
-    if display {
-        methods.extend([
-            "step",
-            "run_frames",
-            "press_buttons",
-            "screenshot",
-            "save_state",
-            "load_state",
-        ]);
-    }
+    methods.extend([
+        "step_input_polls",
+        "read_input_polls",
+        "save_state",
+        "load_state",
+        "step",
+        "run_frames",
+        "press_buttons",
+        "screenshot",
+    ]);
     methods
 }
-
-fn exceptions_for(display: bool) -> Vec<&'static str> {
+fn exceptions_for(_display: bool) -> Vec<&'static str> {
     let mut exceptions = ACTIVE_EXCEPTIONS.to_vec();
-    if display {
-        exceptions.extend([
-            "n64.input-pulse.bounded",
-            "n64.screenshot.frozen-only",
-            "n64.state-save.frozen-only",
-            "n64.state-load.frozen-only",
-        ]);
-    } else {
-        exceptions.push("n64.execution.frame-step-absent");
-    }
+    exceptions.extend([
+        "n64.input-pulse.bounded",
+        "n64.screenshot.frozen-only",
+        "n64.state-save.frozen-only",
+        "n64.state-load.frozen-only",
+    ]);
     exceptions
 }
 
@@ -1094,40 +1123,6 @@ fn display_requested() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-}
-
-fn set_config_int(
-    api: &Api,
-    section: *mut c_void,
-    name: &'static [u8],
-    kind: c_int,
-    value: c_int,
-) -> N64Result<()> {
-    check_core("ConfigSetParameter", unsafe {
-        (api.config_set_parameter)(
-            section,
-            cstr(name).as_ptr(),
-            kind,
-            &value as *const c_int as *const c_void,
-        )
-    })
-}
-
-fn set_config_string(
-    api: &Api,
-    section: *mut c_void,
-    name: &'static [u8],
-    value: &Path,
-) -> N64Result<()> {
-    let value = path_cstring(value)?;
-    check_core("ConfigSetParameter", unsafe {
-        (api.config_set_parameter)(
-            section,
-            cstr(name).as_ptr(),
-            M64TYPE_STRING,
-            value.as_ptr() as *const c_void,
-        )
-    })
 }
 
 fn check_core(operation: &'static str, code: c_int) -> N64Result<()> {

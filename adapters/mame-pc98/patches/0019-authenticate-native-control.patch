@@ -1,0 +1,453 @@
+diff --git a/src/frontend/mame/emucap_control_io.h b/src/frontend/mame/emucap_control_io.h
+index bf2dd5d..730dd04 100644
+--- a/src/frontend/mame/emucap_control_io.h
++++ b/src/frontend/mame/emucap_control_io.h
+@@ -3,16 +3,21 @@
+ #pragma once
+ 
+ #include "asio.h"
++#include "util/hashing.h"
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
+ #include <cstdint>
++#include <iterator>
++#include <limits>
+ #include <memory>
+ #include <stdexcept>
+ #include <string>
+ #include <string_view>
+ #include <thread>
+ #include <tuple>
++#include <utility>
++#include <vector>
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
+@@ -28,11 +33,18 @@ class control_socket
+ {
+ public:
+ 	static constexpr std::size_t chunk_limit = 4096;
++	static constexpr std::size_t candidate_limit = 8;
++	static constexpr std::size_t accept_limit = 2;
++	static constexpr std::size_t auth_work_limit = 32768;
++	static constexpr std::size_t auth_payload_limit = 256;
+ 
+-	explicit control_socket(std::uint32_t port) : m_listener(m_context), m_peer(m_context)
++	control_socket(std::uint32_t port, std::string token)
++		: m_listener(m_context), m_peer(m_context), m_token(std::move(token))
+ 	{
+ 		if (port > 65535)
+ 			throw std::invalid_argument("invalid control port");
++		if (m_token.empty() || m_token.size() > 256 || m_token.find('\0') != std::string::npos)
++			throw std::invalid_argument("invalid native control token");
+ 		using asio::ip::tcp;
+ 		m_listener.open(tcp::v4());
+ #if !defined(_WIN32)
+@@ -40,7 +52,7 @@ public:
+ 		m_listener.set_option(asio::socket_base::reuse_address(true));
+ #endif
+ 		m_listener.bind(tcp::endpoint(asio::ip::address_v4::loopback(), port));
+-		m_listener.listen(1);
++		m_listener.listen(candidate_limit);
+ 		m_listener.non_blocking(true);
+ 		m_port = m_listener.local_endpoint().port();
+ 	}
+@@ -54,31 +66,35 @@ public:
+ 		asio::error_code ignored;
+ 		m_listener.close(ignored);
+ 		m_peer.close(ignored);
++		for (auto &candidate : m_candidates)
++			candidate->socket.close(ignored);
++		m_candidates.clear();
++		m_prefetched.clear();
+ 	}
+ 
+ 	std::tuple<std::string, std::string> read()
+ 	{
+ 		if (m_terminal)
+ 			return { "closed", "" };
+-		asio::error_code error;
+-		if (m_listener.is_open())
++		if (!m_committed)
+ 		{
+-			m_listener.accept(m_peer, error);
+-			if (idle(error))
+-				return { "idle", "" };
+-			if (error)
+-				return fail(error);
+-			m_peer.non_blocking(true, error);
+-			if (error)
+-				return fail(error);
+-			m_peer.set_option(asio::ip::tcp::no_delay(true), error);
+-			if (error)
+-				return fail(error);
+-			m_listener.close(error);
+-			if (error)
+-				return fail(error);
+-			return { "accepted", "" };
++			std::size_t work = 0;
++			service_candidates(work);
++			if (m_committed)
++				return { "accepted", "" };
++			accept_candidates();
++			service_candidates(work);
++			return m_committed ? std::tuple<std::string, std::string>{ "accepted", "" }
++				: std::tuple<std::string, std::string>{ "idle", "" };
+ 		}
++		if (!m_prefetched.empty())
++		{
++			auto const size = std::min(chunk_limit, m_prefetched.size());
++			std::string data = m_prefetched.substr(0, size);
++			m_prefetched.erase(0, size);
++			return { "data", std::move(data) };
++		}
++		asio::error_code error;
+ 		std::array<char, chunk_limit> data;
+ 		auto const size = m_peer.read_some(asio::buffer(data), error);
+ 		if (idle(error))
+@@ -104,7 +120,7 @@ public:
+ 			throw std::invalid_argument("control write chunk outside bounds");
+ 		if (m_terminal)
+ 			return { "closed", 0 };
+-		if (m_listener.is_open())
++		if (!m_committed)
+ 			return { "idle", 0 };
+ 		asio::error_code error;
+ 		auto const size = m_peer.write_some(asio::buffer(data.data(), data.size()), error);
+@@ -127,11 +143,307 @@ public:
+ 	static void wait() { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+ 
+ private:
++	using clock = std::chrono::steady_clock;
++	enum class auth_stage { challenge, server_reply, server_ack, client_proof, ok_reply, ok_ack, ready };
++	enum class frame_result { incomplete, invalid, complete };
++
++	struct candidate
++	{
++		explicit candidate(asio::ip::tcp::socket &&value)
++			: socket(std::move(value)), deadline(clock::now() + std::chrono::seconds(5)) { }
++
++		asio::ip::tcp::socket socket;
++		clock::time_point deadline;
++		auth_stage stage = auth_stage::challenge;
++		std::string rx;
++		std::string tx;
++		std::size_t tx_offset = 0;
++		std::string reply;
++		std::string client_nonce;
++		std::string server_nonce;
++		unsigned retries = 0;
++		bool verified = false;
++	};
++
+ 	static bool idle(asio::error_code const &error)
+ 	{
+ 		return error == asio::error::would_block || error == asio::error::try_again;
+ 	}
+ 
++	static int hex_digit(char value)
++	{
++		if (value >= '0' && value <= '9') return value - '0';
++		if (value >= 'a' && value <= 'f') return value - 'a' + 10;
++		if (value >= 'A' && value <= 'F') return value - 'A' + 10;
++		return -1;
++	}
++
++	static bool hex_string(std::string_view value, std::size_t size)
++	{
++		return value.size() == size
++			&& std::all_of(value.begin(), value.end(), [] (char ch) { return hex_digit(ch) >= 0; });
++	}
++
++	static void append_field(util::sha1_creator &hash, std::string_view field)
++	{
++		std::array<std::uint8_t, 8> length;
++		auto value = std::uint64_t(field.size());
++		for (int index = 7; index >= 0; --index)
++		{
++			length[index] = std::uint8_t(value);
++			value >>= 8;
++		}
++		hash.append(length.data(), length.size());
++		hash.append(field.data(), field.size());
++	}
++
++	static std::string hmac_sha1(std::string_view key, std::string_view direction,
++			std::string_view client_nonce, std::string_view server_nonce)
++	{
++		constexpr std::size_t block_size = 64;
++		std::array<std::uint8_t, block_size> key_block{};
++		if (key.size() > key_block.size())
++		{
++			auto const digest = util::sha1_creator::simple(key.data(), key.size());
++			std::copy(std::begin(digest.m_raw), std::end(digest.m_raw), key_block.begin());
++		}
++		else
++		{
++			std::copy(key.begin(), key.end(), key_block.begin());
++		}
++		std::array<std::uint8_t, block_size> inner_pad;
++		std::array<std::uint8_t, block_size> outer_pad;
++		for (std::size_t index = 0; index < block_size; ++index)
++		{
++			inner_pad[index] = key_block[index] ^ 0x36;
++			outer_pad[index] = key_block[index] ^ 0x5c;
++		}
++		util::sha1_creator inner;
++		inner.append(inner_pad.data(), inner_pad.size());
++		append_field(inner, "emucap-mame-native-auth-v1");
++		append_field(inner, direction);
++		append_field(inner, client_nonce);
++		append_field(inner, server_nonce);
++		auto const inner_digest = inner.finish();
++		util::sha1_creator outer;
++		outer.append(outer_pad.data(), outer_pad.size());
++		outer.append(inner_digest.m_raw, sizeof(inner_digest.m_raw));
++		return outer.finish().as_string();
++	}
++
++	static bool constant_time_equal(std::string_view left, std::string_view right)
++	{
++		unsigned difference = unsigned(left.size() ^ right.size());
++		for (std::size_t index = 0; index < left.size(); ++index)
++			difference |= std::uint8_t(left[index]) ^ std::uint8_t(index < right.size() ? right[index] : 0);
++		return difference == 0;
++	}
++
++	static std::string frame(std::string_view payload)
++	{
++		std::uint8_t checksum = 0;
++		for (auto const ch : payload) checksum += std::uint8_t(ch);
++		static constexpr char digits[] = "0123456789abcdef";
++		std::string result;
++		result.reserve(payload.size() + 4);
++		result.push_back('$');
++		result.append(payload);
++		result.push_back('#');
++		result.push_back(digits[checksum >> 4]);
++		result.push_back(digits[checksum & 15]);
++		return result;
++	}
++
++	static frame_result take_frame(candidate &value, std::string &payload)
++	{
++		if (value.rx.empty()) return frame_result::incomplete;
++		if (value.rx.front() != '$') return frame_result::invalid;
++		auto const marker = value.rx.find('#', 1);
++		if (marker == std::string::npos)
++			return value.rx.size() > auth_payload_limit + 1 ? frame_result::invalid : frame_result::incomplete;
++		if (marker - 1 > auth_payload_limit) return frame_result::invalid;
++		if (value.rx.size() < marker + 3) return frame_result::incomplete;
++		if (hex_digit(value.rx[marker + 1]) < 0 || hex_digit(value.rx[marker + 2]) < 0)
++			return frame_result::invalid;
++		std::uint8_t checksum = 0;
++		for (std::size_t index = 1; index < marker; ++index)
++		{
++			if (value.rx[index] == '}' || value.rx[index] == '$') return frame_result::invalid;
++			checksum += std::uint8_t(value.rx[index]);
++		}
++		auto const expected = (hex_digit(value.rx[marker + 1]) << 4) | hex_digit(value.rx[marker + 2]);
++		if (checksum != expected) return frame_result::invalid;
++		payload = value.rx.substr(1, marker - 1);
++		value.rx.erase(0, marker + 3);
++		return frame_result::complete;
++	}
++
++	static void queue_reply(candidate &value, std::string reply, auth_stage stage)
++	{
++		value.reply = std::move(reply);
++		value.tx = "+" + value.reply;
++		value.tx_offset = 0;
++		value.stage = stage;
++	}
++
++	void reject(std::size_t index)
++	{
++		asio::error_code ignored;
++		m_candidates[index]->socket.close(ignored);
++		m_candidates.erase(m_candidates.begin() + index);
++	}
++
++	void accept_candidates()
++	{
++		for (std::size_t count = 0; count < accept_limit && m_listener.is_open(); ++count)
++		{
++			asio::ip::tcp::socket socket(m_context);
++			asio::error_code error;
++			m_listener.accept(socket, error);
++			if (idle(error)) return;
++			if (error) { close(); return; }
++			socket.non_blocking(true, error);
++			if (!error) socket.set_option(asio::ip::tcp::no_delay(true), error);
++			if (error) { socket.close(); continue; }
++			if (m_candidates.size() == candidate_limit)
++			{
++				auto victim = std::find_if(m_candidates.begin(), m_candidates.end(),
++					[] (auto const &candidate) { return !candidate->verified; });
++				if (victim == m_candidates.end()) { socket.close(); continue; }
++				asio::error_code ignored;
++				(*victim)->socket.close(ignored);
++				m_candidates.erase(victim);
++			}
++			m_candidates.emplace_back(std::make_unique<candidate>(std::move(socket)));
++		}
++	}
++
++	bool write_candidate(candidate &value, std::size_t &work)
++	{
++		if (value.tx_offset >= value.tx.size()) return true;
++		auto const length = std::min({ chunk_limit, auth_work_limit - work, value.tx.size() - value.tx_offset });
++		if (!length) return true;
++		asio::error_code error;
++		auto const size = value.socket.write_some(asio::buffer(value.tx.data() + value.tx_offset, length), error);
++		if (idle(error)) return true;
++		if (error || !size) return false;
++		value.tx_offset += size;
++		work += size;
++		if (value.tx_offset == value.tx.size())
++		{
++			value.tx.clear();
++			value.tx_offset = 0;
++			value.stage = value.stage == auth_stage::server_reply ? auth_stage::server_ack : auth_stage::ok_ack;
++		}
++		return true;
++	}
++
++	bool read_candidate(candidate &value, std::size_t &work)
++	{
++		if (work >= auth_work_limit) return true;
++		std::array<char, chunk_limit> data;
++		asio::error_code error;
++		auto const length = std::min(chunk_limit, auth_work_limit - work);
++		auto const size = value.socket.read_some(asio::buffer(data.data(), length), error);
++		if (idle(error)) return true;
++		if (error || !size) return false;
++		value.rx.append(data.data(), size);
++		work += size;
++		return value.rx.size() <= (value.verified ? chunk_limit + auth_payload_limit + 8 : auth_payload_limit + 8);
++	}
++
++	bool advance(candidate &value)
++	{
++		for (unsigned transitions = 0; transitions < 4; ++transitions)
++		{
++			if (value.stage == auth_stage::server_reply || value.stage == auth_stage::ok_reply)
++				return true;
++			if (value.stage == auth_stage::server_ack || value.stage == auth_stage::ok_ack)
++			{
++				if (value.rx.empty()) return true;
++				if (value.rx.front() == '-')
++				{
++					value.rx.erase(0, 1);
++					if (++value.retries > 8) return false;
++					value.tx = value.reply;
++					value.tx_offset = 0;
++					value.stage = value.stage == auth_stage::server_ack ? auth_stage::server_reply : auth_stage::ok_reply;
++					return true;
++				}
++				if (value.rx.front() != '+') return false;
++				value.rx.erase(0, 1);
++				value.retries = 0;
++				if (value.stage == auth_stage::ok_ack)
++				{
++					value.stage = auth_stage::ready;
++					return true;
++				}
++				value.stage = auth_stage::client_proof;
++				continue;
++			}
++			std::string payload;
++			auto const parsed = take_frame(value, payload);
++			if (parsed == frame_result::incomplete) return true;
++			if (parsed == frame_result::invalid) return false;
++			if (value.stage == auth_stage::challenge)
++			{
++				static constexpr std::string_view prefix = "qEmucap,auth1:";
++				if (!payload.starts_with(prefix)) return false;
++				value.client_nonce = payload.substr(prefix.size());
++				if (!hex_string(value.client_nonce, 32)) return false;
++				if (m_nonce_counter == std::numeric_limits<std::uint64_t>::max()) return false;
++				auto const counter = std::to_string(++m_nonce_counter);
++				value.server_nonce = hmac_sha1(m_token, "nonce", value.client_nonce, counter).substr(0, 32);
++				auto const proof = hmac_sha1(m_token, "server", value.client_nonce, value.server_nonce);
++				queue_reply(value, frame("qEmucap,auth2:" + value.server_nonce + ":" + proof), auth_stage::server_reply);
++				return true;
++			}
++			static constexpr std::string_view prefix = "qEmucap,auth3:";
++			if (!payload.starts_with(prefix)) return false;
++			auto const proof = payload.substr(prefix.size());
++			if (!hex_string(proof, 40)) return false;
++			auto const expected = hmac_sha1(m_token, "client", value.client_nonce, value.server_nonce);
++			if (!constant_time_equal(expected, proof)) return false;
++			value.verified = true;
++			queue_reply(value, frame("OK"), auth_stage::ok_reply);
++			return true;
++		}
++		return false;
++	}
++
++	void promote(std::size_t index)
++	{
++		auto &winner = *m_candidates[index];
++		m_prefetched = std::move(winner.rx);
++		m_peer = std::move(winner.socket);
++		asio::error_code ignored;
++		m_listener.close(ignored);
++		for (std::size_t other = 0; other < m_candidates.size(); ++other)
++			if (other != index) m_candidates[other]->socket.close(ignored);
++		m_candidates.clear();
++		m_committed = true;
++	}
++
++	void service_candidates(std::size_t &work)
++	{
++		for (std::size_t index = 0; index < m_candidates.size() && work < auth_work_limit; )
++		{
++			auto &value = *m_candidates[index];
++			if (clock::now() >= value.deadline || !write_candidate(value, work)
++					|| !read_candidate(value, work) || !advance(value))
++			{
++				reject(index);
++				continue;
++			}
++			if (value.verified && value.stage == auth_stage::ready && value.tx.empty())
++			{
++				promote(index);
++				return;
++			}
++			++index;
++		}
++	}
++
+ 	std::tuple<std::string, std::string> fail(asio::error_code const &error)
+ 	{
+ 		close();
+@@ -141,8 +453,13 @@ private:
+ 	asio::io_context m_context;
+ 	asio::ip::tcp::acceptor m_listener;
+ 	asio::ip::tcp::socket m_peer;
++	std::vector<std::unique_ptr<candidate>> m_candidates;
++	std::string m_token;
++	std::string m_prefetched;
++	std::uint64_t m_nonce_counter = 0;
+ 	std::uint16_t m_port = 0;
+ 	bool m_terminal = false;
++	bool m_committed = false;
+ };
+ 
+ class regular_input
+diff --git a/src/frontend/mame/luaengine.cpp b/src/frontend/mame/luaengine.cpp
+index 470fc14..16186ff 100644
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -1035,7 +1035,8 @@ void lua_engine::initialize()
+ */
+ 
+ 	auto control_type = emu.new_usertype<emucap::control_socket>(
+-			"emucap_control_socket", sol::call_constructor, sol::constructors<emucap::control_socket(std::uint32_t)>());
++			"emucap_control_socket", sol::call_constructor,
++			sol::constructors<emucap::control_socket(std::uint32_t, std::string)>());
+ 	control_type["read"] = &emucap::control_socket::read;
+ 	control_type["write"] = &emucap::control_socket::write;
+ 	control_type["close"] = &emucap::control_socket::close;

@@ -14,14 +14,13 @@ impl<G: GdbTransport> Bridge<G> {
         argument: &str,
         budget: Duration,
     ) -> BridgeResult<String> {
-        let mut stops = Vec::new();
+        let events = &mut self.events;
+        let frozen = &mut self.frozen;
         let result =
             crate::mame_owned_frames::exchange(&mut self.gdb, name, argument, budget, |raw| {
-                stops.push(raw)
+                *frozen = true;
+                events.push(stop_event(&raw));
             });
-        for raw in stops {
-            self.note_stop(raw, false);
-        }
         Ok(result?)
     }
 

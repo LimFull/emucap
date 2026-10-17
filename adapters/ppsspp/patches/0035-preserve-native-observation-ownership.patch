@@ -1,0 +1,38 @@
+diff --git a/Core/Core.cpp b/Core/Core.cpp
+index e1927314f0..7dcbbd7167 100644
+--- a/Core/Core.cpp
++++ b/Core/Core.cpp
+@@ -765,6 +765,9 @@ static bool Core_ProcessStepping(MIPSDebugInterface *cpu) {
+ 	Core_ResetException();
+ 
+ 	if (!g_cpuStepCommand.empty()) {
++		// A previous breakpoint hit does not describe this instruction. A new native
++		// breakpoint during execution will publish its own hit through Core_Break().
++		g_breakHit = BreakpointHit{};
+ 		Core_PerformCPUStep(cpu, g_cpuStepCommand.type);
+ 		g_breakReason = g_cpuStepCommand.reason;
+ 		if (g_cpuStepCommand.type == CPUStepType::Into) {
+diff --git a/Core/Debugger/WebSocket/MemorySubscriber.cpp b/Core/Debugger/WebSocket/MemorySubscriber.cpp
+index 17440608e6..989dc90ddc 100644
+--- a/Core/Debugger/WebSocket/MemorySubscriber.cpp
++++ b/Core/Debugger/WebSocket/MemorySubscriber.cpp
+@@ -588,8 +588,9 @@ static void EmucapMemoryBatch(DebuggerRequest &req) {
+         return req.Fail("invalid memory batch ranges");
+     std::string bytes;
+     uint64_t frame = 0, epoch = 0;
+-    bool success = Core_EmucapWithHaltedCPU([&](uint64_t stopEpoch) {
+-        Memory::MemoryInitedLock lock;
++    bool success = false;
++    Core_RunOnCPUThread([&] {
++      success = Core_EmucapWithHaltedCPU([&](uint64_t stopEpoch) {
+         if (!Memory::IsActive()) return false;
+         for (const auto &range : ranges)
+             if (!Memory::IsValidRange(0x08800000 + range.first, range.second)) return false;
+@@ -599,6 +600,7 @@ static void EmucapMemoryBatch(DebuggerRequest &req) {
+         epoch = stopEpoch; frame = __DisplayGetNumVblanks();
+         return true;
+     });
++    });
+     if (!success) return req.Fail("memory batch requires an inactive halted CPU and live RAM");
+     const char *digits = "0123456789abcdef";
+     std::string hex; hex.reserve(bytes.size() * 2);

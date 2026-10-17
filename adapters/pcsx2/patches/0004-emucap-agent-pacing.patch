@@ -1,11 +1,11 @@
-diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
-index 147e7b39d..41846be14 100644
---- a/pcsx2/PINE.cpp
-+++ b/pcsx2/PINE.cpp
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index 965e260..bb79c99 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
 @@ -16,6 +16,7 @@
- #include "SIO/Sio.h"
  #include "PINE.h"
  #include "VMManager.h"
+ #include "vtlb.h"
 +#include "Counters.h"
  #include "common/Error.h"
  #include "common/Image.h"
@@ -37,7 +37,7 @@ index 147e7b39d..41846be14 100644
  		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
  	};
  
-@@ -1560,6 +1565,60 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+@@ -1558,6 +1563,60 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
  					goto error;
  				break;
  			}
@@ -98,11 +98,11 @@ index 147e7b39d..41846be14 100644
  			default:
  			{
  			error:
-diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
-index e6263c565..4472a80a8 100644
---- a/pcsx2/VMManager.cpp
-+++ b/pcsx2/VMManager.cpp
-@@ -185,6 +185,10 @@ static LimiterModeType s_limiter_mode = LimiterModeType::Nominal;
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index cfc5e0e..1769e96 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -188,6 +188,10 @@ static LimiterModeType s_limiter_mode = LimiterModeType::Nominal;
  static s64 s_limiter_ticks_per_frame = 0;
  static u64 s_limiter_frame_start = 0;
  static float s_target_speed = 0.0f;
@@ -113,7 +113,7 @@ index e6263c565..4472a80a8 100644
  static bool s_target_speed_can_sync_to_host = false;
  static bool s_target_speed_synced_to_host = false;
  static bool s_use_vsync_for_timing = false;
-@@ -2122,7 +2126,7 @@ float VMManager::GetTargetSpeedForLimiterMode(LimiterModeType mode)
+@@ -2185,7 +2189,7 @@ float VMManager::GetTargetSpeedForLimiterMode(LimiterModeType mode)
  	switch (s_limiter_mode)
  	{
  		case LimiterModeType::Nominal:
@@ -122,7 +122,7 @@ index e6263c565..4472a80a8 100644
  
  		case LimiterModeType::Slomo:
  			return EmuConfig.EmulationSpeed.SlomoScalar;
-@@ -2174,8 +2178,9 @@ void VMManager::UpdateTargetSpeed()
+@@ -2237,8 +2241,9 @@ void VMManager::UpdateTargetSpeed()
  
  	const float target_frame_rate = frame_rate * target_speed;
  
@@ -133,7 +133,7 @@ index e6263c565..4472a80a8 100644
  
  	DevCon.WriteLn(fmt::format("Frame rate: {}, target speed: {}, target frame rate: {}, ticks per frame: {}", frame_rate, target_speed,
  		target_frame_rate, s_limiter_ticks_per_frame));
-@@ -2187,9 +2192,32 @@ void VMManager::UpdateTargetSpeed()
+@@ -2250,9 +2255,32 @@ void VMManager::UpdateTargetSpeed()
  		MTGS::UpdateVSyncMode();
  		SPU2::OnTargetSpeedChanged();
  		ResetFrameLimiter();
@@ -166,7 +166,7 @@ index e6263c565..4472a80a8 100644
  bool VMManager::IsTargetSpeedAdjustedToHost()
  {
  	return s_target_speed_synced_to_host;
-@@ -2224,15 +2252,20 @@ void VMManager::Internal::Throttle()
+@@ -2287,15 +2315,20 @@ void VMManager::Internal::Throttle()
  		return;
  	}
  
@@ -195,11 +195,11 @@ index e6263c565..4472a80a8 100644
  	}
  
  	// Conversion to milliseconds loses some precision; after sleeping off whole milliseconds,
-diff --git a/pcsx2/VMManager.h b/pcsx2/VMManager.h
-index e63bde004..30192bb7f 100644
---- a/pcsx2/VMManager.h
-+++ b/pcsx2/VMManager.h
-@@ -190,6 +190,14 @@ namespace VMManager
+diff --git c/pcsx2/VMManager.h i/pcsx2/VMManager.h
+index 1ecc935..a1764c6 100644
+--- c/pcsx2/VMManager.h
++++ i/pcsx2/VMManager.h
+@@ -196,6 +196,14 @@ namespace VMManager
  	/// EmuConfig.EmulationSpeed without going through the usual config apply.
  	void UpdateTargetSpeed();
  

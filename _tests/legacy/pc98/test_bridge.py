@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
 import unittest
 import zipfile
+import warnings
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -392,6 +394,60 @@ class BridgeTests(unittest.TestCase):
                         {"save_items": {"dir": "saveitems"}},
                         td,
                     )
+
+    def test_extract_save_items_portable_path_preflight(self) -> None:
+        hostile = [r"..\escape.bin", r"\escape.bin", r"C:\escape.bin", "C:escape.bin",
+                   "item.bin:stream", "NUL.bin", "COM1", "LPT9.txt", "item.", "item ",
+                   "a//b", "a/../b", "a/./b", "../escape.bin"]
+        for name in hostile:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                archive = pathlib.Path(td) / "state.zip"
+                with zipfile.ZipFile(archive, "w") as zf:
+                    zf.writestr("saveitems/manifest.txt", "")
+                    zf.writestr("saveitems/" + name, b"hostile")
+                with zipfile.ZipFile(archive) as zf:
+                    with self.assertRaises(pc98_bridge.BridgeError):
+                        pc98_bridge.Bridge._extract_save_items(zf, {"save_items": {}}, td)
+                self.assertFalse((pathlib.Path(td) / "saveitems").exists())
+
+    def test_extract_save_items_rejects_aliases_and_existing_root(self) -> None:
+        for names in [("item.bin", "ITEM.bin"), ("item.bin", "item.bin"),
+                      ("a", "a/b"), ("a/b", "A/c")]:
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as td:
+                archive = pathlib.Path(td) / "state.zip"
+                with zipfile.ZipFile(archive, "w") as zf:
+                    zf.writestr("saveitems/manifest.txt", "")
+                    for name in names:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", UserWarning)
+                            zf.writestr("saveitems/" + name, b"item")
+                with zipfile.ZipFile(archive) as zf:
+                    with self.assertRaises(pc98_bridge.BridgeError):
+                        pc98_bridge.Bridge._extract_save_items(zf, {"save_items": {}}, td)
+                self.assertFalse((pathlib.Path(td) / "saveitems").exists())
+        with tempfile.TemporaryDirectory() as td:
+            archive = pathlib.Path(td) / "state.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("saveitems/manifest.txt", "manifest")
+                zf.writestr("saveitems/sub/item_000001.bin", b"payload")
+            with zipfile.ZipFile(archive) as zf:
+                output = pc98_bridge.Bridge._extract_save_items(zf, {"save_items": {}}, td)
+                self.assertEqual((pathlib.Path(output) / "sub/item_000001.bin").read_bytes(), b"payload")
+                with self.assertRaises(pc98_bridge.BridgeError):
+                    pc98_bridge.Bridge._extract_save_items(zf, {"save_items": {}}, td)
+                self.assertEqual((pathlib.Path(output) / "manifest.txt").read_text(), "manifest")
+                self.assertIsNone(pc98_bridge.Bridge._extract_save_items(zf, {}, td))
+
+    def test_extract_save_items_rejects_zip_nul_truncation(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("saveitems/manifest.txt", "")
+            zf.writestr("saveitems/itemX.bin", b"payload")
+        raw = buffer.getvalue().replace(b"saveitems/itemX.bin", b"saveitems/item\x00.bin")
+        with tempfile.TemporaryDirectory() as td, zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            with self.assertRaises(pc98_bridge.BridgeError):
+                pc98_bridge.Bridge._extract_save_items(zf, {"save_items": {}}, td)
+            self.assertFalse((pathlib.Path(td) / "saveitems").exists())
 
     def test_atomic_restore_sled_discards_stale_save_items(self) -> None:
         regs = i386_regs_hex(eip=0x1000, cs=0)

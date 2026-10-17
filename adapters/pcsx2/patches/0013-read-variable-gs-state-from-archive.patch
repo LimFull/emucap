@@ -1,5 +1,24 @@
---- a/pcsx2/SaveState.cpp
-+++ b/pcsx2/SaveState.cpp
+diff --git c/pcsx2/GS/GS.cpp i/pcsx2/GS/GS.cpp
+index 1405b15..81981b5 100644
+--- c/pcsx2/GS/GS.cpp
++++ i/pcsx2/GS/GS.cpp
+@@ -465,10 +465,8 @@ int GSfreeze(FreezeAction mode, freezeData* data)
+ 	}
+ 	else // if (mode == FreezeAction::Load)
+ 	{
+-		// Since Defrost doesn't do a hardware reset (since it would be clearing
+-		// local memory just before it's overwritten), we have to manually wipe
+-		// out the current textures.
+-		g_gs_device->ClearCurrent();
++		// Defrost validates the complete history before its virtual Reset(true)
++		// clears current textures. Malformed data must not clear them early.
+ 
+ 		// Dump audio frames in video capture if it's been started, otherwise we get
+ 		// a buildup of audio frames from the CPU thread.
+diff --git c/pcsx2/SaveState.cpp i/pcsx2/SaveState.cpp
+index a49ffa4..f937d4a 100644
+--- c/pcsx2/SaveState.cpp
++++ i/pcsx2/SaveState.cpp
 @@ -13,6 +13,8 @@
  #include "Elfheader.h"
  #include "GS.h"
@@ -9,7 +28,7 @@
  #include "Host.h"
  #include "MTGS.h"
  #include "MTVU.h"
-@@ -643,13 +645,33 @@
+@@ -643,13 +645,33 @@ public:
  	bool IsRequired() const override { return true; }
  };
  
@@ -44,18 +63,3 @@
  	bool FreezeOut(SaveStateBase& writer) const { return SysState_ComponentFreezeOut(writer, GS); }
  	bool IsRequired() const { return true; }
  };
---- a/pcsx2/GS/GS.cpp
-+++ b/pcsx2/GS/GS.cpp
-@@ -462,10 +462,8 @@
- 	}
- 	else // if (mode == FreezeAction::Load)
- 	{
--		// Since Defrost doesn't do a hardware reset (since it would be clearing
--		// local memory just before it's overwritten), we have to manually wipe
--		// out the current textures.
--		g_gs_device->ClearCurrent();
-+		// Defrost validates the complete history before its virtual Reset(true)
-+		// clears current textures. Malformed data must not clear them early.
- 
- 		// Dump audio frames in video capture if it's been started, otherwise we get
- 		// a buildup of audio frames from the CPU thread.

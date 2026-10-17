@@ -36,7 +36,7 @@
 +    }
 +    // processPacket holds cpu_mutex; the scheduler publishes only at its debug idle gate.
 +    else if (strcmp((const char *)packet, "qEmucap,haltstate") == 0) {
-+      send_size = snprintf((char *)out_ptr, BUFMAX, "HALT|1|%s|%llx",
++      send_size = snprintf((char *)out_ptr, BUFMAX - 1, "HALT|1|%s|%llx",
 +          emucap_shared_halt_verified() ? "parked" : "running",
 +          (unsigned long long)emucap_vblank_clock.load());
      }

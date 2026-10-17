@@ -103,6 +103,42 @@ def copy(source, target):
         shutil.copy2(source, target)
 
 
+def copy_dolphin_gui(src, stage):
+    """Copy Dolphin's GUI tree without retaining build-root license links."""
+    gui = src / 'build-emucap-gui/Binaries'
+    if not gui.is_dir():
+        return
+    destination = stage / 'gui'
+    copy(gui, destination)
+    source_root = src.resolve()
+    for name in ('COPYING', 'Licenses'):
+        original = gui / name
+        packaged = destination / name
+        if not original.is_symlink():
+            continue
+        target = original.resolve(strict=True)
+        if not target.is_relative_to(source_root):
+            raise ValueError(f'Dolphin {name} link escapes its verified source tree')
+        packaged.unlink()
+        copy(target, packaged)
+
+
+def copy_pcsx2_qt_plugins(source, executable):
+    """Install the Qt plugins produced with PCSX2 beside its executable."""
+    plugins = source / 'native-dependencies' / 'pcsx2' / 'plugins'
+    xcb = plugins / 'platforms' / 'libqxcb.so'
+    if not xcb.is_file():
+        raise ValueError(f'missing PCSX2 Qt platform plugin: {xcb}')
+    destination = executable.parent / 'plugins'
+    if destination.exists():
+        raise ValueError(f'PCSX2 Qt plugin destination already exists: {destination}')
+    copy(plugins, destination)
+    qt_config = executable.parent / 'qt.conf'
+    if qt_config.exists():
+        raise ValueError(f'PCSX2 Qt configuration already exists: {qt_config}')
+    qt_config.write_text('[Paths]\nPlugins = plugins\n')
+
+
 def format_of(path):
     if not path.is_file() or path.is_symlink():
         return None
@@ -126,9 +162,15 @@ def copy_library(source, target, origins):
     return True
 
 
-def linux_dependencies(stage):
+def linux_dependencies(stage, library_dirs=()):
     lib = stage / 'lib'
     lib.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    # Resolve the complete closure against the producer's library set before
+    # system fallbacks, including dependencies discovered through system libraries.
+    paths = [str(lib.resolve()), *(str(p.resolve()) for p in library_dirs)]
+    if env.get('LD_LIBRARY_PATH'): paths.append(env['LD_LIBRARY_PATH'])
+    env['LD_LIBRARY_PATH'] = os.pathsep.join(paths)
     queue = [p for p in stage.rglob('*') if format_of(p) == 'elf']
     seen = set()
     origins = {p.resolve(): sha(p) for p in queue}
@@ -137,7 +179,7 @@ def linux_dependencies(stage):
         if binary in seen:
             continue
         seen.add(binary)
-        result = subprocess.run(['ldd', str(binary)], text=True, capture_output=True)
+        result = subprocess.run(['ldd', str(binary)], text=True, capture_output=True, env=env)
         if 'not found' in result.stdout:
             raise ValueError(f'unresolved dependency: {binary}\n{result.stdout}')
         for line in result.stdout.splitlines():
@@ -292,7 +334,8 @@ def source_archive(source, src, adapter, output, name):
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
         tracked = run('git', '-C', source, 'ls-files', 'adapters/' + adapter, 'adapters/_common',
-                      'LICENSE', 'NOTICE', 'licenses').splitlines()
+                      'LICENSE', 'NOTICE', 'licenses', '_tests/adapters/build-lock-test.sh',
+                      '_tests/native/np2kai-load-api.py', 'src/np2kai_adapter/ffi.rs').splitlines()
         if adapter == 'mame-neogeo':
             tracked += run('git', '-C', source, 'ls-files', 'adapters/mame-pc98').splitlines()
         for rel in sorted(set(tracked)):
@@ -315,12 +358,31 @@ def move_app_metadata(stage):
         metadata.unlink()
 
 
+def refresh_executable_metadata(stage, executable):
+    """Bind copied build sidecars to the final relocated executable bytes."""
+    digest = sha(executable)
+    for path in stage.rglob('*emucap*build.json'):
+        value = json.loads(path.read_text())
+        changed = False
+        for field in ('binary_sha256', 'core_sha256'):
+            if field in value:
+                value[field] = digest
+                changed = True
+        if changed:
+            path.write_text(json.dumps(value, indent=2) + '\n')
+
+
 def restore_package(directory, name, revision, stage):
     stage = stage.resolve()
     record = json.loads((directory / (name + '.json')).read_text())
     if record['source_revision'] != revision:
         raise ValueError('reused package producer revision mismatch')
-    for filename in (name + '.tar.gz', name + '-source.tar.gz'):
+    sources = [n for n in record['artifacts'] if n.endswith('-source.tar.gz')]
+    if len(sources) != 1 or set(record['artifacts']) != {name + '.tar.gz', sources[0]}:
+        raise ValueError('unexpected reused native artifact set')
+    for filename in record['artifacts']:
+        if Path(filename).name != filename or '\\' in filename:
+            raise ValueError('invalid reused native artifact name')
         if record['artifacts'].get(filename) != sha(directory / filename):
             raise ValueError(f'reused package digest mismatch: {filename}')
     with tarfile.open(directory / (name + '.tar.gz')) as archive:
@@ -340,18 +402,24 @@ def restore_package(directory, name, revision, stage):
 
 
 def main():
+    from native_provenance import Verifier, create_record
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--adapter', required=True)
     parser.add_argument('--platform', choices=['linux', 'macos'], required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--reuse', type=Path, help='Verified complete package directory to repackage without compilation')
+    parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY'))
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     version = tomllib.loads((source / 'Cargo.toml').read_text())['package']['version']
     revision = run('git', '-C', source, 'rev-parse', 'HEAD')
+    parent = None
+    if args.reuse:
+        parent = Verifier(args.repo).verify(args.reuse.resolve(), 'package', args.adapter, args.platform, source)
+        revision = parent.record['native']['source_revision']
     mac = args.platform == 'macos'
     target = 'x86_64-apple-darwin' if mac and args.adapter == 'pcsx2' else ('aarch64-apple-darwin' if mac else 'x86_64-unknown-linux-gnu')
     name = f'emucap-{version}-{args.adapter}-{target}'
@@ -360,7 +428,20 @@ def main():
     with tempfile.TemporaryDirectory(prefix='emucap-native-') as temporary:
         stage = Path(temporary).resolve() / name
         if args.reuse:
-            executable = restore_package(args.reuse.resolve(), name, revision, stage)
+            records = list(args.reuse.glob('emucap-*.json'))
+            if len(records) != 1: raise ValueError('expected one reused package record')
+            previous = json.loads(records[0].read_text())
+            if (previous['adapter'], previous['target'], previous['source_revision'], previous['packaging_revision']) != (
+                    args.adapter, target, revision, parent.record['producer']['revision']):
+                raise ValueError('reused package identity differs from authenticated producer')
+            previous_name = records[0].stem
+            if previous_name != f'emucap-{previous["version"]}-{args.adapter}-{target}':
+                raise ValueError('unexpected reused package record filename')
+            previous_stage = stage.parent / previous_name
+            executable = restore_package(args.reuse.resolve(), previous_name, revision, previous_stage)
+            relative_executable = executable.relative_to(previous_stage)
+            if previous_stage != stage: previous_stage.rename(stage)
+            executable = stage / relative_executable
         else:
             stage.mkdir()
             dest = stage / original.name if original.suffix == '.app' or original.is_file() else stage / 'runtime'
@@ -376,8 +457,9 @@ def main():
                 metadata = one(src, 'derived/**/emucap-openmsx-build.json')
                 shutil.copy2(metadata, executable.parent / metadata.name)
             if args.adapter == 'dolphin':
-                gui = src / 'build-emucap-gui/Binaries'
-                if gui.is_dir(): copy(gui, stage / 'gui')
+                copy_dolphin_gui(src, stage)
+            if args.adapter == 'pcsx2' and not mac:
+                copy_pcsx2_qt_plugins(source, executable)
             if args.adapter == 'ppsspp':
                 for extra in ('assets', 'PPSSPPSDL', 'PPSSPPSDL.app'):
                     p = binary.parent / extra
@@ -385,17 +467,14 @@ def main():
             if args.adapter.startswith('mame-'):
                 copy(src / 'hash', stage / 'hash')
         move_app_metadata(stage)
-        native_files = macho_dependencies(stage, executable) if mac else linux_dependencies(stage)
+        library_dirs = [p for p in (source / 'native-dependencies' / args.adapter / 'lib',) if p.is_dir()]
+        native_files = macho_dependencies(stage, executable) if mac else linux_dependencies(stage, library_dirs)
         for p in native_files:
             arches = run('lipo', '-archs', p) if mac else run('file', p)
             expected = 'x86_64' if mac and args.adapter == 'pcsx2' else ('arm64' if mac else 'x86-64')
             if expected not in arches:
                 raise ValueError(f'wrong architecture in {p}: {arches}')
-        for p in stage.rglob('*emucap*build.json'):
-            value = json.loads(p.read_text())
-            if 'binary_sha256' in value:
-                value['binary_sha256'] = sha(executable)
-                p.write_text(json.dumps(value, indent=2) + '\n')
+        refresh_executable_metadata(stage, executable)
         if not args.reuse:
             notices = stage / 'licenses'
             notices.mkdir()
@@ -403,12 +482,15 @@ def main():
             for p in src.iterdir():
                 if p.is_file() and any(word in p.name.lower() for word in ('license', 'copying', 'copyright', 'notice')):
                     copy(p, notices / p.name)
+            dependency_notices = source / 'native-dependencies' / args.adapter / 'share/licenses'
+            if dependency_notices.is_dir():
+                copy(dependency_notices, notices / 'dependencies')
         manifest = {'adapter': args.adapter, 'target': target, 'source_revision': revision,
                     'version': version, 'executable': executable.relative_to(stage).as_posix(),
                     'packaging_revision': run('git', '-C', Path(__file__).resolve().parent, 'rev-parse', 'HEAD'),
                     'files': files_manifest(stage)}
         if args.reuse:
-            manifest['repackaged_from_sha256'] = sha(args.reuse / (name + '.tar.gz'))
+            manifest['repackaged_from_sha256'] = sha(args.reuse / (previous_name + '.tar.gz'))
         (stage / 'NATIVE-PACKAGE.json').write_text(json.dumps(manifest, indent=2) + '\n')
         archive_path = output / (name + '.tar.gz')
         with tarfile.open(archive_path, 'w:gz', compresslevel=3) as archive:
@@ -438,7 +520,10 @@ def main():
         del restored['NATIVE-PACKAGE.json']
         assert restored == manifest['files'], 'extracted native package mismatch'
         if args.reuse:
-            sources = output / (name + '-source.tar.gz')
+            source_names = [n for n in previous['artifacts'] if n.endswith('-source.tar.gz')]
+            if len(source_names) != 1 or Path(source_names[0]).name != source_names[0]:
+                raise ValueError('invalid reused native source archive')
+            sources = output / source_names[0]
             shutil.copy2(args.reuse / sources.name, sources)
         else:
             sources = source_archive(source, src, args.adapter, output, name)
@@ -446,6 +531,8 @@ def main():
                   'artifacts': {p.name: sha(p) for p in (archive_path, sources)}}
         (output / (name + '.json')).write_text(json.dumps(record, indent=2) + '\n')
         (output / (name + '.sha256')).write_text(''.join(f'{digest}  {path}\n' for path, digest in record['artifacts'].items()))
+        create_record(output, source, 'package', args.adapter, args.platform,
+                      parents=[parent] if parent else [])
         print(json.dumps(record))
 
 

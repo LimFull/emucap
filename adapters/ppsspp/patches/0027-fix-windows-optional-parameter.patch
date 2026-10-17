@@ -1,6 +1,8 @@
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index 72ac07ee20..6540b9b0e4 100644
 --- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-@@ -104,7 +104,7 @@
+@@ -103,7 +103,7 @@ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
  	if (count == 0 || count > 5000)
  		return req.Fail("count must be between 1 and 5000");
  	std::string operation;

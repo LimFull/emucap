@@ -1,0 +1,165 @@
+--- a/src/emu/video.h
++++ b/src/emu/video.h
+@@ -11,6 +11,7 @@
+ #pragma once
+ 
+ #include <functional>
++#include <stdexcept>
+ 
+ #ifndef __EMU_H__
+ #error Dont include this file directly; include emu.h instead.
+@@ -59,10 +60,21 @@
+ 	// setters
+ 	void set_frameskip(int frameskip);
+ 	void set_throttled(bool throttled) { if (m_throttled != throttled) { m_throttled = throttled; m_throttle_resync = true; } }
+-	void set_throttle_rate(float throttle_rate) { if (m_throttle_rate != throttle_rate) { m_throttle_rate = throttle_rate; m_throttle_resync = true; } }
++	bool is_valid_throttle_rate(double rate) const;
++	void set_throttle_rate(float throttle_rate)
++	{
++		if (!is_valid_throttle_rate(throttle_rate))
++			throw std::invalid_argument("unrepresentable throttle rate");
++		if (m_throttle_rate != throttle_rate) { m_throttle_rate = throttle_rate; m_throttle_resync = true; }
++	}
+ 	void set_fastforward(bool ffwd) { if (m_fastforward != ffwd) { m_fastforward = ffwd; m_throttle_resync = true; } }
+ 	void set_output_changed() { m_output_changed = true; }
+-	void set_speed_factor(int speed) { if (m_speed != speed) { m_speed = speed; m_throttle_resync = true; } }
++	void set_speed_factor(int speed)
++	{
++		if (speed < 0)
++			throw std::invalid_argument("negative speed factor");
++		if (m_speed != speed) { m_speed = speed; m_throttle_resync = true; }
++	}
+ 	// Called at bounded intervals while a throttle wait sleeps; returning true ends the wait so the
+ 	// frame can finish and queued control requests are serviced without waiting a full frame.
+ 	void set_throttle_wait_hook(std::function<bool ()> &&hook) { m_throttle_wait_hook = std::move(hook); }
+--- a/src/emu/video.cpp
++++ b/src/emu/video.cpp
+@@ -33,6 +33,7 @@
+ #include <cstdio>
+ 
+ #include <limits>
++#include <cmath>
+ 
+ 
+ //**************************************************************************
+@@ -670,6 +671,42 @@
+ //  natural speed
+ //-------------------------------------------------
+ 
++// Validate the narrowed native float before any float-to-integer conversion. The upper
++// duration bound comes from attotime's representation, not the public speed-request range.
++static attoseconds_t checked_throttle_period(double rate, osd_ticks_t frequency)
++{
++	if (!std::isfinite(rate) || rate <= 0 || rate >= ATTOTIME_MAX_SECONDS || !frequency)
++		return 0;
++	float const native_rate = float(rate);
++	if (!(native_rate > 0 && native_rate < ATTOTIME_MAX_SECONDS))
++		return 0;
++	double const period = double(ATTOSECONDS_PER_SECOND / frequency) * double(native_rate);
++	if (!(period >= 1.0 && period < double(std::numeric_limits<attoseconds_t>::max())))
++		return 0;
++	return attoseconds_t(period);
++}
++
++// attotime(0, attoseconds) does not normalize; construct a subsecond value or a checked
++// full duration. Never multiply ticks by period in an integer when the product can overflow.
++static bool throttle_elapsed(osd_ticks_t ticks, attoseconds_t period, attotime &elapsed)
++{
++	if (ticks <= osd_ticks_t((ATTOSECONDS_PER_SECOND - 1) / period))
++	{
++		elapsed = attotime(0, ticks * period);
++		return true;
++	}
++	double const seconds = double(ticks) * double(period) / double(ATTOSECONDS_PER_SECOND);
++	if (!(seconds >= 0 && seconds < ATTOTIME_MAX_SECONDS))
++		return false;
++	elapsed = attotime::from_double(seconds);
++	return true;
++}
++
++bool video_manager::is_valid_throttle_rate(double rate) const
++{
++	return checked_throttle_period(rate, osd_ticks_per_second()) != 0;
++}
++
+ void video_manager::update_throttle(attotime emutime)
+ {
+ /*
+@@ -722,7 +759,9 @@
+ 
+ 		// compute conversion factors up front
+ 		osd_ticks_t ticks_per_second = osd_ticks_per_second();
+-		attoseconds_t attoseconds_per_tick = ATTOSECONDS_PER_SECOND / ticks_per_second * m_throttle_rate;
++		attoseconds_t const attoseconds_per_tick = checked_throttle_period(m_throttle_rate, ticks_per_second);
++		if (!attoseconds_per_tick)
++			break;
+ 
+ 		// if we're paused, emutime will not advance; instead, we subtract a fixed
+ 		// amount of time (1/60th of a second) from the emulated time that was passed in,
+@@ -767,15 +806,17 @@
+ 		}
+ 
+ 		// convert this value into attoseconds for easier comparison
+-		attoseconds_t real_delta_attoseconds = diff_ticks * attoseconds_per_tick;
++		attotime real_delta;
++		if (!throttle_elapsed(diff_ticks, attoseconds_per_tick, real_delta))
++			break;
+ 
+ 		// now update our real and emulated timers with the current values
+ 		m_throttle_emutime = emutime;
+-		m_throttle_realtime += attotime(0, real_delta_attoseconds);
++		m_throttle_realtime += real_delta;
+ 
+ 		// keep a history of whether or not emulated time beat real time over the last few
+ 		// updates; this can be used for future heuristics
+-		m_throttle_history = (m_throttle_history << 1) | (emu_delta_attoseconds > real_delta_attoseconds);
++		m_throttle_history = (m_throttle_history << 1) | (emu_delta > real_delta);
+ 
+ 		// determine how far ahead real time is versus emulated time; note that we use the
+ 		// accumulated times for this instead of the deltas for the current update because
+@@ -800,18 +841,27 @@
+ 			return;
+ 
+ 		// compute the target real time, in ticks, where we want to be
+-		osd_ticks_t const ahead_ticks = (real_is_ahead_seconds >= 1.0)
+-				? osd_ticks_t(real_is_ahead_seconds * double(ticks_per_second) / double(m_throttle_rate))
+-				: osd_ticks_t(real_is_ahead_attoseconds / attoseconds_per_tick);
+-		osd_ticks_t target_ticks = m_throttle_last_ticks + ahead_ticks;
++		osd_ticks_t ahead_ticks;
++		if (real_is_ahead_seconds >= 1.0)
++		{
++			double const wait_ticks = real_is_ahead_seconds * double(ticks_per_second) / double(m_throttle_rate);
++			if (!(wait_ticks >= 0 && wait_ticks < double(std::numeric_limits<osd_ticks_t>::max())))
++				break;
++			ahead_ticks = osd_ticks_t(wait_ticks);
++		}
++		else
++			ahead_ticks = osd_ticks_t(real_is_ahead_attoseconds / attoseconds_per_tick);
++		if (ahead_ticks > std::numeric_limits<osd_ticks_t>::max() - m_throttle_last_ticks)
++			break;
++		osd_ticks_t const target_ticks = m_throttle_last_ticks + ahead_ticks;
+ 
+ 		// throttle until we read the target, and update real time to match the final time
+ 		diff_ticks = throttle_until_ticks(target_ticks) - m_throttle_last_ticks;
+ 		m_throttle_last_ticks += diff_ticks;
+-		// a wait of one second or more does not fit a single attoseconds field
+-		m_throttle_realtime += (diff_ticks < ticks_per_second)
+-				? attotime(0, diff_ticks * attoseconds_per_tick)
+-				: attotime::from_double(double(diff_ticks) * double(attoseconds_per_tick) / double(ATTOSECONDS_PER_SECOND));
++		attotime waited;
++		if (!throttle_elapsed(diff_ticks, attoseconds_per_tick, waited))
++			break;
++		m_throttle_realtime += waited;
+ 		return;
+ 	}
+ 
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -2222,6 +2222,7 @@
+ 	video_type["speed_factor"] = sol::property(&video_manager::speed_factor, &video_manager::set_speed_factor);
+ 	video_type["throttled"] = sol::property(&video_manager::throttled, &video_manager::set_throttled);
+ 	video_type["throttle_rate"] = sol::property(&video_manager::throttle_rate, &video_manager::set_throttle_rate);
++	video_type.set_function("is_valid_throttle_rate", &video_manager::is_valid_throttle_rate);
+ 	video_type["frameskip"] = sol::property(&video_manager::frameskip, &video_manager::set_frameskip);
+ 	video_type["fastforward"] = sol::property(&video_manager::fastforward);
+ 	video_type.set_function("set_throttle_wait_hook",

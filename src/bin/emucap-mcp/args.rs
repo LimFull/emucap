@@ -1,3 +1,12 @@
+fn two() -> u64 {
+    2
+}
+fn tap_press_schema_default(schema: &mut schemars::Schema) {
+    schema.insert("default".into(), serde_json::json!(2));
+}
+fn tap_after_schema_default(schema: &mut schemars::Schema) {
+    schema.insert("default".into(), serde_json::json!(1));
+}
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
@@ -558,23 +567,73 @@ pub(crate) struct PulseTouchArgs {
     pub(crate) frames: u64,
 }
 
-fn two() -> u64 {
-    2
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TapTiming {
+    pub(crate) unit: StepUnit,
+    #[serde(deserialize_with = "deser_input_frames")]
+    pub(crate) press: u64,
+    #[serde(default, deserialize_with = "deser_frame_count")]
+    pub(crate) after: u64,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TapArgs {
+    /// Raw controller axes from full status, held together with buttons.
+    #[serde(default)]
+    pub(crate) axes: std::collections::BTreeMap<String, i64>,
     #[serde(default)]
     pub(crate) port: u64,
-    /// Buttons/keys pressed together for the entire press_frames duration.
     pub(crate) buttons: Vec<String>,
-    /// Frames to hold all buttons/keys before release, including long holds. Default: 2.
-    #[serde(default = "two", deserialize_with = "deser_input_frames")]
-    pub(crate) press_frames: u64,
-    /// Frames to advance after release. Default: 0. A positive value composes
-    /// input and observation in one call while preserving frozen state.
-    #[serde(default, deserialize_with = "deser_frame_count")]
-    pub(crate) after_frames: u64,
+    /// Frames to hold input. Default: 2.
+    #[serde(default, deserialize_with = "deser_optional_count")]
+    #[schemars(transform = tap_press_schema_default)]
+    pub(crate) press_frames: Option<u64>,
+    /// Frames after release. Default: 1. Use 0 for consecutive TAS inputs.
+    #[serde(default, deserialize_with = "deser_optional_count")]
+    #[schemars(transform = tap_after_schema_default)]
+    pub(crate) after_frames: Option<u64>,
+    /// Explicit frames or advertised input_polls timing; replaces both frame arguments.
+    #[serde(default)]
+    pub(crate) timing: Option<TapTiming>,
+}
+impl TapArgs {
+    pub(crate) fn resolved_timing(
+        &self,
+    ) -> Result<(StepUnit, u64, u64), emucap::live::link::LinkError> {
+        let (unit, press, after) = match &self.timing {
+            Some(t) if self.press_frames.is_none() && self.after_frames.is_none() => {
+                (t.unit, t.press, t.after)
+            }
+            Some(_) => {
+                return Err(emucap::live::link::LinkError::Emulator {
+                    kind: "bad_params".into(),
+                    message: "timing replaces press_frames and after_frames".into(),
+                })
+            }
+            None => (
+                StepUnit::Frames,
+                self.press_frames.unwrap_or(2),
+                self.after_frames.unwrap_or(1),
+            ),
+        };
+        if !matches!(unit, StepUnit::Frames | StepUnit::InputPolls)
+            || press == 0
+            || press > MAX_SYNC_ADVANCE_COUNT
+            || after > MAX_SYNC_ADVANCE_COUNT
+        {
+            return Err(emucap::live::link::LinkError::Emulator{kind:"bad_params".into(),message:"tap requires frames or input_polls, positive press, and durations within the synchronous limit".into()});
+        }
+        Ok((unit, press, after))
+    }
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadInputPollsArgs {
+    #[serde(default)]
+    pub(crate) after_sequence: u64,
+    #[serde(default)]
+    pub(crate) limit: Option<u64>,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -930,7 +989,7 @@ pub(crate) struct LaunchPlanArgs {
     pub(crate) indirect_media_approval: Option<emucap::content_identity::IndirectMediaApproval>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LaunchArgs {
     /// Required ROM, disc, or disk path. launch performs execution, not planning.
@@ -1063,4 +1122,75 @@ pub(crate) struct SnapshotReceiptArgs {
     /// Optional expected source launch. Omission verifies historical integrity only.
     #[serde(default)]
     pub(crate) expected_launch_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tap_duration_tests {
+    use super::*;
+    #[test]
+    fn release_duration_is_explicit_and_zero_remains_available() {
+        let ordinary: TapArgs =
+            serde_json::from_value(serde_json::json!({"buttons":["a"]})).unwrap();
+        assert_eq!(
+            ordinary.resolved_timing().unwrap(),
+            (StepUnit::Frames, 2, 1)
+        );
+        let tas:TapArgs=serde_json::from_value(serde_json::json!({"buttons":[],"axes":{"stick_x":37},"press_frames":1,"after_frames":0})).unwrap();
+        assert_eq!(tas.resolved_timing().unwrap(), (StepUnit::Frames, 1, 0));
+        assert_eq!(tas.axes["stick_x"], 37);
+
+        let schema = serde_json::to_value(schemars::schema_for!(TapArgs)).unwrap();
+        assert_eq!(schema["properties"]["press_frames"]["default"], 2);
+        assert_eq!(schema["properties"]["after_frames"]["default"], 1);
+    }
+}
+
+#[cfg(test)]
+mod tap_clock_tests {
+    use super::*;
+    #[test]
+    fn explicit_clock_rejects_mixing_and_invalid_durations() {
+        let good: TapArgs = serde_json::from_value(
+            serde_json::json!({"buttons":[],"timing":{"unit":"input_polls","press":1}}),
+        )
+        .unwrap();
+        assert_eq!(
+            good.resolved_timing().unwrap(),
+            (StepUnit::InputPolls, 1, 0)
+        );
+        for extra in [
+            serde_json::json!({"press_frames":1}),
+            serde_json::json!({"after_frames":0}),
+        ] {
+            let mut value =
+                serde_json::json!({"buttons":[],"timing":{"unit":"input_polls","press":1}});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(serde_json::from_value::<TapArgs>(value)
+                .unwrap()
+                .resolved_timing()
+                .is_err());
+        }
+        for timing in [
+            serde_json::json!({"unit":"instructions","press":1}),
+            serde_json::json!({"unit":"input_polls","press":0}),
+        ] {
+            assert!(serde_json::from_value::<TapArgs>(
+                serde_json::json!({"buttons":[],"timing":timing})
+            )
+            .unwrap()
+            .resolved_timing()
+            .is_err());
+        }
+        assert!(serde_json::from_value::<TapArgs>(
+            serde_json::json!({"buttons":[],"press_frames":MAX_SYNC_ADVANCE_COUNT+1})
+        )
+        .is_err());
+    }
+}
+
+fn deser_optional_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    deser_frame_count(d).map(Some)
 }

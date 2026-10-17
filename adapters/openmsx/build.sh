@@ -252,7 +252,11 @@ JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
       # bindist's destination is already relative. Keep its child directories
       # relative too: MSYS otherwise rewrites /share and /doc to drive paths
       # before native Python concatenates them with the staging destination.
-      if ! make -j "$JOBS" staticbindist INSTALL_SHARE_DIR=share INSTALL_DOC_DIR=doc; then
+      # The published Windows payload is x86_64. On Windows ARM, upstream's
+      # host probe otherwise selects an aarch64 cross compiler even when this
+      # recipe is running in the MINGW64 toolchain.
+      if ! make -j "$JOBS" staticbindist OPENMSX_TARGET_CPU=x86_64 \
+        INSTALL_SHARE_DIR=share INSTALL_DOC_DIR=doc; then
         find derived -path '*/config/probe.log' -type f -exec cat {} \;
         exit 1
       fi

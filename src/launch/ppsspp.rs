@@ -8,7 +8,7 @@ use super::{
     find_on_path, is_runnable_file, process_alive, spawn_detached, terminate_detached, LaunchSpec,
 };
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -163,16 +163,98 @@ fn wait_survives(pid: u32, settle: Duration, on_exit: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Wait for PPSSPP's debugger WebSocket port to accept a TCP connection. Unlike the NDS bridge
-/// (whose `GdbRspClient` retries the GDB stubs for 30s on its own), `emucap-ppsspp-bridge`'s
+#[cfg(target_os = "linux")]
+fn process_owns_listening_port(pid: u32, port: u16) -> io::Result<bool> {
+    let mut listening_sockets = std::collections::HashSet::new();
+    let contents = std::fs::read_to_string("/proc/net/tcp")?;
+    for line in contents.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() <= 9 || fields[3] != "0A" {
+            continue;
+        }
+        let Some((encoded_address, encoded_port)) = fields[1].rsplit_once(':') else {
+            continue;
+        };
+        if encoded_address == "0100007F" && u16::from_str_radix(encoded_port, 16).ok() == Some(port)
+        {
+            listening_sockets.insert(format!("socket:[{}]", fields[9]));
+        }
+    }
+    if listening_sockets.is_empty() {
+        return Ok(false);
+    }
+
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let Ok(target) = std::fs::read_link(entry?.path()) else {
+            continue;
+        };
+        if listening_sockets.contains(target.to_string_lossy().as_ref()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn process_owns_listening_port(pid: u32, port: u16) -> io::Result<bool> {
+    let pid = pid.to_string();
+    let endpoint = format!("-iTCP@127.0.0.1:{port}");
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", &pid, &endpoint, "-sTCP:LISTEN"])
+        .output()?;
+    Ok(output.status.success() && !output.stdout.is_empty())
+}
+
+#[cfg(windows)]
+fn process_owns_listening_port(pid: u32, port: u16) -> io::Result<bool> {
+    let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "SystemRoot is unavailable for debugger listener ownership verification",
+        )
+    })?;
+    let output = std::process::Command::new(
+        PathBuf::from(system_root)
+            .join("System32")
+            .join("netstat.exe"),
+    )
+    .args(["-ano", "-p", "tcp"])
+    .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "netstat failed while verifying debugger listener ownership",
+        ));
+    }
+    let expected_pid = pid.to_string();
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.len() >= 5
+            && fields[0].eq_ignore_ascii_case("TCP")
+            && fields[3].eq_ignore_ascii_case("LISTENING")
+            && fields[4] == expected_pid
+            && fields[1]
+                .rsplit_once(':')
+                .is_some_and(|(host, value)| host == "127.0.0.1" && value.parse() == Ok(port))
+    }))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn process_owns_listening_port(_pid: u32, _port: u16) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "debugger listener ownership verification is unsupported on this platform",
+    ))
+}
+
+/// Wait until the spawned PPSSPP process itself owns the debugger WebSocket listener. Unlike the
+/// NDS bridge (whose `GdbRspClient` retries the GDB stubs for 30s on its own),
+/// `emucap-ppsspp-bridge`'s
 /// `TungsteniteWs::connect` makes exactly one connection attempt and fails immediately — so if the
 /// launcher spawned the bridge before PPSSPP opened the port, the bridge would die on a bare
-/// liveness-only settle (verified: `wait_survives`'s 2s process-liveness check alone is not a
-/// readiness check). Empirically the port opens within ~1s of spawn even against a 1.4GB ISO (the
-/// debugger listener starts before any disc I/O — `--debugger` forces `startBreak=true` ahead of
-/// boot), so this polls briefly rather than trusting timing.
+/// liveness-only settle. Ownership, rather than a TCP connect probe, is security-critical: an
+/// unrelated loopback listener must never receive the bridge's bearer token. Linux verifies socket
+/// inodes through procfs without `lsof`; macOS and Windows use their platform listener tables.
 fn wait_ws_ready(pid: u32, port: u16, timeout: Duration) -> io::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let deadline = Instant::now() + timeout;
     loop {
         if !process_alive(pid) {
@@ -180,12 +262,18 @@ fn wait_ws_ready(pid: u32, port: u16, timeout: Duration) -> io::Result<()> {
                 "PPSSPPHeadless exited before opening the debugger WebSocket port (crashed — check the launch log)",
             ));
         }
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return Ok(());
+        match process_owns_listening_port(pid, port) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "could not verify that PPSSPPHeadless owns debugger port {port}: {error}"
+                )));
+            }
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "PPSSPPHeadless did not open the debugger WebSocket port {port} within {timeout:?} (the bridge has no connect retry — check the launch log)"
+                "PPSSPPHeadless did not own debugger WebSocket port {port} within {timeout:?} (refusing to release the bearer token to an unrelated listener; check the launch log)"
             )));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -203,15 +291,14 @@ fn wait_ws_ready(pid: u32, port: u16, timeout: Duration) -> io::Result<()> {
 ///   seconds regardless of debugger/WebSocket activity — it is never passed here. Omitting it lets
 ///   PPSSPPHeadless run with no wall-clock deadline while the debugger remains interactive.
 ///
-/// Per-port emucap-owned profile environment for the PPSSPP process, so a session — headless *or* a
+/// Generation-owned profile environment for the PPSSPP process, so a session — headless *or* a
 /// HITL `display:true` window the human plays with PPSSPP's own control mappings — reads and writes
 /// only isolated per-session state, never the operator's real PPSSPP config/saves. Applied to both
 /// the headless and GUI specs (uniform; harmless where a var is unused). Three redirects, because
 /// The maintained GUI and headless producers honor EMUCAP_PPSSPP_MEMSTICK before
 /// creating system directories. HOME and the XDG roots also isolate auxiliary
 /// configuration. Each managed generation supplies its own memory-stick root.
-fn isolation_env(port: u16) -> Vec<(String, String)> {
-    let home = super::emu_home_dir("ppsspp", port);
+fn isolation_env(home: &Path) -> Vec<(String, String)> {
     let memstick = home.join("memstick");
     // `mut` is used only on non-macOS, where the XDG vars are pushed below.
     #[cfg_attr(target_os = "macos", allow(unused_mut))]
@@ -236,34 +323,59 @@ fn isolation_env(port: u16) -> Vec<(String, String)> {
     env
 }
 
+fn prepare_profile(l: &Launch<'_>) -> io::Result<PathBuf> {
+    let home = super::emu_generation_dir("ppsspp", l.port, l.runtime)?;
+    crate::private_fs::ensure_private_dir_tree(&home, &home.join("memstick"))?;
+    Ok(home)
+}
+
 /// Display (HITL) mode launches the `PPSSPPSDL` GUI build with the same `--debugger=<port>` and
 /// positional content, but omits `--graphics=software` so the window renders with the real GPU
-/// backend (Vulkan/GL). The GUI honors `--debugger=<port>` via the repo fork patch
-/// (`patches/0005-emucap-gui-debugger-port.patch`): it pins `iRemoteISOPort` to that port and arms
+/// backend (Vulkan/GL). Upstream command-line handling honors `--debugger=<port>`:
+/// it pins `iRemoteISOPort` to that port and arms
 /// `bRemoteDebuggerOnStartup`, so the debugger WebServer binds the requested loopback port at boot.
 /// Unlike headless, the GUI does not set `startBreak`, so the game boots running and the human can
-/// play immediately while the agent attaches. Both modes run under an isolated per-port profile
+/// play immediately while the agent attaches. Both modes run under an isolated generation profile
 /// (`isolation_env`) so a session never reads or pollutes the operator's real PPSSPP config/saves.
-fn emu_spec(l: &Launch, ws_port: u16) -> LaunchSpec {
-    let mut spec = LaunchSpec::new(l.binary, l.log_path).arg(format!("--debugger={ws_port}"));
-    for (k, v) in isolation_env(l.port) {
+fn emu_spec(
+    l: &Launch,
+    profile_home: &Path,
+    ws_port: u16,
+    native_debug_token: &str,
+) -> io::Result<LaunchSpec> {
+    let mut spec = LaunchSpec::new(l.binary, l.log_path)
+        .arg(format!("--debugger={ws_port}"))
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_debug_token);
+    for (k, v) in isolation_env(profile_home) {
         spec = spec.env(k, v);
     }
-    if l.display {
+    Ok(if l.display {
         spec.arg(l.content)
     } else {
         spec.arg("--graphics=software").arg(l.content)
+    })
+}
+
+fn validate_session_token(l: &Launch) -> io::Result<()> {
+    if l.session_token.is_some_and(|token| !token.is_empty()) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EMUCAP_SESSION_TOKEN is required and must be non-empty for PPSSPP",
+        ))
     }
 }
 
 /// The bridge that relays the debugger WebSocket to emucap on `l.port`. Mirrors `launch.sh`:
 /// `emucap-ppsspp-bridge <port> <ws_port>` with `EMUCAP_*` env (content/name/session token —
 /// `PpssppBridge::new` reads `EMUCAP_CONTENT` itself for `get_rom_info`'s sha1/size).
-fn bridge_spec(l: &Launch, ws_port: u16) -> LaunchSpec {
+fn bridge_spec(l: &Launch, ws_port: u16, native_debug_token: &str) -> LaunchSpec {
     let mut spec = LaunchSpec::new(l.bridge, l.log_path)
         .arg(l.port.to_string())
         .arg(ws_port.to_string())
-        .env("EMUCAP_CONTENT", l.content);
+        .env("EMUCAP_CONTENT", l.content)
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_debug_token);
     if let Some(name) = l.name {
         spec = spec.env("EMUCAP_NAME", name);
     }
@@ -279,16 +391,15 @@ fn bridge_spec(l: &Launch, ws_port: u16) -> LaunchSpec {
 /// (rather than an opaque bridge connect failure). If the bridge spawn/settle fails, the launcher
 /// terminates PPSSPP.
 pub fn launch(l: &Launch) -> io::Result<Launched> {
+    validate_session_token(l)?;
+    let profile_home = prepare_profile(l)?;
+    let native_debug_token = new_native_debug_token();
     let ws_res = resolve_ws_port()?;
     let ws_port = ws_res.port;
     // Free the reserved port for PPSSPP to bind before spawning it.
     drop(ws_res);
 
-    // Pre-create the isolated per-port profile so PPSSPP writes its config/saves there from the
-    // first boot, never the operator's real profile (see `isolation_env`).
-    let _ = std::fs::create_dir_all(super::emu_home_dir("ppsspp", l.port).join("memstick"));
-
-    let ppsspp_pid = spawn_detached(&emu_spec(l, ws_port))?;
+    let ppsspp_pid = spawn_detached(&emu_spec(l, &profile_home, ws_port, &native_debug_token)?)?;
     // PPSSPP PID를 spawn 직후 즉시 기록한다 — 이후 단계(WS 대기·bridge spawn)가 실패해 종료 처리로
     // 넘어가도, terminate가 혹시 놓친 프로세스를 status.owned_instance가 이 pidfile로 찾아 정리할 수
     // 있게 한다. 성공 시 bridge.pid는 아래에서 추가 기록한다.
@@ -310,7 +421,8 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
         let _ = terminate_detached(ppsspp_pid);
         return Err(e);
     }
-    let bridge = match bridge_spec(l, ws_port).emulator_dependency(ppsspp_pid) {
+    let bridge = match bridge_spec(l, ws_port, &native_debug_token).emulator_dependency(ppsspp_pid)
+    {
         Ok(spec) => spec,
         Err(e) => {
             let _ = terminate_detached(ppsspp_pid);
@@ -343,7 +455,15 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
     })
 }
 
-/// per-port pidfile을 RUN_DIR(log_path의 부모)에 기록한다(legacy launch.sh와 동일 규약). status가 이걸 읽어
+fn new_native_debug_token() -> String {
+    format!(
+        "native-{}{}",
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase()
+    )
+}
+
+/// generation pidfile을 RUN_DIR(log_path의 부모)에 기록한다. status가 이걸 읽어
 /// 소유 인스턴스 PID를 재발견하므로, agent가 launch 응답을 지나쳐도(다음 턴 등) 자기 것만 kill할 수 있다.
 fn write_pidfile(log_path: &Path, name: &str, pid: u32) {
     if let Some(run_dir) = log_path.parent() {

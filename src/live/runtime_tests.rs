@@ -516,6 +516,16 @@ fn compatibility_files_share_the_private_runtime_root() {
         .write_compatibility_token(47808, "compatibility-token")
         .unwrap();
     store
+        .write_broker_controller_token(47808, "controller-secret")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_broker_controller_token(47808)
+            .unwrap()
+            .as_deref(),
+        Some("controller-secret")
+    );
+    store
         .write_persisted_port("0123456789abcdef-1234", 47800, 47808)
         .unwrap();
 
@@ -533,11 +543,25 @@ fn compatibility_files_share_the_private_runtime_root() {
         .compatibility_token_path(47808)
         .starts_with(store.root()));
 
+    // Compatibility data is written during bootstrap, before the first launch. It must build the
+    // runtime tree from its private root so a later generation does not reject a parent that the
+    // token writer itself created with ambient permissions.
+    let prepared = store.prepare(47808).unwrap();
+    assert!(prepared.generation_dir().is_dir());
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        for directory in [
+            store.root().to_path_buf(),
+            store.root().join("compatibility"),
+        ] {
+            let mode = fs::metadata(directory).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
         for path in [
             store.compatibility_token_path(47808),
+            store.broker_controller_token_path(47808),
             store
                 .persisted_port_path("0123456789abcdef-1234", 47800)
                 .unwrap(),

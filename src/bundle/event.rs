@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -260,11 +259,17 @@ pub fn validate_event_stream(
     registry: &EventContractRegistry,
     spec: &EventValidationSpec,
 ) -> Result<EventStreamReport, EventValidationError> {
-    validate_event_stream_at_start(path, registry, spec, None, &BTreeSet::new())
+    validate_event_stream_at_start(
+        crate::path_safety::open_regular_file_no_follow(path)?,
+        registry,
+        spec,
+        None,
+        &BTreeSet::new(),
+    )
 }
 
 pub(crate) fn validate_event_stream_at_start(
-    path: &Path,
+    file: std::fs::File,
     registry: &EventContractRegistry,
     spec: &EventValidationSpec,
     observation_anchor: Option<&ObservationStartFacts>,
@@ -351,7 +356,6 @@ pub(crate) fn validate_event_stream_at_start(
         }
     }
 
-    let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(8192, file);
     let mut hasher = Sha256::new();
     let mut physical_bytes = 0_u64;

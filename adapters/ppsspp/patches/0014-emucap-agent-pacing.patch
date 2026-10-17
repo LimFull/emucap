@@ -1,16 +1,17 @@
 diff --git a/Core/Core.cpp b/Core/Core.cpp
-index 41117105c4..5fc08c603a 100644
+index 98fd6698d2..3551e51b32 100644
 --- a/Core/Core.cpp
 +++ b/Core/Core.cpp
-@@ -38,6 +38,7 @@
- #include "Core/Debugger/Breakpoints.h"
- #include "Core/MIPS/MIPS.h"
+@@ -46,6 +46,8 @@
  #include "Core/MIPS/MIPSAnalyst.h"
+ #include "Core/HLE/sceKernelModule.h"
+ #include "Core/HLE/sceKernelThread.h"
 +#include "Core/HLE/sceDisplay.h"
- #include "Core/HLE/sceNetAdhoc.h"
++#include "Core/HLE/sceNetAdhoc.h"
  #include "Core/MIPS/MIPSTracer.h"
+ #include "Core/CoreTiming.h"
  
-@@ -562,6 +563,9 @@ void Core_Resume() {
+@@ -812,6 +814,9 @@ void Core_Resume() {
  
  	// Clear the exception if we resume.
  	Core_ResetException();
@@ -19,13 +20,13 @@ index 41117105c4..5fc08c603a 100644
 +	__DisplaySetWasPaused();
  	coreState = CORE_RUNNING_CPU;
  	g_breakReason = BreakReason::None;
- 	g_breakRelatedAddress = 0;
+ 	Core_WakeIdleCPUThread();
 diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-index eb97132565..8fc0fd8aff 100644
+index 3e9c01cb5b..d6407f656a 100644
 --- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-@@ -23,7 +23,10 @@
- #include "Core/Core.h"
+@@ -24,7 +24,10 @@
+ #include "Core/CoreTiming.h"
  #include "Core/HLE/HLE.h"
  #include "Core/HW/Display.h"
 +#include "Core/HLE/sceDisplay.h"
@@ -35,23 +36,23 @@ index eb97132565..8fc0fd8aff 100644
  #include "Core/MIPS/MIPSDebugInterface.h"
  #include "Core/MIPS/MIPSStackWalk.h"
  
-@@ -43,6 +46,7 @@ struct WebSocketSteppingState : public DebuggerSubscriber {
- 	void RunUntil(DebuggerRequest &req);
+@@ -42,6 +45,7 @@ struct WebSocketSteppingState : public DebuggerSubscriber {
+ 	void RunUntilTime(DebuggerRequest &req);
  	void HLE(DebuggerRequest &req);
  	void Frame(DebuggerRequest &req);
 +	void Pacing(DebuggerRequest &req);
  
  protected:
  	uint32_t GetNextAddress(DebugInterface *cpuDebug);
-@@ -59,6 +63,7 @@ DebuggerSubscriber *WebSocketSteppingInit(DebuggerEventHandlerMap &map) {
- 	map["cpu.runUntil"] = [p](DebuggerRequest &req) { p->RunUntil(req); };
+@@ -58,6 +62,7 @@ DebuggerSubscriber *WebSocketSteppingInit(DebuggerEventHandlerMap &map) {
+ 	map["cpu.runUntilTime"] = [p](DebuggerRequest &req) { p->RunUntilTime(req); };
  	map["cpu.nextHLE"]  = [p](DebuggerRequest &req) { p->HLE(req); };
  	map["emucap.frameStep"] = [p](DebuggerRequest &req) { p->Frame(req); };
 +	map["emucap.pacing"] = [p](DebuggerRequest &req) { p->Pacing(req); };
  	return p;
  }
  
-@@ -84,16 +89,19 @@ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
+@@ -83,16 +88,19 @@ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
  
  	Core_Resume();
  	EmucapFrameStepResult result = Core_EmucapWaitFrameStep(240000);
@@ -74,7 +75,7 @@ index eb97132565..8fc0fd8aff 100644
  	json.writeString("unit", "frames");
  	json.writeUint("count", result.requested);
  	json.writeUint("completed", result.completed);
-@@ -102,6 +110,51 @@ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
+@@ -101,6 +109,51 @@ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
  	json.writeString("state", "frozen");
  }
  
@@ -158,7 +159,7 @@ index 79a6e46f6c..d6331412ef 100644
  
  #if PPSSPP_PLATFORM(WINDOWS)
 diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
-index c9c75946f7..37cd66d389 100644
+index 95ee78a00c..505a14a164 100644
 --- a/Core/HLE/sceDisplay.cpp
 +++ b/Core/HLE/sceDisplay.cpp
 @@ -15,6 +15,7 @@
@@ -169,10 +170,12 @@ index c9c75946f7..37cd66d389 100644
  #include <algorithm>
  #include <cmath>
  #include <map>
-@@ -357,8 +358,25 @@ void __DisplaySetWasPaused() {
+@@ -386,8 +387,25 @@ void __DisplaySetWasPaused() {
  	wasPaused = true;
  }
  
+-// TODO: Should return 59.997?
+-static int FrameTimingLimit() {
 +static std::atomic<int> emucapSpeedPercent{100};
 +static std::atomic<uint32_t> emucapPacingGeneration{0};
 +
@@ -189,24 +192,27 @@ index c9c75946f7..37cd66d389 100644
 +	return emucapPacingGeneration;
 +}
 +
- // TOOD: Should return 59.997?
--static int FrameTimingLimit() {
++// TOOD: Should return 59.997?
 +// Frames per second; 0 is unthrottled. The normal limit follows the emucap agent speed.
 +static double FrameTimingLimit() {
  	if (!NetworkAllowSpeedControl()) {
  		return 60;
  	}
-@@ -384,7 +402,8 @@ static int FrameTimingLimit() {
- 		return fixRate(g_Config.iFpsLimit2);
- 	if (PSP_CoreParameter().fpsLimit == FPSLimit::ANALOG)
+@@ -415,10 +433,11 @@ static int FrameTimingLimit() {
  		return fixRate(PSP_CoreParameter().analogFpsLimit);
+ 	if (PSP_CoreParameter().fpsLimit == FPSLimit::DEBUGGER)
+ 		return fixRate(PSP_CoreParameter().debuggerFpsLimit);
 -	return framerate;
 +	const int percent = emucapSpeedPercent;
 +	return percent == 0 ? 0.0 : framerate * percent / 100.0;
  }
  
- static bool FrameTimingThrottled() {
-@@ -484,10 +503,10 @@ static void DoFrameIdleTiming() {
+-int __DisplayGetFrameTimingLimit() {
++double __DisplayGetFrameTimingLimit() {
+ 	return FrameTimingLimit();
+ }
+ 
+@@ -519,10 +538,10 @@ static void DoFrameIdleTiming() {
  	}
  
  	float scaledVblank = timePerVblank;
@@ -219,7 +225,7 @@ index c9c75946f7..37cd66d389 100644
  	}
  
  	// If we have over at least a vblank of spare time, maintain at least 30fps in delay.
-@@ -681,7 +700,7 @@ void __DisplayFlip(int cyclesLate) {
+@@ -717,7 +736,7 @@ void __DisplayFlip(int cyclesLate) {
  
  	float scaledTimestep = (float)numVBlanksSinceFlip * timePerVblank;
  	if (fpsLimit > 0 && fpsLimit != framerate) {
@@ -228,7 +234,7 @@ index c9c75946f7..37cd66d389 100644
  	}
  	bool skipFrame;
  	DoFrameTiming(throttle, &skipFrame, scaledTimestep, nextFrame);
-@@ -758,10 +777,10 @@ void hleLagSync(u64 userdata, int cyclesLate) {
+@@ -811,10 +830,10 @@ void hleLagSync(u64 userdata, int cyclesLate) {
  	}
  
  	float scale = 1.0f;
@@ -242,53 +248,50 @@ index c9c75946f7..37cd66d389 100644
  
  	const double goal = lastLagSync + (scale / 1000.0f);
 diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
-index 2f8d05aa28..f89ef28411 100644
+index edb3bc6b23..1a93317d8e 100644
 --- a/Core/HLE/sceDisplay.h
 +++ b/Core/HLE/sceDisplay.h
-@@ -32,6 +32,13 @@ void __DisplaySetFramebuf(u32 topaddr, int linesize, int pixelformat, int sync);
- // Call this when resuming to avoid a small speedup burst
- void __DisplaySetWasPaused();
+@@ -36,7 +36,13 @@ void __DisplaySetWasPaused();
  
+ // The frame rate throttling is actually aiming for right now, after fast-forward, the alternative
+ // speeds, and the netplay/achievement restrictions have all had their say. 0 means unlimited.
+-int __DisplayGetFrameTimingLimit();
++double __DisplayGetFrameTimingLimit();
 +// emucap agent pacing: a percent of the PSP refresh used in place of the normal limit, 0 for
 +// unlimited. Held keys, custom limits and fast-forward still take precedence.
 +void __DisplaySetEmucapSpeed(int percent);
 +int __DisplayGetEmucapSpeed();
 +// Changes whenever the agent speed changes, so a wait computed for the old target can end.
 +uint32_t __DisplayEmucapPacingGeneration();
-+
+ 
  void Register_sceDisplay_driver();
  void __DisplayWaitForVblanks(const char* reason, int vblanks, bool callbacks = false);
- 
 diff --git a/headless/Headless.cpp b/headless/Headless.cpp
-index 304b2b4b1e..1b7152215c 100644
+index 27f6ceeecf..2fe8b7e996 100644
 --- a/headless/Headless.cpp
 +++ b/headless/Headless.cpp
-@@ -41,6 +41,7 @@
- #include "Core/Core.h"
- #include "Core/CoreTiming.h"
- #include "Core/Debugger/Breakpoints.h"
+@@ -61,6 +61,7 @@
+ #include "Core/HLE/HLE.h"
+ #include "Core/HLE/__sceAudio.h"
+ #include "Core/MIPS/MIPSTables.h"
 +#include "Core/FrameTiming.h"
  #include "Core/System.h"
- #include "Core/WebServer.h"
- #include "Core/HLE/sceUtility.h"
-@@ -300,6 +301,9 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
- 		if (coreState == CORE_NEXTFRAME) {
- 			coreState = CORE_RUNNING_CPU;
- 			headlessHost->SwapBuffers();
-+			// emucap fork: the GUI performs the frame's deferred throttle wait after submitting it
-+			// (NativeFrame); headless never did, so it ran unthrottled.
+ #include "Core/Util/PSARUnpack.h"
+ #include "Core/Util/PkgUnpack.h"
+@@ -609,6 +610,7 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
+ 			if (gpu) {
+ 				gpu->BeginHostFrame(g_Config.GetDisplayLayoutConfig(DeviceOrientation::Landscape));
+ 			}
 +			g_frameTiming.PostSubmit();
  		}
- 		if (coreState == CORE_STEPPING_CPU && !coreParameter.startBreak) {
- 			break;
-@@ -572,6 +576,10 @@ int main(int argc, const char* argv[])
- 	coreParameter.pixelWidth = 480;
- 	coreParameter.pixelHeight = 272;
- 	coreParameter.fastForward = true;
-+	// emucap fork: a debugger session is paced by the agent speed (launch default 100 percent)
-+	// instead of running unthrottled like an autotest.
-+	if (debuggerPort > 0)
-+		coreParameter.fastForward = false;
+ 		// Without a debugger nothing can resume a stop, so it ends the run.
+ 		if (coreState == CORE_STEPPING_CPU && !opt.debugger) {
+@@ -1141,7 +1143,7 @@ int main(int argc, const char* argv[]) {
+ 	coreParameter.renderHeight = 272 * coreParameter.renderScaleFactor;
+ 	coreParameter.pixelWidth = 480 * coreParameter.renderScaleFactor;
+ 	coreParameter.pixelHeight = 272 * coreParameter.renderScaleFactor;
+-	coreParameter.fastForward = true;
++	coreParameter.fastForward = !cmdLineOptions.DebuggerPort().has_value();
  
- 	g_Config.RestoreDefaults(RestoreSettingsBits::SETTINGS | RestoreSettingsBits::CONTROLS, true);
+ 	Path exePath = File::GetExeDirectory();
  

@@ -2,6 +2,37 @@
 
 Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## Unreleased
+
+### Added
+- Add N64 analog-stick input and exact `input_polls` stepping/tap timing through the existing
+  `step` and `tap` tools.
+
+### Changed
+- Make explicit `tap` timing exact: guest progress is `press_frames + after_frames`, with no
+  hidden release frame. Omitted frame timing defaults to 2 held frames and 1 released frame.
+- Enforce the limits published by `status` for synchronous advances, analysis, recording and
+  transport input. Longer workflows use multiple bounded terminal operations.
+- Keep public validation and native package workflows manually dispatched.
+
+### Fixed
+- Authenticate managed xemu QMP and GDB peers before either native frontend opens. xemu host API 4
+  binds the new transport to its bridge; rebuild the producer and bridge together.
+- Mutually authenticate every managed producer and its direct Control or broker listener before
+  capabilities, ownership or ordinary requests. Per-launch front keys are role- and port-bound;
+  hello no longer carries reusable credential material. Rebuild native adapter hosts and restart
+  Control and broker together.
+- Reject symlink, special-file, oversized and replacement races across snapshots, dumps, recordings,
+  media graphs and published bundles. Output replacement remains atomic and generation-owned.
+- Bound broker admission, adapter transports, event queues, debugger points and tracking queries;
+  cancellation and disconnect retain ownership until native cleanup completes.
+- Match Windows content aliases by filesystem identity, keep openMSX disk-state scratch paths short,
+  and bound fragmented PPSSPP and PCSX2 control reads without losing cancellation.
+- Repair Windows and Linux native build closure for Dolphin, PPSSPP and PCSX2, including PCSX2 Qt
+  plugins and the declared Rust 1.88 toolchain floor.
+- Authenticate reused native CI inputs and release assembly provenance, and pin third-party Actions
+  by immutable revision.
+
 ## 1.0.0
 
 ### Changed

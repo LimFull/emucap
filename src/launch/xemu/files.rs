@@ -23,14 +23,8 @@ pub struct FirmwareInventory {
     pub eeprom_template_identity: Option<FileIdentity>,
 }
 
-fn managed_firmware_root() -> PathBuf {
-    super::super::emu_home_base().join("firmware/xemu")
-}
-
-fn fallback_firmware_root() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("workspace/retrobios/bios/Microsoft/Xbox"))
+fn managed_firmware_root() -> io::Result<PathBuf> {
+    Ok(super::super::emu_home_base()?.join("firmware/xemu"))
 }
 
 pub fn resolve_firmware() -> io::Result<FirmwareInventory> {
@@ -44,18 +38,13 @@ pub fn resolve_firmware() -> io::Result<FirmwareInventory> {
         }
         return validate_firmware_root(&root);
     }
-    let mut candidates = vec![managed_firmware_root()];
-    if let Some(path) = fallback_firmware_root() {
-        candidates.push(path);
-    }
-    for root in &candidates {
-        if root.is_dir()
-            && ["mcpx_1.0.bin", "Complex_4627.bin", "xbox_hdd.qcow2"]
-                .iter()
-                .all(|name| root.join(name).exists())
-        {
-            return validate_firmware_root(root);
-        }
+    let root = managed_firmware_root()?;
+    if root.is_dir()
+        && ["mcpx_1.0.bin", "Complex_4627.bin", "xbox_hdd.qcow2"]
+            .iter()
+            .all(|name| root.join(name).exists())
+    {
+        return validate_firmware_root(&root);
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
@@ -204,7 +193,7 @@ pub fn identity_for_regular_file(path: &Path) -> io::Result<FileIdentity> {
     Ok(FileIdentity { size, sha256 })
 }
 
-pub(super) fn copy_verified(
+pub(crate) fn copy_verified(
     source: &Path,
     destination: &Path,
     expected: &FileIdentity,
@@ -216,10 +205,7 @@ pub(super) fn copy_verified(
             source.display()
         )));
     }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
+    let mut output = crate::private_fs::create_private_file(destination)?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -236,6 +222,7 @@ pub(super) fn copy_verified(
     output.sync_all()?;
     let actual = hex::encode(hasher.finalize());
     if copied != expected.size || actual != expected.sha256 {
+        drop(output);
         let _ = fs::remove_file(destination);
         return Err(io::Error::other(format!(
             "source changed while creating managed copy: {}",

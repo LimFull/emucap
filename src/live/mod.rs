@@ -4,13 +4,18 @@ pub mod capture_capsule;
 mod capture_filesystem;
 pub mod continuity;
 pub mod control_session;
+pub mod controller_input;
 mod evidence_identity;
+#[cfg(test)]
+mod evidence_identity_tests;
 pub mod link;
 pub mod memory_batch;
 pub mod pacing;
+pub mod producer_auth;
 pub mod protocol;
 pub mod reconnect;
 pub mod recording;
+mod recording_admission;
 pub mod recording_capability;
 mod recording_input;
 mod recording_member_sink;
@@ -31,6 +36,8 @@ mod tools_state;
 
 #[cfg(test)]
 mod broker_link_tests;
+#[cfg(test)]
+mod broker_readiness_tests;
 #[cfg(test)]
 mod broker_tests;
 #[cfg(test)]

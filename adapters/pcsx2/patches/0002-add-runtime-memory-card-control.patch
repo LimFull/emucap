@@ -1,15 +1,15 @@
-diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
-index 925cf6297..92da4fb51 100644
---- a/pcsx2/PINE.cpp
-+++ b/pcsx2/PINE.cpp
-@@ -13,6 +13,7 @@
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index e3e6e74..df8f3c0 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
+@@ -12,6 +12,7 @@
  #include "PerformanceMetrics.h"
  #include "SaveState.h"
  #include "SIO/Pad/Pad.h"
 +#include "SIO/Sio.h"
  #include "PINE.h"
  #include "VMManager.h"
- #include "common/Error.h"
+ #include "vtlb.h"
 @@ -77,7 +78,7 @@
  #endif
  
@@ -170,7 +170,7 @@ index 925cf6297..92da4fb51 100644
  } // namespace PINEServer
  
  bool PINEServer::Initialize(int slot)
-@@ -1358,6 +1496,52 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+@@ -1356,6 +1494,52 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
  				ret_cnt += 4;
  				break;
  			}
@@ -223,10 +223,10 @@ index 925cf6297..92da4fb51 100644
  			default:
  			{
  			error:
-diff --git a/pcsx2/SIO/Sio.cpp b/pcsx2/SIO/Sio.cpp
-index dad79a5c9..50ac58052 100644
---- a/pcsx2/SIO/Sio.cpp
-+++ b/pcsx2/SIO/Sio.cpp
+diff --git c/pcsx2/SIO/Sio.cpp i/pcsx2/SIO/Sio.cpp
+index 19fa503..910d6f0 100644
+--- c/pcsx2/SIO/Sio.cpp
++++ i/pcsx2/SIO/Sio.cpp
 @@ -150,6 +150,11 @@ bool MemcardBusy::IsBusy()
  	return (currentBusyTicks.load(std::memory_order_acquire) > 0);
  }
@@ -239,10 +239,10 @@ index dad79a5c9..50ac58052 100644
  void MemcardBusy::ClearBusy()
  {
  	currentBusyTicks.store(0, std::memory_order_release);
-diff --git a/pcsx2/SIO/Sio.h b/pcsx2/SIO/Sio.h
-index 19d078109..ac473c21c 100644
---- a/pcsx2/SIO/Sio.h
-+++ b/pcsx2/SIO/Sio.h
+diff --git c/pcsx2/SIO/Sio.h i/pcsx2/SIO/Sio.h
+index 85aa6d2..f05a9fa 100644
+--- c/pcsx2/SIO/Sio.h
++++ i/pcsx2/SIO/Sio.h
 @@ -131,6 +131,7 @@ namespace MemcardBusy
  	extern void Decrement();
  	extern void SetBusy();

@@ -1,0 +1,243 @@
+--- a/src/emu/debug/debugcpu.h
++++ b/src/emu/debug/debugcpu.h
+@@ -13,6 +13,7 @@
+ 
+ #pragma once
+ 
++#include <limits>
+ #include <set>
+ #include <utility>
+ #include <vector>
+@@ -421,10 +422,19 @@
+ 	bool memory_modified() const { return m_memory_modified; }
+ 	exec_state execution_state() const { return m_execution_state; }
+ 	device_t *live_cpu() { return m_livecpu; }
+-	u32 get_breakpoint_index() { return m_bpindex++; }
+-	u32 get_watchpoint_index() { return m_wpindex++; }
+-	u32 get_registerpoint_index() { return m_rpindex++; }
+-	u32 get_exceptionpoint_index() { return m_epindex++; }
++	u32 get_breakpoint_index() { return allocate_point_index(m_bpindex); }
++	u32 get_watchpoint_index() { return allocate_point_index(m_wpindex); }
++	u32 get_registerpoint_index() { return allocate_point_index(m_rpindex); }
++	u32 get_exceptionpoint_index() { return allocate_point_index(m_epindex); }
++
++	// Point identities are stored and returned as signed int throughout the debugger.
++	// Zero is reserved for exhausted admission; clearing points never reuses IDs.
++	static u32 allocate_point_index(u32 &next)
++	{
++		if (!next || next > u32(std::numeric_limits<int>::max()))
++			return 0;
++		return next++;
++	}
+ 
+ 	// setters
+ 	void set_break_cpu(device_t * breakcpu) { m_breakcpu = breakcpu; }
+--- a/src/emu/debug/debugcpu.cpp
++++ b/src/emu/debug/debugcpu.cpp
+@@ -1404,6 +1404,8 @@
+ {
+ 	// allocate a new one and hook it into our list
+ 	u32 id = m_device.machine().debugger().cpu().get_breakpoint_index();
++	if (!id)
++		return -1;
+ 	m_bplist.emplace(address, std::make_unique<debug_breakpoint>(this, *m_symtable, id, address, condition, action));
+ 
+ 	// update the flags and return the index
+@@ -1489,11 +1491,13 @@
+ 
+ int device_debug::watchpoint_set(address_space &space, read_or_write type, offs_t address, offs_t length, const char *condition, std::string_view action)
+ {
++	// allocate a new one
++	u32 id = m_device.machine().debugger().cpu().get_watchpoint_index();
++	if (!id)
++		return -1;
++
+ 	if (space.spacenum() >= int(m_wplist.size()))
+ 		m_wplist.resize(space.spacenum()+1);
+-
+-	// allocate a new one
+-	u32 id = m_device.machine().debugger().cpu().get_watchpoint_index();
+ 	m_wplist[space.spacenum()].emplace_back(std::make_unique<debug_watchpoint>(this, *m_symtable, id, space, type, address, length, condition, action));
+ 
+ 	return id;
+@@ -1578,6 +1582,8 @@
+ {
+ 	// allocate a new one
+ 	u32 id = m_device.machine().debugger().cpu().get_registerpoint_index();
++	if (!id)
++		return -1;
+ 	m_rplist.emplace_front(*m_symtable, id, condition, action);
+ 
+ 	// update the flags and return the index
+@@ -1662,6 +1668,8 @@
+ {
+ 	// allocate a new one and hook it into our list
+ 	u32 id = m_device.machine().debugger().cpu().get_exceptionpoint_index();
++	if (!id)
++		return -1;
+ 	m_eplist.emplace(exception, std::make_unique<debug_exceptionpoint>(this, *m_symtable, id, exception, condition, action));
+ 
+ 	// return the index
+--- a/src/emu/debug/debugcmd.cpp
++++ b/src/emu/debug/debugcmd.cpp
+@@ -1405,7 +1405,10 @@
+ 
+ 	// set the breakpoint
+ 	int const bpnum = debug->breakpoint_set(address, condition.is_empty() ? nullptr : condition.original_string(), action);
+-	m_console.printf("Breakpoint %X set\n", bpnum);
++	if (bpnum < 0)
++		m_console.printf("Debugger point ID space exhausted\n");
++	else
++		m_console.printf("Breakpoint %X set\n", bpnum);
+ }
+ 
+ 
+@@ -1585,7 +1588,10 @@
+ 
+ 	// set the watchpoint
+ 	int const wpnum = debug->watchpoint_set(*tspace, type, taddress, length, (condition.is_empty()) ? nullptr : condition.original_string(), action);
+-	m_console.printf("Watchpoint %X set\n", wpnum);
++	if (wpnum < 0)
++		m_console.printf("Debugger point ID space exhausted\n");
++	else
++		m_console.printf("Watchpoint %X set\n", wpnum);
+ }
+ 
+ 
+@@ -1737,7 +1743,10 @@
+ 
+ 	// set the registerpoint
+ 	int const rpnum = cpu->debug()->registerpoint_set(condition.original_string(), action);
+-	m_console.printf("Registerpoint %X set\n", rpnum);
++	if (rpnum < 0)
++		m_console.printf("Debugger point ID space exhausted\n");
++	else
++		m_console.printf("Registerpoint %X set\n", rpnum);
+ }
+ 
+ 
+@@ -1828,7 +1837,10 @@
+ 
+ 	// set the exception point
+ 	int epnum = cpu->debug()->exceptionpoint_set(type, (condition.is_empty()) ? nullptr : condition.original_string(), action);
+-	m_console.printf("Exception point %X set\n", epnum);
++	if (epnum < 0)
++		m_console.printf("Debugger point ID space exhausted\n");
++	else
++		m_console.printf("Exception point %X set\n", epnum);
+ }
+ 
+ 
+--- a/src/frontend/mame/luaengine_debug.cpp
++++ b/src/frontend/mame/luaengine_debug.cpp
+@@ -435,9 +435,11 @@
+ 				return result;
+ 			});
+ 	device_debug_type.set_function("bpset",
+-			[] (device_debug &dev, offs_t address, char const *cond, char const *act)
++			[] (device_debug &dev, offs_t address, char const *cond, char const *act, sol::this_state state)
+ 			{
+ 				int result(dev.breakpoint_set(address, cond, act));
++				if (result < 0)
++					return luaL_error(state, "Debugger point ID space exhausted");
+ 				dev.device().machine().debug_view().update_all(DVT_DISASSEMBLY);
+ 				dev.device().machine().debug_view().update_all(DVT_BREAK_POINTS);
+ 				return result;
+@@ -470,10 +472,12 @@
+ 				return table;
+ 			});
+ 	device_debug_type.set_function("wpset",
+-			[] (device_debug &dev, addr_space &sp, std::string const &type, offs_t addr, offs_t len, char const *cond, char const *act)
++			[] (device_debug &dev, addr_space &sp, std::string const &type, offs_t addr, offs_t len, char const *cond, char const *act, sol::this_state state)
+ 			{
+ 				read_or_write const wptype = s_read_or_write_parser(type);
+ 				int result(dev.watchpoint_set(sp.space, wptype, addr, len, cond, act));
++				if (result < 0)
++					return luaL_error(state, "Debugger point ID space exhausted");
+ 				dev.device().machine().debug_view().update_all(DVT_WATCH_POINTS);
+ 				return result;
+ 			});
+--- a/src/osd/modules/debugger/debuggdbstub.cpp
++++ b/src/osd/modules/debugger/debuggdbstub.cpp
+@@ -1482,7 +1482,6 @@
+ 	{
+ 		if ( !m_memory->translate(m_address_space->spacenum(), device_memory_interface::TR_READ, offset, tspace) )
+ 			return REPLY_ENN;
+-		m_address_map[offset] = address;
+ 	}
+ 
+ 	device_debug *debug = m_debugger_console->get_visible_cpu()->debug();
+@@ -1492,19 +1491,24 @@
+ 		//       same way, and the 'kind' parameter is ignored.
+ 		case 0: // software breakpoint
+ 		case 1: // hardware breakpoint
+-			debug->breakpoint_set(address);
+-			return REPLY_OK;
++			return debug->breakpoint_set(address) < 0 ? REPLY_ENN : REPLY_OK;
+ 		case 2:
+ 			// write watchpoint
+-			debug->watchpoint_set(*m_address_space, read_or_write::WRITE, offset, kind);
++			if (debug->watchpoint_set(*m_address_space, read_or_write::WRITE, offset, kind) < 0)
++				return REPLY_ENN;
++			m_address_map[offset] = address;
+ 			return REPLY_OK;
+ 		case 3:
+ 			// read watchpoint
+-			debug->watchpoint_set(*m_address_space, read_or_write::READ, offset, kind);
++			if (debug->watchpoint_set(*m_address_space, read_or_write::READ, offset, kind) < 0)
++				return REPLY_ENN;
++			m_address_map[offset] = address;
+ 			return REPLY_OK;
+ 		case 4:
+ 			// access watchpoint
+-			debug->watchpoint_set(*m_address_space, read_or_write::READWRITE, offset, kind);
++			if (debug->watchpoint_set(*m_address_space, read_or_write::READWRITE, offset, kind) < 0)
++				return REPLY_ENN;
++			m_address_map[offset] = address;
+ 			return REPLY_OK;
+ 	}
+ 
+--- a/src/osd/modules/debugger/qt/dasmwindow.cpp
++++ b/src/osd/modules/debugger/qt/dasmwindow.cpp
+@@ -275,7 +275,10 @@
+ 		if (!bp)
+ 		{
+ 			int32_t bpindex = cpuinfo->breakpoint_set(address);
+-			m_machine.debugger().console().printf("Breakpoint %X set\n", bpindex);
++			if (bpindex < 0)
++				m_machine.debugger().console().printf("Debugger point ID space exhausted\n");
++			else
++				m_machine.debugger().console().printf("Breakpoint %X set\n", bpindex);
+ 		}
+ 		else
+ 		{
+--- a/src/osd/modules/debugger/win/disasmbasewininfo.cpp
++++ b/src/osd/modules/debugger/win/disasmbasewininfo.cpp
+@@ -177,7 +177,10 @@
+ 					if (bp == nullptr)
+ 					{
+ 						int32_t bpindex = debug->breakpoint_set(address);
+-						machine().debugger().console().printf("Breakpoint %X set\n", bpindex);
++						if (bpindex < 0)
++							machine().debugger().console().printf("Debugger point ID space exhausted\n");
++						else
++							machine().debugger().console().printf("Breakpoint %X set\n", bpindex);
+ 					}
+ 					else
+ 					{
+--- a/src/osd/modules/debugger/osx/disassemblyviewer.mm
++++ b/src/osd/modules/debugger/osx/disassemblyviewer.mm
+@@ -190,8 +190,11 @@
+ 		// if it doesn't exist, add a new one
+ 		if (bp == nullptr)
+ 		{
+-			uint32_t const bpnum = device.debug()->breakpoint_set(address);
+-			machine->debugger().console().printf("Breakpoint %X set\n", bpnum);
++			int const bpnum = device.debug()->breakpoint_set(address);
++			if (bpnum < 0)
++				machine->debugger().console().printf("Debugger point ID space exhausted\n");
++			else
++				machine->debugger().console().printf("Breakpoint %X set\n", bpnum);
+ 		}
+ 		else
+ 		{

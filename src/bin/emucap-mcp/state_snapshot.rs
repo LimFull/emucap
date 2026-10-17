@@ -41,7 +41,8 @@ pub async fn save(
                 &mut *link,
                 &args.path,
                 key,
-                &RuntimeStore::discover(),
+                &RuntimeStore::discover()
+                    .map_err(|e| emucap::live::link::LinkError::Protocol(e.to_string()))?,
                 worker_cancel,
             )
         } else {

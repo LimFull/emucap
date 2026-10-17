@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Retained native pixels are immutable, bounded by their dimensions and explicitly invalidated."""
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[2]
-native = root / 'adapters/pcsx2/work/pcsx2/pcsx2/GS/Renderers/Common'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--source', type=Path, default=root / 'adapters/pcsx2/work/pcsx2/pcsx2',
+                    help='patched pcsx2 source directory')
+native_source = parser.parse_args().source
+native = native_source / 'GS/Renderers/Common'
 code = r'''
 #include "GSRestoredSnapshot.h"
 #include <cassert>

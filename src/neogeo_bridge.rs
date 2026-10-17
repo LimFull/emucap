@@ -357,9 +357,6 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         if let Some(name) = &self.env.name {
             obj.insert("name".into(), json!(name));
         }
-        if let Some(token) = &self.env.session_token {
-            obj.insert("session_token".into(), json!(token));
-        }
         if let Some(launch_id) = &self.env.launch_id {
             obj.insert("launch_id".into(), json!(launch_id));
         }
@@ -686,16 +683,24 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             .ok_or_else(|| BridgeError::BadParams("missing required param: hex".into()))?;
         let data = hex::decode(raw)
             .map_err(|_| BridgeError::BadParams("hex must contain complete bytes".into()))?;
+        if data.is_empty() {
+            return Err(BridgeError::BadParams(
+                "hex must contain at least one byte".into(),
+            ));
+        }
         let address = region_address(self.profile, params, data.len() as u64)?;
-        let response = self.gdb.send(&format!(
-            "M{address:x},{:x}:{}",
-            data.len(),
-            hex::encode(&data)
-        ))?;
-        if response != "OK" {
-            return Err(BridgeError::Emulator(format!(
-                "MAME memory write failed: {response}"
-            )));
+        for (index, chunk) in data.chunks(MAX_READ as usize).enumerate() {
+            let target = address + index as u64 * MAX_READ;
+            let response = self.gdb.send(&format!(
+                "M{target:x},{:x}:{}",
+                chunk.len(),
+                hex::encode(chunk)
+            ))?;
+            if response != "OK" {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME memory write failed: {response}"
+                )));
+            }
         }
         Ok(json!({"written": data.len(), "address": required_num(params, "address")?}))
     }

@@ -21,6 +21,7 @@ def main():
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <sys/wait.h>
@@ -38,7 +39,7 @@ bool inactive = false;
 bool Core_EmucapMemoryParked() { return inactive; }
 auto Core_EmucapWaitFrameStep(unsigned ms) { assert(ms == 0); return native; }
 void Core_Break(BreakReason, int) { ++breaks; }
-auto Core_EmucapCancelFrameStep() { ++cancels; native.status=EmucapFrameStepStatus::Interrupted; return native; }
+auto Core_EmucapCancelFrameStep() { ++cancels; if(native.status==EmucapFrameStepStatus::Running||native.status==EmucapFrameStepStatus::TimedOut)native.status=EmucapFrameStepStatus::Interrupted; return native; }
 struct JsonWriter {
  static std::map<std::string,std::string> last;
  void begin() { last.clear(); }
@@ -59,6 +60,7 @@ struct WebSocketSteppingState {
  void CloseFrame();
 };
 WebSocketSteppingState *emucapFrameOwner=nullptr;
+std::recursive_mutex emucapFrameOwnerMutex;
 '''
     tests = r'''
 int main() {
@@ -83,7 +85,7 @@ int main() {
  WebSocketSteppingState breakpoint;
  emucapFrameOwner=&breakpoint; native.status=EmucapFrameStepStatus::Interrupted;
  breakpoint.RequestFrameStop("cancelled"); breakpoint.Broadcast(&ws);
- assert(breaks==1 && JsonWriter::last["status"]=="interrupted" && !JsonWriter::last.count("reason"));
+ assert(breaks==1 && JsonWriter::last["status"]=="interrupted" && JsonWriter::last["reason"]=="native_halt");
  WebSocketSteppingState eof;
  emucapFrameOwner=&eof; eof.CloseFrame();
  assert(!emucapFrameOwner && breaks==1);

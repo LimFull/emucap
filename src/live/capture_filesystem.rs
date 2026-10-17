@@ -66,14 +66,7 @@ impl FilesystemIdentity {
 
 pub(super) fn create_staging_owner(staging: &Path) -> io::Result<String> {
     let token = ulid::Ulid::generate().to_string();
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(staging.join(RECOVERY_OWNER_MEMBER))?;
+    let mut file = crate::private_fs::create_private_file(&staging.join(RECOVERY_OWNER_MEMBER))?;
     file.write_all(token.as_bytes())?;
     file.sync_all()?;
     Ok(token)
@@ -83,6 +76,9 @@ pub(super) fn staging_owner_matches(staging: &Path, expected: Option<&str>) -> i
     let Some(expected) = expected.filter(|value| value.len() == 26) else {
         return Ok(false);
     };
+    if crate::private_fs::verify_private_file(&staging.join(RECOVERY_OWNER_MEMBER)).is_err() {
+        return Ok(false);
+    }
     let file =
         match crate::path_safety::open_regular_member_no_follow(staging, RECOVERY_OWNER_MEMBER) {
             Ok(file) => file,

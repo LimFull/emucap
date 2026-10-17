@@ -246,29 +246,25 @@ fn press_cancellation_releases_input_and_starts_no_later_phase() {
 
 #[test]
 fn cancellation_between_phases_keeps_prior_progress_and_skips_remaining_advance() {
-    for (phase, label, counts) in [
-        (1, "release_edge", vec![6, 0]),
-        (2, "after_release", vec![6, 1, 0]),
-    ] {
-        let mut link = Scripted::new();
-        link.cancel_phase = Some(phase);
-        let ToolOutput::Json(result) = tap(&mut link).unwrap() else {
-            panic!()
-        };
-        assert_eq!(result["phase"], label);
-        assert_eq!(link.keys.len(), phase);
-        assert_eq!(
-            result["advances"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v["count"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            counts
-        );
-        assert_eq!(link.calls.iter().filter(|s| *s == "release").count(), 1);
-        assert_eq!(link.calls.last().unwrap(), "status");
-    }
+    let (phase, label, counts) = (1, "after_release", vec![6, 0]);
+    let mut link = Scripted::new();
+    link.cancel_phase = Some(phase);
+    let ToolOutput::Json(result) = tap(&mut link).unwrap() else {
+        panic!()
+    };
+    assert_eq!(result["phase"], label);
+    assert_eq!(link.keys.len(), phase);
+    assert_eq!(
+        result["advances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["count"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        counts
+    );
+    assert_eq!(link.calls.iter().filter(|s| *s == "release").count(), 1);
+    assert_eq!(link.calls.last().unwrap(), "status");
 }
 
 #[test]
@@ -277,16 +273,16 @@ fn each_phase_has_a_distinct_native_operation_identity() {
     let ToolOutput::Json(result) = tap(&mut link).unwrap() else {
         panic!()
     };
-    assert_eq!(result["advances"].as_array().unwrap().len(), 3);
-    assert_eq!(link.keys.len(), 3);
-    for i in 0..3 {
-        for j in i + 1..3 {
+    assert_eq!(result["advances"].as_array().unwrap().len(), 2);
+    assert_eq!(link.keys.len(), 2);
+    for i in 0..2 {
+        for j in i + 1..2 {
             assert_ne!(link.keys[i], link.keys[j]);
         }
     }
     assert_eq!(
         link.calls,
-        vec!["pause", "press", "step", "release", "step", "step"]
+        vec!["pause", "press", "step", "release", "step"]
     );
 }
 

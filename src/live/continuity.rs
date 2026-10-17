@@ -42,13 +42,13 @@ pub struct ObservedLink<L> {
     snapshot: ContinuitySnapshot,
 }
 
-pub fn observed<L: EmulatorLink>(inner: L) -> ObservedLink<L> {
+pub fn observed<L: EmulatorLink>(inner: L) -> std::io::Result<ObservedLink<L>> {
     ObservedLink::new(inner)
 }
 
 impl<L: EmulatorLink> ObservedLink<L> {
-    pub fn new(inner: L) -> Self {
-        Self::with_store(inner, RuntimeStore::discover())
+    pub fn new(inner: L) -> std::io::Result<Self> {
+        Ok(Self::with_store(inner, RuntimeStore::discover()?))
     }
 
     pub fn with_store(inner: L, store: RuntimeStore) -> Self {
@@ -416,6 +416,8 @@ impl<L: EmulatorLink> ObservedLink<L> {
                                 | "set_input"
                                 | "step"
                                 | "step_instructions"
+                                | "step_input_polls"
+                                | "poll_events"
                                 | "begin_temporal_operation"
                                 | "finish_temporal_operation"
                         );
@@ -782,12 +784,13 @@ fn runtime_binding(
     let identity_disagrees = [
         (identity.system.as_deref(), Some(current.system.as_str())),
         (identity.adapter.as_deref(), Some(current.adapter.as_str())),
-        (identity.content.as_deref(), Some(current.content.as_str())),
     ]
     .into_iter()
     .any(|(live, capsule)| {
         live.zip(capsule)
             .is_some_and(|(live, capsule)| live != capsule)
+    }) || identity.content.as_deref().is_some_and(|content| {
+        !crate::content_identity::same_content_path(&current.content, content)
     });
     RuntimeBinding {
         state: if identity_disagrees {
@@ -836,7 +839,7 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
     }
 
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
-        if !is_read_only(method) {
+        if requires_control_lease(method) {
             self.ensure_mutation_lease(method, &params)?;
         }
         let result = self.inner.call(method, params);
@@ -855,7 +858,7 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         control: &ProgressCallControl,
     ) -> Result<Value, LinkError> {
         self.check_temporal_deadline(control)?;
-        if !is_read_only(method) {
+        if requires_control_lease(method) {
             self.ensure_mutation_lease(method, &params)?;
         }
         self.check_temporal_deadline(control)?;
@@ -1050,10 +1053,17 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
     }
 }
 
+// Event polling leaves guest execution unchanged but consumes shared evidence.
+// Keep temporal observation classification separate from lease ownership.
+fn requires_control_lease(method: &str) -> bool {
+    method == "poll_events" || !is_read_only(method)
+}
+
 pub(crate) fn is_read_only(method: &str) -> bool {
     matches!(
         method,
         "hello"
+            | "read_input_polls"
             | "status"
             | "get_state"
             | "read_memory"

@@ -31,7 +31,7 @@ its live windows and limits. For collection speed or human handoff, describe `de
 
 Wait for each dependent call's terminal response and check its execution state and cleanup
 outcome. On timeout or disconnect, inspect continuity and `get_failure_context()` before choosing
-recovery. Consult [known issues](AGENT_GUIDE.md#known-issues) for adapter-specific symptoms.
+recovery. Consult the **Known issues** section of `AGENT_GUIDE.md` for adapter-specific symptoms.
 Establish process exit from process evidence. Use managed lifecycle tools for attachment
 and replacement; end a generation with `stop(status.runtime_instance.launch_id)`.
 

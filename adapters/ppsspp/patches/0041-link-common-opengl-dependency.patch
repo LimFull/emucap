@@ -1,0 +1,13 @@
+--- a/Common/CMakeLists.txt
++++ b/Common/CMakeLists.txt
+@@ -364,6 +364,10 @@
+ 	target_compile_definitions(Common PUBLIC GLES_SILENCE_DEPRECATION)
+ endif()
+ 
++# Common owns GLQueueRunner/thin3d_gl and their direct OpenGL symbols.
++# Retain the dependency even when a consumer has no SDL graphics context.
++target_link_libraries(Common ${OPENGL_LIBRARIES})
++
+ target_link_libraries(Common Ext::Snappy cpu_features)
+ 
+ if(SDL_LIB_TARGET AND TARGET SDL3::Headers)

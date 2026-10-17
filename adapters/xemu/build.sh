@@ -103,6 +103,7 @@ PATCHES=(
   "$HERE/patches/0021-pacing-transaction.patch"
   "$HERE/patches/0022-nonunwinding-windows-tcg-exit.patch"
   "$HERE/patches/0023-publish-complete-generated-eeprom.patch"
+  "$HERE/patches/0024-authenticate-native-control.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done |
   if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi |

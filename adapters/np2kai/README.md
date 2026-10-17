@@ -20,12 +20,12 @@ define manifest violates that boundary, then writes
 The repository does not distribute the generated core or PC-98 firmware. Put
 your legally obtained NP2kai firmware inventory in a directory and set
 `EMUCAP_NP2KAI_FIRMWARE` to it. The launcher copies only recognized firmware
-files into the per-port emucap runtime; it never reads or changes a user's
+files into the launch-generation emucap runtime; it never reads or changes a user's
 RetroArch or NP2kai profile.
 
 The patch stack adds a small native debug ABI at CPU execution, memory access,
 machine reset, and hard-disk transition boundaries. The direct host therefore
-advertises the same 33 Control/Debug methods as the MAME PC-98 backend:
+advertises the same common Control/Debug method names as the MAME PC-98 backend:
 
 - bounded physical, RAM, text-VRAM, and planar graphics-VRAM reads, writes,
   searches, and dumps;
@@ -35,6 +35,10 @@ advertises the same 33 Control/Debug methods as the MAME PC-98 backend:
 - exact frame execution, keyboard and relative-pointer input, frozen
   screenshots, identity-bound native states, reset observation, and verified
   `hdd0` replacement through an emucap-owned media copy.
+
+State files are bounded by the host's size limit and verified against their exact saved-byte
+hash and media/core identity before native restore. Their length can vary with device state;
+loading does not serialize the current guest to infer the saved file's length.
 
 Method parity does not erase device differences. `hdd0` must remain loaded,
 only `.hdi` media and one hard disk are exposed, and a media change is verified

@@ -226,17 +226,8 @@ if ($metadata.upstream -ne $lockValues.MESEN_REPO -or
   throw "mesen-patch-required: $metadataPath does not match upstream.lock"
 }
 
-if ($env:EMUCAP_EMU_HOME) {
-  $emuBase = $env:EMUCAP_EMU_HOME
-} elseif ($env:LOCALAPPDATA) {
-  $emuBase = Join-Path $env:LOCALAPPDATA "emucap"
-} elseif ($env:APPDATA) {
-  $emuBase = Join-Path $env:APPDATA "emucap"
-} elseif ($env:USERPROFILE) {
-  $emuBase = Join-Path $env:USERPROFILE "AppData\Local\emucap"
-} else {
-  $emuBase = Join-Path ([System.IO.Path]::GetTempPath()) "emucap"
-}
+. (Join-Path $here "..\_common\runtime-env.ps1")
+$emuBase = Get-EmucapRuntimeBase
 $emuHome = Join-Path $emuBase "mesen2\$Port"
 $portableDir = Join-Path $emuHome "portable"
 $pidFile = Join-Path $emuHome "mesen.pid"
@@ -343,7 +334,7 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua emucap_step.lua emucap_json.lua emucap_input.lua emucap_owner.lua emucap_control_wire.lua emucap_control.lua emucap_control_advance.lua emucap_rx.lua emucap_tx.lua emucap_state_io.lua emucap_snapshot.lua emucap_recording.lua $entryName 2>$null)
+    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_auth.lua emucap_front_auth.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua emucap_step.lua emucap_json.lua emucap_input.lua emucap_owner.lua emucap_control_wire.lua emucap_control.lua emucap_control_advance.lua emucap_rx.lua emucap_tx.lua emucap_state_io.lua emucap_snapshot.lua emucap_recording.lua $entryName 2>$null)
     if ($LASTEXITCODE -ne 0 -or $dirtyFiles.Count -gt 0) {
       $buildHash = "$buildHash-dirty"
     }
@@ -351,21 +342,10 @@ try {
 } catch {
 }
 $env:EMUCAP_BUILD_HASH = $buildHash
-$tokenFile = if ($env:EMUCAP_SESSION_TOKEN_FILE) {
-  $env:EMUCAP_SESSION_TOKEN_FILE
-} else {
-  $runtimeBase = if ($env:EMUCAP_EMU_HOME) {
-    $env:EMUCAP_EMU_HOME
-  } elseif ($env:LOCALAPPDATA) {
-    Join-Path $env:LOCALAPPDATA "emucap"
-  } else {
-    Join-Path ([System.IO.Path]::GetTempPath()) "emucap"
-  }
-  Join-Path $runtimeBase "sessions\compatibility\session-token-$Port"
+if (-not $env:EMUCAP_SESSION_TOKEN -and $env:EMUCAP_SESSION_TOKEN_FILE) {
+  $env:EMUCAP_SESSION_TOKEN = (Get-Content -LiteralPath $env:EMUCAP_SESSION_TOKEN_FILE -TotalCount 1).Trim()
 }
-if (-not $env:EMUCAP_SESSION_TOKEN -and (Test-Path -LiteralPath $tokenFile -PathType Leaf)) {
-  $env:EMUCAP_SESSION_TOKEN = (Get-Content -LiteralPath $tokenFile -TotalCount 1).Trim()
-}
+Assert-EmucapFrontIdentity
 @(
   "emucap Mesen Windows launch",
   "  rom=$Rom",

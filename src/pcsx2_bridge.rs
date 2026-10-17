@@ -169,7 +169,6 @@ pub struct Pcsx2Bridge<T> {
     content: Option<PathBuf>,
     content_sha1: ContentSha1,
     name: Option<String>,
-    session_token: Option<String>,
     launch_id: Option<String>,
     memory_card_dir: Option<PathBuf>,
     host_api: u32,
@@ -213,7 +212,6 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             pine,
             content.clone(),
             std::env::var("EMUCAP_NAME").ok(),
-            std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             Some(data_root.join("memcards")),
         )?;
         if let Some(path) = content {
@@ -229,16 +227,15 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         pine: T,
         content: Option<PathBuf>,
         name: Option<String>,
-        session_token: Option<String>,
+        _front_key: Option<String>,
     ) -> BridgeResult<Self> {
-        Self::with_identity_and_memory_cards(pine, content, name, session_token, None)
+        Self::with_identity_and_memory_cards(pine, content, name, None)
     }
 
     fn with_identity_and_memory_cards(
         pine: T,
         content: Option<PathBuf>,
         name: Option<String>,
-        session_token: Option<String>,
         memory_card_dir: Option<PathBuf>,
     ) -> BridgeResult<Self> {
         let mut bridge = Self {
@@ -246,7 +243,6 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             content,
             content_sha1: ContentSha1::Unavailable,
             name,
-            session_token,
             launch_id: None,
             memory_card_dir,
             host_api: 0,
@@ -368,7 +364,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
                     .as_ref()
                     .is_some_and(|owner| owner.active_parent_key().is_some());
             if scoped {
-                let cap = Duration::from_millis(500);
+                let cap = owned_frame::PINE_EXCHANGE;
                 let end = self
                     .native_stop_deadline
                     .unwrap_or_else(|| Instant::now() + cap);
@@ -449,9 +445,6 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         let object = value.as_object_mut().expect("hello object");
         if let Some(name) = &self.name {
             object.insert("name".into(), json!(name));
-        }
-        if let Some(token) = &self.session_token {
-            object.insert("session_token".into(), json!(token));
         }
         if let Some(launch_id) = &self.launch_id {
             object.insert("launch_id".into(), json!(launch_id));

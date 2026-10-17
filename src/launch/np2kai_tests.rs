@@ -59,6 +59,28 @@ fn managed_working_copy_rejects_non_hdi_media_before_staging() {
     assert!(!dir.path().join("runtime/media/content.hdi").exists());
 }
 
+#[test]
+fn core_copy_is_generation_owned_and_digest_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join(format!(
+        "np2kai_libretro.{}",
+        std::env::consts::DLL_EXTENSION
+    ));
+    std::fs::write(&source, b"pinned core bytes").unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    let digest = sha256_file(&source).unwrap();
+
+    let staged = prepare_core_copy(&source, &digest, &runtime).unwrap();
+
+    assert_ne!(staged, source);
+    assert_eq!(sha256_file(&staged).unwrap(), digest);
+    assert!(std::fs::metadata(&staged).unwrap().permissions().readonly());
+    let other = dir.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    assert!(prepare_core_copy(&source, &"00".repeat(32), &other).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_working_copy_rejects_a_preexisting_destination_symlink() {

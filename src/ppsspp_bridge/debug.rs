@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_BREAKPOINTS: usize = 128;
+
 impl<T: WsTransport> PpssppBridge<T> {
     /// `cpu.getAllRegs` → the `id:0` ("GPR") category flattened into `cpu.<name>: value` (MIPS GPRs
     /// plus the fork-appended synthetic `pc`/`hi`/`lo`, per `CPUCoreSubscriber.cpp`). FPU/VFPU
@@ -204,6 +206,11 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// (`value`/`value_mask`/`value_len`) are unsupported and rejected
     /// rather than silently ignored.
     pub(super) fn set_breakpoint(&mut self, params: &Value) -> BridgeResult<Value> {
+        if self.bps.len() >= MAX_BREAKPOINTS {
+            return Err(BridgeError::BadParams(format!(
+                "PSP supports at most {MAX_BREAKPOINTS} retained breakpoint registrations"
+            )));
+        }
         let kind = params
             .get("kind")
             .and_then(Value::as_str)
@@ -260,6 +267,10 @@ impl<T: WsTransport> PpssppBridge<T> {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let condition = breakpoint_condition(params)?;
+        let id = self.next_bp;
+        let next_id = id
+            .checked_add(1)
+            .ok_or_else(|| BridgeError::Emulator("breakpoint id space exhausted".into()))?;
 
         if kind == "exec" {
             // Range/end check already done above, in caller offset coordinates, before routing.
@@ -275,8 +286,7 @@ impl<T: WsTransport> PpssppBridge<T> {
                 req["condition"] = json!(cond);
             }
             self.ws.call("cpu.breakpoint.add", req)?;
-            let id = self.next_bp;
-            self.next_bp += 1;
+            self.next_bp = next_id;
             self.bps.insert(
                 id,
                 PpssppBreakpoint {
@@ -357,8 +367,7 @@ impl<T: WsTransport> PpssppBridge<T> {
                         })
                 })
                 .unwrap_or(0);
-            let id = self.next_bp;
-            self.next_bp += 1;
+            self.next_bp = next_id;
             self.bps.insert(
                 id,
                 PpssppBreakpoint {

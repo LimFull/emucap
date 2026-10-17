@@ -1,5 +1,5 @@
 //! Broker-backed emulator link with generation-fenced reconnect.
-use std::io::{BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,7 +24,6 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 /// 하게 한다(TcpLink의 deferred_deadline 동형).
 const DEFAULT_DEFERRED_DEADLINE: Duration = Duration::from_secs(300);
 
-#[derive(Debug)]
 pub struct BrokerLink {
     reader: BufReader<TcpStream>,
     writer: Mutex<TcpStream>,
@@ -39,6 +38,45 @@ pub struct BrokerLink {
     attached_name: String,
     registration_id: u64,
     attachment_id: String,
+    producer_token: String,
+}
+
+impl std::fmt::Debug for BrokerLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerLink")
+            .field("caps", &self.caps)
+            .field("next_id", &self.next_id)
+            .field("attached_name", &self.attached_name)
+            .field("registration_id", &self.registration_id)
+            .field("attachment_id", &self.attachment_id)
+            .field("producer_token", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+fn configured_controller_token() -> Result<String, LinkError> {
+    // Broker credentials are generation-scoped and are published only after one process owns
+    // both bind-as-lock ports. A stable EMUCAP_SESSION_TOKEN override would survive a failed
+    // election and let a pre-bound listener collect a credential valid for the next generation.
+    let emu_port = std::env::var("EMUCAP_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(47800);
+    let token = super::runtime::RuntimeStore::discover()
+        .and_then(|store| store.read_broker_controller_token(emu_port))
+        .map_err(|error| {
+            LinkError::Protocol(format!(
+                "broker authentication token is unavailable: {error}"
+            ))
+        })?
+        .ok_or(LinkError::NotConnected)?;
+    if !super::broker::generated_session_token_is_current(&token) {
+        return Err(LinkError::Protocol(
+            "broker authentication token is not a current generation credential".into(),
+        ));
+    }
+    Ok(token)
 }
 
 /// 세션 포트로 접속해 attach{name?}한다. 실패는 명시 LinkError.
@@ -47,17 +85,34 @@ pub fn connect(
     name: Option<String>,
     timeout: Duration,
 ) -> Result<BrokerLink, LinkError> {
-    connect_expected(session_addr, name, None, None, timeout)
+    let session_token = configured_controller_token()?;
+    connect_expected(session_addr, name, None, None, &session_token, timeout)
 }
 
-fn connect_expected(
+#[cfg(test)]
+pub(crate) fn connect_with_token(
     session_addr: &str,
     name: Option<String>,
-    expected_registration_id: Option<u64>,
-    expected_launch_id: Option<String>,
+    session_token: &str,
     timeout: Duration,
 ) -> Result<BrokerLink, LinkError> {
-    let stream = TcpStream::connect(session_addr).map_err(|_| LinkError::NotConnected)?;
+    connect_expected(session_addr, name, None, None, session_token, timeout)
+}
+
+fn authenticate_session(
+    stream: TcpStream,
+    session_token: &str,
+    auth_deadline: Instant,
+) -> Result<(BrokerLink, String, String), LinkError> {
+    let timeout = auth_deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        return Err(LinkError::Timeout);
+    }
+    if !super::broker::session_token_is_valid(session_token) {
+        return Err(LinkError::Protocol(
+            "broker authentication token is invalid".into(),
+        ));
+    }
     stream.set_read_timeout(Some(timeout)).map_err(io_e)?;
     // 쓰기 타임아웃도 건다. 없으면 broker가 recv를 안 비우는(백프레셔) 대량 요청에서 write_all이 영원히
     // 블록해 링크 뮤텍스를 쥔 채 MCP를 wedge한다. 쓰기 실패는 poison → NotConnected로 처리한다.
@@ -88,7 +143,160 @@ fn connect_expected(
         attached_name: String::new(),
         registration_id: 0,
         attachment_id: super::temporal::fresh_identity(),
+        producer_token: super::broker::producer_token_from_controller(session_token),
     };
+    let client_nonce = super::broker::new_auth_nonce();
+    {
+        let mut writer = link.writer.lock().unwrap_or_else(|p| p.into_inner());
+        writer
+            .write_all(
+                to_line(&Request::new(
+                    0,
+                    "broker_authenticate",
+                    serde_json::json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "client_nonce": client_nonce.clone(),
+                    }),
+                ))
+                .as_bytes(),
+            )
+            .map_err(|_| LinkError::NotConnected)?;
+    }
+    let auth_line =
+        read_frame_until(&mut link.reader, &mut link.pending, auth_deadline).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) {
+                LinkError::Timeout
+            } else {
+                io_e(error)
+            }
+        })?;
+    let auth_line = auth_line.ok_or(LinkError::NotConnected)?;
+    let auth_response =
+        parse_response(auth_line.trim()).map_err(|error| LinkError::Protocol(error.to_string()))?;
+    if auth_response.id != 0 || !auth_response.ok {
+        return Err(LinkError::Protocol(
+            "broker authentication response used an invalid envelope".into(),
+        ));
+    }
+    let auth_result = auth_response
+        .result
+        .and_then(|result| result.as_object().cloned())
+        .ok_or_else(|| LinkError::Protocol("broker authentication omitted its result".into()))?;
+    if auth_result.get("protocol_version").and_then(Value::as_u64)
+        != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return Err(LinkError::Protocol(
+            "broker authentication protocol version mismatch".into(),
+        ));
+    }
+    let server_nonce = auth_result
+        .get("server_nonce")
+        .and_then(Value::as_str)
+        .filter(|nonce| super::broker::auth_nonce_is_current(nonce))
+        .ok_or_else(|| LinkError::Protocol("broker authentication nonce is invalid".into()))?
+        .to_string();
+    let presented_server_proof = auth_result
+        .get("server_proof")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected_server_proof =
+        super::broker::session_server_proof(session_token, &client_nonce, &server_nonce);
+    if !super::broker::auth_proof_matches(&expected_server_proof, presented_server_proof) {
+        link.close_session();
+        return Err(LinkError::IdentityMismatch {
+            expected: "[redacted]".into(),
+            actual: Some("[redacted]".into()),
+            identity: Box::new(EmulatorIdentity::default()),
+        });
+    }
+    link.reader
+        .get_ref()
+        .set_read_timeout(Some(timeout))
+        .map_err(io_e)?;
+
+    Ok((link, client_nonce, server_nonce))
+}
+
+/// Verify the broker without attaching a controller or changing registry ownership.
+pub fn probe_session(session_addr: &str, timeout: Duration) -> Result<(), LinkError> {
+    probe_session_until(session_addr, Instant::now() + timeout)
+}
+
+fn probe_session_until(session_addr: &str, deadline: Instant) -> Result<(), LinkError> {
+    let token = configured_controller_token()?;
+    probe_session_with_token_until(session_addr, &token, deadline)
+}
+
+#[cfg(test)]
+pub(crate) fn probe_session_with_token(
+    session_addr: &str,
+    token: &str,
+    timeout: Duration,
+) -> Result<(), LinkError> {
+    probe_session_with_token_until(session_addr, token, Instant::now() + timeout)
+}
+
+fn probe_session_with_token_until(
+    session_addr: &str,
+    token: &str,
+    deadline: Instant,
+) -> Result<(), LinkError> {
+    let endpoint = session_addr.parse().map_err(|_| {
+        LinkError::Protocol("broker readiness requires a numeric socket address".into())
+    })?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(LinkError::Timeout);
+    }
+    let stream = TcpStream::connect_timeout(&endpoint, remaining).map_err(io_e)?;
+    let (link, _, _) = authenticate_session(stream, token, deadline)?;
+    drop(link);
+    Ok(())
+}
+
+/// Observe an election winner's credential rotation within one startup budget.
+pub fn wait_for_session(session_addr: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if probe_session_until(
+            session_addr,
+            deadline.min(Instant::now() + Duration::from_millis(100)),
+        )
+        .is_ok()
+        {
+            return true;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+fn connect_expected(
+    session_addr: &str,
+    name: Option<String>,
+    expected_registration_id: Option<u64>,
+    expected_launch_id: Option<String>,
+    session_token: &str,
+    timeout: Duration,
+) -> Result<BrokerLink, LinkError> {
+    if !super::broker::session_token_is_valid(session_token) {
+        return Err(LinkError::Protocol(
+            "broker authentication token is invalid".into(),
+        ));
+    }
+    let stream = TcpStream::connect(session_addr).map_err(|_| LinkError::NotConnected)?;
+    let (mut link, client_nonce, server_nonce) =
+        authenticate_session(stream, session_token, Instant::now() + timeout)?;
     let mut params = serde_json::Map::new();
     if let Some(name) = name {
         params.insert("name".into(), Value::String(name));
@@ -102,6 +310,16 @@ fn connect_expected(
     if let Some(launch_id) = expected_launch_id {
         params.insert("expected_launch_id".into(), Value::String(launch_id));
     }
+    let attach_binding = super::broker::session_attach_binding(&params);
+    params.insert(
+        "auth_proof".into(),
+        Value::String(super::broker::session_client_proof(
+            session_token,
+            &client_nonce,
+            &server_nonce,
+            &attach_binding,
+        )),
+    );
     let res = link.raw_call("attach", Value::Object(params))?;
     link.attached_name = res
         .get("attached_name")
@@ -169,6 +387,34 @@ fn connect_expected(
 
 fn io_e(e: std::io::Error) -> LinkError {
     LinkError::Protocol(format!("io: {e}"))
+}
+
+fn read_frame_until(
+    reader: &mut BufReader<TcpStream>,
+    pending: &mut Vec<u8>,
+    deadline: Instant,
+) -> io::Result<Option<String>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        match super::protocol::read_ndjson_chunk(reader, pending) {
+            Ok(frame) => return Ok(frame),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl BrokerLink {
@@ -434,6 +680,10 @@ impl EmulatorLink for BrokerLink {
     fn has_exclusive_control(&self) -> bool {
         !self.attached_name.is_empty() && self.registration_id != 0
     }
+
+    fn session_token(&self) -> Option<&str> {
+        Some(&self.producer_token)
+    }
 }
 
 /// 지연 BrokerLink — 첫 call 시에 connect+attach를 시도한다. 실패 시 직접 모드로 폴백하지
@@ -445,6 +695,9 @@ pub struct LazyBrokerLink {
     inner: Option<BrokerLink>,
     expected_registration_id: Option<u64>,
     expected_launch_id: Option<String>,
+    controller_token: Option<String>,
+    producer_token: Option<String>,
+    reload_session_token: bool,
 }
 
 /// tcp::lazy에 대응하는 broker 지연 접속 팩토리. EMUCAP_BROKER 모드에서 SharedLink로 감싸
@@ -457,17 +710,56 @@ pub fn lazy(session_addr: &str, name: Option<String>, timeout: Duration) -> Lazy
         inner: None,
         expected_registration_id: None,
         expected_launch_id: None,
+        controller_token: None,
+        producer_token: None,
+        reload_session_token: true,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lazy_with_token(
+    session_addr: &str,
+    name: Option<String>,
+    session_token: &str,
+    timeout: Duration,
+) -> LazyBrokerLink {
+    LazyBrokerLink {
+        addr: session_addr.to_string(),
+        name,
+        timeout,
+        inner: None,
+        expected_registration_id: None,
+        expected_launch_id: None,
+        controller_token: Some(session_token.to_string()),
+        producer_token: Some(super::broker::producer_token_from_controller(session_token)),
+        reload_session_token: false,
     }
 }
 
 impl LazyBrokerLink {
     fn ensure_connected(&mut self) -> Result<&mut BrokerLink, LinkError> {
         if self.inner.is_none() {
+            if self.reload_session_token {
+                // Do not surface a token from a broker generation that has already disconnected.
+                self.controller_token = None;
+                self.producer_token = None;
+            }
+            let session_token = match (self.reload_session_token, self.controller_token.clone()) {
+                (true, _) | (false, None) => configured_controller_token()?,
+                (false, Some(token)) => token,
+            };
+            // Preserve the freshly loaded capability even when attach reports that no producer is
+            // registered yet. Launch/status flows need the out-of-band token to start that producer.
+            self.producer_token = Some(super::broker::producer_token_from_controller(
+                &session_token,
+            ));
+            self.controller_token = Some(session_token.clone());
             let link = connect_expected(
                 &self.addr,
                 self.name.clone(),
                 self.expected_registration_id,
                 self.expected_launch_id.clone(),
+                &session_token,
                 self.timeout,
             )?;
             if self.name.is_none() {
@@ -559,5 +851,9 @@ impl EmulatorLink for LazyBrokerLink {
         self.inner
             .as_ref()
             .is_some_and(EmulatorLink::has_exclusive_control)
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        self.producer_token.as_deref()
     }
 }

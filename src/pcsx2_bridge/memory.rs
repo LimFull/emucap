@@ -10,7 +10,13 @@ const MAX_PATTERN_MATCHES: u64 = 4096;
 impl<T: PineTransport> Pcsx2Bridge<T> {
     pub(super) fn find_pattern(&mut self, params: &Value) -> BridgeResult<Value> {
         require_ee_memory_type(params)?;
-        let pattern = hex::decode(required_str(params, "hex")?)
+        let encoded = required_str(params, "hex")?;
+        if encoded.len() > MAX_PATTERN_BYTES * 2 {
+            return Err(Pcsx2BridgeError::BadParams(
+                "find_pattern hex exceeds 64 KiB".into(),
+            ));
+        }
+        let pattern = hex::decode(encoded)
             .map_err(|_| Pcsx2BridgeError::BadParams("hex decode failed".into()))?;
         if pattern.is_empty() || pattern.len() > MAX_PATTERN_BYTES {
             return Err(Pcsx2BridgeError::BadParams(format!(
@@ -46,22 +52,17 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         let bytes = finish_with_cleanup(scan, cleanup, "find_pattern resume")?;
 
         let mut matches = Vec::new();
-        let mut offset = 0usize;
         let mut truncated_matches = false;
-        while offset <= bytes.len().saturating_sub(pattern.len()) {
-            let Some(relative) = find_subslice(&bytes[offset..], &pattern) else {
-                break;
-            };
-            let relative = offset + relative;
+        pattern_matches(&bytes, &pattern, |relative| {
             if relative.is_multiple_of(align) {
                 if matches.len() >= max_matches {
                     truncated_matches = true;
-                    break;
+                    return false;
                 }
                 matches.push(start + relative as u64);
             }
-            offset = relative + 1;
-        }
+            true
+        });
 
         Ok(json!({
             "memory_type": "ee",
@@ -169,11 +170,42 @@ fn require_ee_memory_type(params: &Value) -> BridgeResult<()> {
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+// KMP retains overlap information, so repeated-prefix patterns remain linear.
+fn pattern_matches<T: PartialEq>(data: &[T], pattern: &[T], mut visit: impl FnMut(usize) -> bool) {
+    if pattern.is_empty() || pattern.len() > data.len() {
+        return;
+    }
+    let mut prefix = vec![0; pattern.len()];
+    let mut matched = 0;
+    for i in 1..pattern.len() {
+        while matched > 0 && pattern[i] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[i] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[i] = matched;
+    }
+    matched = 0;
+    for (i, value) in data.iter().enumerate() {
+        while matched > 0 && *value != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *value == pattern[matched] {
+            matched += 1;
+        }
+        if matched == pattern.len() {
+            if !visit(i + 1 - pattern.len()) {
+                return;
+            }
+            matched = prefix[matched - 1];
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "memory_tests.rs"]
+mod pattern_tests;
 
 fn finish_with_cleanup<T>(
     operation: BridgeResult<T>,

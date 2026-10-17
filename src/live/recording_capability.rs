@@ -8,6 +8,44 @@ use crate::event_contracts::{EventContractError, EventContractRegistry};
 pub use crate::input_movie::INPUT_MOVIE_FORMAT;
 use crate::live::temporal::{MAX_SYNC_ADVANCE_COUNT, MAX_SYNC_OPERATION_MS};
 
+/// Core admission applies to imported manifests as well as live capabilities.
+pub fn validate_recording_limits(limits: &RecordingLimits) -> Result<(), RecordingCapabilityError> {
+    if limits.max_frames == 0 || limits.max_frames > CORE_MAX_RECORDING_FRAMES {
+        return Err(RecordingCapabilityError::Invalid(
+            "max_frames is outside the Core bound".into(),
+        ));
+    }
+    if limits.max_events < limits.max_frames || limits.max_events > CORE_MAX_RECORDING_EVENTS {
+        return Err(RecordingCapabilityError::Invalid(
+            "max_events is outside the Core bound".into(),
+        ));
+    }
+    if limits.max_bytes == 0 || limits.max_bytes > CORE_MAX_RECORDING_BYTES {
+        return Err(RecordingCapabilityError::Invalid(
+            "max_bytes is outside the Core bound".into(),
+        ));
+    }
+    if limits.max_line_bytes == 0
+        || limits.max_line_bytes > CORE_MAX_RECORDING_LINE_BYTES
+        || limits.max_line_bytes > limits.max_bytes
+    {
+        return Err(RecordingCapabilityError::Invalid(
+            "max_line_bytes is outside the Core bound".into(),
+        ));
+    }
+    if limits.max_host_ms == 0 || limits.max_host_ms > CORE_MAX_RECORDING_HOST_MS {
+        return Err(RecordingCapabilityError::Invalid(
+            "max_host_ms is outside the Core bound".into(),
+        ));
+    }
+    if limits.progress_interval_ms < 10 || limits.progress_interval_ms >= limits.max_host_ms {
+        return Err(RecordingCapabilityError::Invalid(
+            "progress_interval_ms must be in 10..max_host_ms".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Recording shares the finite synchronous guest-advance envelope. Adapters still advertise a
 /// conservative per-runtime subset, and callers must explicitly request every captured frame.
 pub const CORE_MAX_RECORDING_FRAMES: u64 = MAX_SYNC_ADVANCE_COUNT;
@@ -557,41 +595,7 @@ impl RecordingCapability {
             }
         }
 
-        let limits = &self.limits;
-        if limits.max_frames == 0 || limits.max_frames > CORE_MAX_RECORDING_FRAMES {
-            return Err(RecordingCapabilityError::Invalid(
-                "max_frames is outside the Core bound".into(),
-            ));
-        }
-        if limits.max_events < limits.max_frames || limits.max_events > CORE_MAX_RECORDING_EVENTS {
-            return Err(RecordingCapabilityError::Invalid(
-                "max_events is outside the Core bound".into(),
-            ));
-        }
-        if limits.max_bytes == 0 || limits.max_bytes > CORE_MAX_RECORDING_BYTES {
-            return Err(RecordingCapabilityError::Invalid(
-                "max_bytes is outside the Core bound".into(),
-            ));
-        }
-        if limits.max_line_bytes == 0
-            || limits.max_line_bytes > CORE_MAX_RECORDING_LINE_BYTES
-            || limits.max_line_bytes > limits.max_bytes
-        {
-            return Err(RecordingCapabilityError::Invalid(
-                "max_line_bytes is outside the Core bound".into(),
-            ));
-        }
-        if limits.max_host_ms == 0 || limits.max_host_ms > CORE_MAX_RECORDING_HOST_MS {
-            return Err(RecordingCapabilityError::Invalid(
-                "max_host_ms is outside the Core bound".into(),
-            ));
-        }
-        if limits.progress_interval_ms < 10 || limits.progress_interval_ms >= limits.max_host_ms {
-            return Err(RecordingCapabilityError::Invalid(
-                "progress_interval_ms must be in 10..max_host_ms".into(),
-            ));
-        }
-        Ok(())
+        validate_recording_limits(&self.limits)
     }
 
     pub fn identities(

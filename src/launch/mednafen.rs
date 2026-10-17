@@ -1,5 +1,5 @@
 //! Mednafen (Saturn / PSX / PC Engine / PC-FX / Mega Drive / WonderSwan / Neo Geo Pocket) launch orchestration. One
-//! built binary handles every system; the caller passes the force_module. We run a per-port *copy* of
+//! built binary handles every system; the caller passes the force_module. We run a per-generation copy of
 //! the binary so that
 //! rebuilding the shared work tree doesn't disturb a running instance (the copy is a separate inode).
 
@@ -90,22 +90,22 @@ pub fn read_build_metadata(binary: &Path) -> std::io::Result<Option<BuildMetadat
     Ok(Some(metadata))
 }
 
-fn default_pcfx_bios_source() -> PathBuf {
-    super::emu_home_base().join("firmware/pcfx.rom")
+fn default_pcfx_bios_source() -> std::io::Result<PathBuf> {
+    Ok(super::emu_home_base()?.join("firmware/pcfx.rom"))
 }
 
 /// Shared operator-supplied firmware inventory. Managed launches copy only the
-/// canonical Mednafen filenames they understand into the port-owned profile.
-pub fn default_firmware_root() -> PathBuf {
-    super::emu_home_base().join("firmware")
+/// canonical Mednafen filenames they understand into the generation-owned profile.
+pub fn default_firmware_root() -> std::io::Result<PathBuf> {
+    Ok(super::emu_home_base()?.join("firmware"))
 }
 
 fn resolve_firmware_root() -> std::io::Result<(PathBuf, bool)> {
     let explicit = std::env::var_os("EMUCAP_MEDNAFEN_FIRMWARE");
     let root = explicit
         .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_firmware_root);
+        .map(|path| Ok(PathBuf::from(path)))
+        .unwrap_or_else(default_firmware_root)?;
     if explicit.is_some() && !root.is_absolute() {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -115,18 +115,24 @@ fn resolve_firmware_root() -> std::io::Result<(PathBuf, bool)> {
     Ok((root, explicit.is_some()))
 }
 
-pub fn runtime_home(port: u16, repeatable: bool) -> PathBuf {
-    let home = super::emu_home_dir("mednafen", port);
-    if repeatable {
-        home.join("repeatable-md")
-    } else {
-        home
-    }
+pub fn runtime_home(port: u16, _repeatable: bool) -> std::io::Result<PathBuf> {
+    super::emu_generation_dir("mednafen", port, None)
 }
 
-fn prepare_runtime_home_for(port: u16, repeatable: bool) -> std::io::Result<PathBuf> {
-    let base = super::emu_home_base();
-    let home = runtime_home(port, repeatable);
+/// Resolve the Mednafen profile owned by an already prepared managed generation.
+pub fn managed_runtime_home(port: u16, runtime: super::RuntimeEnv<'_>) -> std::io::Result<PathBuf> {
+    super::emu_generation_dir("mednafen", port, Some(runtime))
+}
+
+fn prepare_runtime_home_for(
+    port: u16,
+    runtime: Option<super::RuntimeEnv<'_>>,
+) -> std::io::Result<PathBuf> {
+    let base = super::emu_home_base()?;
+    let home = match runtime {
+        Some(runtime) => managed_runtime_home(port, runtime)?,
+        None => runtime_home(port, false)?,
+    };
     if super::has_symlink_component_under(&base, &home) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -136,23 +142,6 @@ fn prepare_runtime_home_for(port: u16, repeatable: bool) -> std::io::Result<Path
             ),
         ));
     }
-    if repeatable {
-        match std::fs::symlink_metadata(&home) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "repeatable Mednafen home is not a private directory: {}",
-                        home.display()
-                    ),
-                ));
-            }
-            Ok(_) => std::fs::remove_dir_all(&home)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    std::fs::create_dir_all(&home)?;
     let firmware = home.join("firmware");
     if super::has_symlink_component_under(&base, &firmware) {
         return Err(Error::new(
@@ -198,7 +187,7 @@ fn prepare_runtime_home_for(port: u16, repeatable: bool) -> std::io::Result<Path
 
 #[cfg(test)]
 fn prepare_runtime_home(port: u16) -> std::io::Result<PathBuf> {
-    prepare_runtime_home_for(port, false)
+    prepare_runtime_home_for(port, None)
 }
 
 /// Resolve the operator-supplied PC-FX BIOS without touching Mednafen's user profile.
@@ -210,8 +199,8 @@ pub fn resolve_pcfx_bios() -> std::io::Result<PathBuf> {
     let explicit = std::env::var_os("EMUCAP_PCFX_BIOS");
     let path = explicit
         .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_pcfx_bios_source);
+        .map(|path| Ok(PathBuf::from(path)))
+        .unwrap_or_else(default_pcfx_bios_source)?;
     if explicit.is_some() && !path.is_absolute() {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -223,7 +212,7 @@ pub fn resolve_pcfx_bios() -> std::io::Result<PathBuf> {
             error.kind(),
             format!(
                 "PC-FX needs the version 1.00 pcfx.rom BIOS: set EMUCAP_PCFX_BIOS or place it at {}: {error}",
-                default_pcfx_bios_source().display()
+                path.display()
             ),
         )
     })?;
@@ -365,7 +354,7 @@ fn copy_run_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Launch Mednafen detached for emucap. Every module receives a port-owned Mednafen home. Known
+/// Launch Mednafen detached for emucap. Every module receives a generation-owned Mednafen home. Known
 /// firmware files are copied from the shared emucap inventory, and PC-FX additionally receives its
 /// explicitly validated BIOS path. The user's Mednafen profile is never read or changed.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
@@ -376,7 +365,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
         ));
     }
     let build_metadata = read_build_metadata(l.binary)?;
-    let runtime_home = prepare_runtime_home_for(l.port, l.repeatable)?;
+    let runtime_home = prepare_runtime_home_for(l.port, l.runtime)?;
     let run_binary = if l.explicit_binary {
         l.binary.to_path_buf()
     } else {

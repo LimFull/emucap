@@ -53,7 +53,12 @@ CD content identity uses the CUE entry file plus every unique referenced file. I
 declared filename, size, and bytes of each file, and reports per-file SHA-1 values so changing an
 audio or data track changes the disc identity.
 
-A maintained representative-game smoke uses Metal Slug 2 with a matching MAME 0.288 set. It
+The shared source pin is MAME 0.289. Maintained macOS and Linux ARM64 subset builds pass
+selected CDZ observation/pacing, input equivalence and repeated restore with breakpoints
+at the Twinkle Star Sprites loading screen. Further game/profile checks, Windows and
+Linux x86-64 remain open.
+
+The maintained representative-game smoke was previously run with Metal Slug 2 and a matching MAME 0.288 set. It
 verifies RAM mutation and native-state restore, `CREDIT 0` to `CREDIT 1` after coin input, and the
 transition to the `HOW TO PLAY` screen after start input. Runtime media is not stored in the
 repository:
@@ -90,12 +95,8 @@ and Pocket/Color remain profile-specific and do not establish Hyper Neo Geo 64 s
 
 ## Batched memory and execution speed
 
-Requires the current patch stack (0006 side-effect-free reads and fast-forward readback, 0007
-throttle-wait hook and sub-second waits); the bridge advertises the methods only when the plugin
-reports those bindings. `read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen stop with
-device side effects disabled, the view MAME's debugger uses; `read_memory` uses the same read.
-`debug.execution_speed` drives MAME's own governor (`speed_factor`, 0.1 percent steps from 0.1 to
-10000, or unlimited); the launch default is MAME's 100 percent. Fast-forward, refresh-rate speed or
-a non-unit throttle rate reads back as `custom`. Read-only requests are answered during throttle
-waits, so polling never advances a slow guest; a paced frame advance that would outlive its host
-budget stops with `reason: "host_deadline"`.
+Neo Geo uses the [shared MAME memory and pacing contract](../mame-pc98/README.md#batched-memory-and-execution-speed).
+`read_memory_batch` observes up to 64 ranges (64 KiB) at one frozen stop. `debug.execution_speed`
+controls MAME's native governor from 0.1 to 10000 percent or unlimited when the connected producer
+advertises the required bindings. The shared contract owns capability gates, backend memory
+limits, write chunking and pacing-aware deadlines.

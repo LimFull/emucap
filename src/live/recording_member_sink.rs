@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, Read};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -9,16 +9,8 @@ use serde::Deserialize;
 
 use crate::bundle::recording_manifest::InitialSnapshotRequest;
 
-const HANDSHAKE_LIMIT: u64 = 1024;
 const HEADER_LIMIT: u64 = 1024;
 const POLL_MS: u64 = 20;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Handshake {
-    token: String,
-    capture_id: String,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +116,15 @@ impl MemberSinkServer {
     }
 }
 
+impl Drop for MemberSinkServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn run_sink(
     listener: TcpListener,
     expected_token: &str,
@@ -136,32 +137,14 @@ fn run_sink(
     let mut members = Vec::with_capacity(requests.len());
     let mut partial = None;
     let result = (|| -> Result<(), String> {
-        let stream = loop {
-            if stop.load(Ordering::Acquire) {
-                return Err("initial snapshot sink stopped before connection".into());
-            }
-            if Instant::now() >= deadline {
-                return Err("initial snapshot sink accept deadline exceeded".into());
-            }
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => return Err(format!("initial snapshot sink accept failed: {error}")),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_millis(POLL_MS)))
-            .map_err(|error| format!("initial snapshot sink timeout setup failed: {error}"))?;
-        let mut reader = BufReader::new(stream);
-        let handshake =
-            read_required_line(&mut reader, HANDSHAKE_LIMIT, deadline, stop, "handshake")?;
-        let handshake: Handshake = serde_json::from_slice(&handshake)
-            .map_err(|error| format!("initial snapshot handshake JSON failed: {error}"))?;
-        if handshake.token != expected_token || handshake.capture_id != expected_capture {
-            return Err("initial snapshot sink authentication failed".into());
-        }
+        let mut reader = super::recording_admission::accept_authenticated(
+            &listener,
+            expected_token,
+            expected_capture,
+            deadline,
+            stop,
+            Duration::from_millis(POLL_MS),
+        )?;
 
         for request in requests {
             let header =

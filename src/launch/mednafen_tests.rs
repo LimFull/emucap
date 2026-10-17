@@ -163,7 +163,7 @@ fn runtime_home_stages_known_firmware_without_reading_user_profile() {
 
     let home = prepare_runtime_home(47800).unwrap();
 
-    assert_eq!(home, dir.path().join("emucap/mednafen/47800"));
+    assert!(home.starts_with(dir.path().join("emucap/mednafen/47800/manual")));
     assert_eq!(
         std::fs::read(home.join("firmware/sega_101.bin")).unwrap(),
         b"managed Saturn BIOS"
@@ -188,7 +188,28 @@ fn runtime_home_allows_an_absent_default_firmware_inventory() {
 }
 
 #[test]
-fn repeatable_md_home_is_separate_and_recreated_without_touching_ordinary_saves() {
+fn managed_runtime_home_stays_inside_its_prepared_generation() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", dir.path());
+    let store = crate::live::runtime::RuntimeStore::discover().unwrap();
+    let prepared = store.prepare(47802).unwrap();
+    let failure = prepared.adapter_failure_path();
+    let runtime = crate::launch::RuntimeEnv {
+        launch_id: prepared.launch_id(),
+        adapter_failure_path: &failure,
+    };
+
+    let home = managed_runtime_home(47802, runtime).unwrap();
+
+    assert_eq!(home, prepared.generation_dir().join("emulators/mednafen"));
+    assert!(!dir.path().join("mednafen").exists());
+    prepared.abort().unwrap();
+}
+
+#[test]
+fn successive_mednafen_homes_are_disjoint_without_deleting_prior_state() {
     let _lock = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE"]);
     let dir = tempfile::tempdir().unwrap();
@@ -198,13 +219,14 @@ fn repeatable_md_home_is_separate_and_recreated_without_touching_ordinary_saves(
     let ordinary = prepare_runtime_home(47804).unwrap();
     std::fs::create_dir_all(ordinary.join("sav")).unwrap();
     std::fs::write(ordinary.join("sav/ordinary.sav"), b"user progress").unwrap();
-    let repeatable = prepare_runtime_home_for(47804, true).unwrap();
+    let repeatable = prepare_runtime_home_for(47804, None).unwrap();
     std::fs::create_dir_all(repeatable.join("sav")).unwrap();
     std::fs::write(repeatable.join("sav/prior.sav"), b"discardable").unwrap();
 
-    let refreshed = prepare_runtime_home_for(47804, true).unwrap();
+    let refreshed = prepare_runtime_home_for(47804, None).unwrap();
 
-    assert_eq!(refreshed, ordinary.join("repeatable-md"));
+    assert_ne!(ordinary, repeatable);
+    assert_ne!(repeatable, refreshed);
     assert!(!refreshed.join("sav/prior.sav").exists());
     assert_eq!(
         std::fs::read(ordinary.join("sav/ordinary.sav")).unwrap(),
@@ -256,19 +278,19 @@ fn explicit_firmware_inventory_must_be_absolute_and_exist() {
 
 #[cfg(unix)]
 #[test]
-fn runtime_home_refuses_a_symlinked_port_directory() {
+fn runtime_home_refuses_an_unsafe_managed_root() {
+    use std::os::unix::fs::PermissionsExt;
+
     let _lock = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE"]);
     let dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
     let base = dir.path().join("emucap");
-    std::fs::create_dir_all(base.join("mednafen")).unwrap();
-    std::os::unix::fs::symlink(outside.path(), base.join("mednafen/47803")).unwrap();
+    std::fs::create_dir(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("EMUCAP_EMU_HOME", &base);
     std::env::remove_var("EMUCAP_MEDNAFEN_FIRMWARE");
 
     let error = prepare_runtime_home(47803).unwrap_err();
 
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
 }

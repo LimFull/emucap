@@ -311,6 +311,16 @@
       "expression": "step(n,unit=frames).completed => delta_frame = n and frozen(after)"
     },
     {
+      "id": "INPUT.POLL.TRACE.1",
+      "category": "observation",
+      "expression": "poll_history.ok => bounded(entries) and entries_are_committed_responses and generation_identified and missing_retained_prefix_reported and exclusive_sequence_cursor"
+    },
+    {
+      "id": "EXEC.STEP.POLL.1",
+      "category": "postcondition",
+      "expression": "step(n,unit=input_polls).completed => delta_successful_controller_responses = n and frozen(after) and no_next_poll_until_release"
+    },
+    {
       "id": "EXEC.STEP.INSTR.1",
       "category": "postcondition",
       "expression": "step(n,unit=instructions,cpu).completed => delta_instruction(cpu) = n and frozen(after)"
@@ -781,6 +791,23 @@
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["EXEC.STEP.FRAME.1", "EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.STOP.1", "TIME.GAP.1", "DEBUG.CPU.SELECT.1"]
+    },
+    {
+      "id": "execution.step-input-polls-wire",
+      "surface": "wire",
+      "methods": ["step_input_polls"],
+      "temporal_classes": ["T1"],
+      "disposition": "retain",
+      "expectations": ["EXEC.STEP.POLL.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.STOP.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "input.poll-history",
+      "surface": "public",
+      "route": "debug",
+      "methods": ["read_input_polls"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["CORE.AVAIL.1", "CORE.PARAM.1", "INPUT.POLL.TRACE.1", "TIME.RESPONSE.1"]
     },
     {
       "id": "execution.step-instructions-wire",

@@ -1,6 +1,6 @@
 # Build the pinned Dolphin native adapter on Windows.
 #
-# Requirements: Visual Studio 2022 with MSVC and a Windows SDK, plus Git.
+# Requirements: Visual Studio 2026 with MSVC and a Windows SDK, plus Git, CMake and Ninja.
 #
 #   build.ps1 [-Src <source-directory>] [-Jobs 2]
 param(
@@ -11,6 +11,24 @@ param(
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $Src) { $Src = Join-Path $here "work\dolphin-src" }
+
+function Invoke-NativeChecked([string]$Program, [string[]]$Arguments, [string]$FailureMessage) {
+  # Windows PowerShell 5.1 surfaces native stderr as error records.  Commands
+  # such as Git use stderr for normal progress, so decide success from the
+  # process exit code while retaining the script-wide fail-fast preference.
+  $previousPreference = $ErrorActionPreference
+  $exitCode = $null
+  try {
+    $ErrorActionPreference = "Continue"
+    & $Program @Arguments
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+  if ($null -eq $exitCode -or $exitCode -ne 0) {
+    throw "$FailureMessage (exit code $exitCode)"
+  }
+}
 
 $lock = @{}
 foreach ($line in Get-Content -LiteralPath (Join-Path $here "upstream.lock")) {
@@ -26,16 +44,15 @@ foreach ($key in @("DOLPHIN_REPO", "DOLPHIN_COMMIT", "DOLPHIN_HOST_API", "DOLPHI
 
 if (-not (Test-Path -LiteralPath (Join-Path $Src ".git") -PathType Container)) {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Src) | Out-Null
-  git clone --filter=blob:none $lock.DOLPHIN_REPO $Src
-  if ($LASTEXITCODE -ne 0) { throw "failed to clone Dolphin" }
+  Invoke-NativeChecked git @("clone", "--filter=blob:none", $lock.DOLPHIN_REPO, $Src) "failed to clone Dolphin"
 }
 
-git -C $Src fetch --depth 1 origin $lock.DOLPHIN_COMMIT
-if ($LASTEXITCODE -ne 0) { throw "failed to fetch the pinned Dolphin revision" }
-git -C $Src checkout --detach $lock.DOLPHIN_COMMIT
-if ($LASTEXITCODE -ne 0) { throw "failed to check out the pinned Dolphin revision" }
-git -C $Src submodule update --init --recursive --depth 1 --jobs 4
-if ($LASTEXITCODE -ne 0) { throw "failed to update Dolphin submodules" }
+Invoke-NativeChecked git @("-C", $Src, "fetch", "--depth", "1", "origin", $lock.DOLPHIN_COMMIT) "failed to fetch the pinned Dolphin revision"
+Invoke-NativeChecked git @("-C", $Src, "checkout", "--detach", $lock.DOLPHIN_COMMIT) "failed to check out the pinned Dolphin revision"
+# SPIRV-Cross contains generated reference filenames that exceed Win32's
+# legacy MAX_PATH limit. Keep long-path handling scoped to this Git command;
+# changing the runner-wide Git configuration would outlive this build.
+Invoke-NativeChecked git @("-c", "core.longpaths=true", "-C", $Src, "submodule", "update", "--init", "--recursive", "--depth", "1", "--jobs", "4") "failed to update Dolphin submodules"
 
 $owned = @(
   "Source/Core/AudioCommon/AudioCommon.cpp",
@@ -51,6 +68,7 @@ $owned = @(
   "Source/Core/VideoCommon/VideoBackendBase.cpp",
   "Source/Core/VideoCommon/VideoBackendBase.h",
   "Source/Core/VideoCommon/VideoState.cpp",
+  "Source/Core/VideoCommon/VideoConfig.cpp",
   "Source/Core/VideoCommon/VideoState.h",
   "Source/Core/Common/Config/ConfigInfo.h",
   "Source/Core/Common/Config/Config.h",
@@ -102,14 +120,18 @@ $owned = @(
   "Source/Core/DolphinNoGUI/Platform.h",
   "Source/Core/DolphinNoGUI/PlatformHeadless.cpp",
   "Source/Core/DolphinNoGUI/MainNoGUI.cpp",
-  "Source/Core/DolphinQt/Settings.cpp",
-  "Source/Core/DolphinLib.props"
+  "Source/Core/DolphinQt/Settings.cpp"
 )
-git -C $Src checkout -- $owned
-if ($LASTEXITCODE -ne 0) { throw "failed to restore files owned by the patch stack" }
-git -C $Src clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h `
-  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h Source/Core/Core/EmuCapTemporal.h Source/Core/Core/EmuCapOwner.h Source/Core/Core/EmuCapWire.h Source/Core/Core/EmuCapOwned.inl Source/Core/Core/EmuCapPacing.h Source/Core/Core/EmuCapAudio.h
-if ($LASTEXITCODE -ne 0) { throw "failed to clean stale adapter sources" }
+Invoke-NativeChecked git (@("-C", $Src, "checkout", "--") + $owned) "failed to restore files owned by the patch stack"
+Invoke-NativeChecked git @(
+  "-C", $Src, "clean", "-fdq", "--",
+  "Source/Core/Core/EmuCap.cpp", "Source/Core/Core/EmuCap.h",
+  "Source/Core/Core/EmuCapInput.cpp", "Source/Core/Core/EmuCapInput.h",
+  "Source/Core/Core/EmuCapTemporal.h", "Source/Core/Core/EmuCapOwner.h",
+  "Source/Core/Core/EmuCapWire.h", "Source/Core/Core/EmuCapOwned.inl",
+  "Source/Core/Core/EmuCapPacing.h", "Source/Core/Core/EmuCapAudio.h",
+  "Source/Core/Core/EmuCapFrontAuth.h"
+) "failed to clean stale adapter sources"
 
 Copy-Item -LiteralPath (Join-Path $here "EmuCap.cpp") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCap.cpp") -Force
@@ -129,6 +151,8 @@ Copy-Item -LiteralPath (Join-Path $here "EmuCapPacing.h") `
 
 Copy-Item -LiteralPath (Join-Path $here "EmuCapAudio.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapAudio.h") -Force
+Copy-Item -LiteralPath (Join-Path $here "..\_common\emucap_front_auth.h") `
+  -Destination (Join-Path $Src "Source\Core\Core\EmuCapFrontAuth.h") -Force
 
 # Match the bytewise patch order used by the Unix recipe and lock manifest.
 [string[]]$patchNames = @(Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" | ForEach-Object { $_.Name })
@@ -136,19 +160,23 @@ Copy-Item -LiteralPath (Join-Path $here "EmuCapAudio.h") `
 foreach ($patchName in $patchNames) {
   $patch = Get-Item -LiteralPath (Join-Path (Join-Path $here "patches") $patchName)
   Write-Output "[patch] applying $($patch.Name)"
-  git -C $Src apply --check $patch.FullName
-  if ($LASTEXITCODE -ne 0) { throw "patch does not apply cleanly: $($patch.Name)" }
-  git -C $Src apply $patch.FullName
-  if ($LASTEXITCODE -ne 0) { throw "failed to apply patch: $($patch.Name)" }
+  Invoke-NativeChecked git @("-C", $Src, "apply", "--check", $patch.FullName) "patch does not apply cleanly: $($patch.Name)"
+  Invoke-NativeChecked git @("-C", $Src, "apply", $patch.FullName) "failed to apply patch: $($patch.Name)"
 }
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
   throw "Visual Studio Installer vswhere.exe was not found"
 }
-$installation = & $vswhere -latest -products "*" -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if ($LASTEXITCODE -ne 0 -or -not $installation) { throw "Visual Studio 2022 C++ tools were not found" }
+$installation = Invoke-NativeChecked $vswhere @("-latest", "-products", "*", "-version", "[18.0,19.0)", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath") "Visual Studio 2026 discovery failed"
+if (-not $installation) { throw "Visual Studio 2026 C++ tools were not found" }
 $vcvars = Join-Path $installation "VC\Auxiliary\Build\vcvars64.bat"
+$armHost = Join-Path $installation "VC\Auxiliary\Build\vcvarsarm64_amd64.bat"
+$hostCpu = Get-CimInstance Win32_Processor -Property Architecture -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($hostCpu.Architecture -eq 12 -and
+    (Test-Path -LiteralPath $armHost -PathType Leaf)) {
+  $vcvars = $armHost
+}
 if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw "Visual Studio vcvars64.bat was not found" }
 
 $bat = @"
@@ -156,17 +184,15 @@ $bat = @"
 call "$vcvars"
 if errorlevel 1 exit /b %ERRORLEVEL%
 cd /d "$Src"
-msbuild Source\dolphin-emu.sln /p:Configuration=Release /p:Platform=x64 /m:$Jobs /p:CL_MPCount=1 /v:minimal /nologo
+cmake --fresh -S . -B build-emucap-windows -G Ninja -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_C_FLAGS_INIT=/utf-8 -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DENABLE_NOGUI=ON -DUSE_SYSTEM_LIBS=OFF
 if errorlevel 1 exit /b %ERRORLEVEL%
-rem Upstream excludes DolphinNoGUI from the default solution configuration.
-msbuild Source\Core\DolphinNoGUI\DolphinNoGUI.vcxproj /p:Configuration=Release /p:Platform=x64 /m:$Jobs /p:CL_MPCount=1 /v:minimal /nologo
+cmake --build build-emucap-windows --target dolphin-emu dolphin-nogui --parallel $Jobs
 exit /b %ERRORLEVEL%
 "@
 $tmp = Join-Path $env:TEMP "emucap-dolphin-build-$PID.bat"
 try {
   [System.IO.File]::WriteAllText($tmp, $bat, [System.Text.Encoding]::ASCII)
-  & cmd /c $tmp
-  if ($LASTEXITCODE -ne 0) { throw "Dolphin MSBuild failed with exit code $LASTEXITCODE" }
+  Invoke-NativeChecked cmd @("/c", $tmp) "Dolphin CMake build failed"
 } finally {
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 }
@@ -175,7 +201,7 @@ function Get-LowerSha256([string]$Path) {
   (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h", "EmuCapPacing.h", "EmuCapAudio.h", "EmuCapOwner.h", "EmuCapWire.h", "EmuCapOwned.inl")
+$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h", "EmuCapPacing.h", "EmuCapAudio.h", "EmuCapOwner.h", "EmuCapWire.h", "EmuCapOwned.inl", "../_common/emucap_front_auth.h")
 $digestInputs += $patchNames | ForEach-Object { "patches/$_" }
 $manifestLines = foreach ($relative in $digestInputs) {
   $nativePath = Join-Path $here ($relative -replace '/', [System.IO.Path]::DirectorySeparatorChar)
@@ -196,6 +222,11 @@ if ($lock.DOLPHIN_PATCHSET_SHA256 -ne "pending" -and
     $patchset -ne $lock.DOLPHIN_PATCHSET_SHA256) {
   throw "patchset digest differs from upstream.lock"
 }
+
+# Keep the adapter bundle layout stable while upstream builds through CMake.
+$output = Join-Path $Src "Binary\x64"
+New-Item -ItemType Directory -Force -Path $output | Out-Null
+Copy-Item -Path (Join-Path $Src "build-emucap-windows\Binaries\*") -Destination $output -Recurse -Force
 
 $binary = Join-Path $Src "Binary\x64\Dolphin.exe"
 foreach ($name in @('Dolphin.exe', 'DolphinNoGUI.exe')) {

@@ -1,0 +1,757 @@
+diff --git a/pcsx2/CMakeLists.txt b/pcsx2/CMakeLists.txt
+index 4652ff9..52d3e6c 100644
+--- a/pcsx2/CMakeLists.txt
++++ b/pcsx2/CMakeLists.txt
+@@ -167,6 +167,7 @@ set(pcsx2Headers
+ 	IopHw.h
+ 	IopMem.h
+ 	LayeredSettingsInterface.h
++	EmuCapPineAuth.h
+ 	PINE.h
+ 	Mdec.h
+ 	MTGS.h
+diff --git a/pcsx2/EmuCapPineAuth.h b/pcsx2/EmuCapPineAuth.h
+new file mode 100644
+index 0000000..15cada0
+--- /dev/null
++++ b/pcsx2/EmuCapPineAuth.h
+@@ -0,0 +1,277 @@
++// SPDX-FileCopyrightText: 2026 EmuCap contributors
++// SPDX-License-Identifier: GPL-3.0+
++
++#pragma once
++
++#include "Sha256.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace EmuCap::PineAuth
++{
++	constexpr std::uint8_t ChallengeCommand = 0xA0;
++	constexpr std::uint8_t ProofCommand = 0xA1;
++	constexpr std::size_t NonceSize = 16;
++	constexpr std::size_t ProofSize = 32;
++	constexpr std::size_t PrefetchLimit = 650000;
++	constexpr std::size_t BufferLimit = 4 + 1 + ProofSize + PrefetchLimit;
++
++	using Nonce = std::array<std::uint8_t, NonceSize>;
++	using Proof = std::array<std::uint8_t, ProofSize>;
++
++	inline void HashField(CSha256& hash, const void* data, std::size_t size)
++	{
++		std::array<std::uint8_t, 8> length{};
++		std::uint64_t value = size;
++		for (int index = 7; index >= 0; --index)
++		{
++			length[static_cast<std::size_t>(index)] = static_cast<std::uint8_t>(value);
++			value >>= 8;
++		}
++		Sha256_Update(&hash, length.data(), length.size());
++		if (size != 0)
++			Sha256_Update(&hash, static_cast<const Byte*>(data), size);
++	}
++
++	inline Proof Hmac(std::string_view key, std::string_view direction,
++		const Nonce& client_nonce, const void* server_field, std::size_t server_field_size)
++	{
++		constexpr std::size_t block_size = 64;
++		std::array<std::uint8_t, block_size> key_block{};
++		if (key.size() > key_block.size())
++		{
++			CSha256 key_hash;
++			Sha256_Init(&key_hash);
++			Sha256_Update(&key_hash, reinterpret_cast<const Byte*>(key.data()), key.size());
++			Sha256_Final(&key_hash, key_block.data());
++		}
++		else
++		{
++			std::copy(key.begin(), key.end(), key_block.begin());
++		}
++
++		std::array<std::uint8_t, block_size> inner_pad{};
++		std::array<std::uint8_t, block_size> outer_pad{};
++		for (std::size_t index = 0; index < block_size; ++index)
++		{
++			inner_pad[index] = key_block[index] ^ 0x36;
++			outer_pad[index] = key_block[index] ^ 0x5c;
++		}
++
++		CSha256 inner;
++		Sha256_Init(&inner);
++		Sha256_Update(&inner, inner_pad.data(), inner_pad.size());
++		static constexpr std::string_view domain = "emucap-pcsx2-pine-auth-v1";
++		HashField(inner, domain.data(), domain.size());
++		HashField(inner, direction.data(), direction.size());
++		HashField(inner, client_nonce.data(), client_nonce.size());
++		HashField(inner, server_field, server_field_size);
++		Proof inner_digest{};
++		Sha256_Final(&inner, inner_digest.data());
++
++		CSha256 outer;
++		Sha256_Init(&outer);
++		Sha256_Update(&outer, outer_pad.data(), outer_pad.size());
++		Sha256_Update(&outer, inner_digest.data(), inner_digest.size());
++		Proof result{};
++		Sha256_Final(&outer, result.data());
++		return result;
++	}
++
++	inline Proof MakeProof(std::string_view key, std::string_view direction,
++		const Nonce& client_nonce, const Nonce& server_nonce)
++	{
++		return Hmac(key, direction, client_nonce, server_nonce.data(), server_nonce.size());
++	}
++
++	inline Nonce MakeServerNonce(std::string_view key, const Nonce& client_nonce, std::uint64_t counter)
++	{
++		std::array<std::uint8_t, 8> encoded{};
++		for (int index = 7; index >= 0; --index)
++		{
++			encoded[static_cast<std::size_t>(index)] = static_cast<std::uint8_t>(counter);
++			counter >>= 8;
++		}
++		const Proof digest = Hmac(key, "nonce", client_nonce, encoded.data(), encoded.size());
++		Nonce nonce{};
++		std::copy_n(digest.begin(), nonce.size(), nonce.begin());
++		return nonce;
++	}
++
++	inline bool ConstantTimeEqual(const std::uint8_t* left, const std::uint8_t* right, std::size_t size)
++	{
++		std::uint8_t difference = 0;
++		for (std::size_t index = 0; index < size; ++index)
++			difference |= left[index] ^ right[index];
++		return difference == 0;
++	}
++
++	inline std::uint32_t ReadU32(const std::uint8_t* data)
++	{
++		return static_cast<std::uint32_t>(data[0]) |
++			(static_cast<std::uint32_t>(data[1]) << 8) |
++			(static_cast<std::uint32_t>(data[2]) << 16) |
++			(static_cast<std::uint32_t>(data[3]) << 24);
++	}
++
++	inline void AppendU32(std::vector<std::uint8_t>& data, std::uint32_t value)
++	{
++		for (unsigned shift = 0; shift < 32; shift += 8)
++			data.push_back(static_cast<std::uint8_t>(value >> shift));
++	}
++
++	enum class ParseResult
++	{
++		Incomplete,
++		Invalid,
++		Complete,
++	};
++
++	inline ParseResult TakePacket(std::vector<std::uint8_t>& buffer, std::vector<std::uint8_t>& payload)
++	{
++		if (buffer.size() < 4)
++			return ParseResult::Incomplete;
++		const std::uint32_t size = ReadU32(buffer.data());
++		if (size < 5 || size > 4 + 1 + ProofSize)
++			return ParseResult::Invalid;
++		if (buffer.size() < size)
++			return ParseResult::Incomplete;
++		payload.assign(buffer.begin() + 4, buffer.begin() + size);
++		buffer.erase(buffer.begin(), buffer.begin() + size);
++		return ParseResult::Complete;
++	}
++
++	inline std::vector<std::uint8_t> Reply(const void* payload, std::size_t size)
++	{
++		std::vector<std::uint8_t> result;
++		result.reserve(5 + size);
++		AppendU32(result, static_cast<std::uint32_t>(5 + size));
++		result.push_back(0);
++		if (size != 0)
++		{
++			const auto* bytes = static_cast<const std::uint8_t*>(payload);
++			result.insert(result.end(), bytes, bytes + size);
++		}
++		return result;
++	}
++
++	class ServerSession
++	{
++	public:
++		explicit ServerSession(std::string_view token) : m_token(token) {}
++
++		bool Feed(const void* data, std::size_t size)
++		{
++			if (m_failed || m_rx.size() + size > BufferLimit)
++				return Fail();
++			if (size != 0)
++			{
++				const auto* bytes = static_cast<const std::uint8_t*>(data);
++				m_rx.insert(m_rx.end(), bytes, bytes + size);
++			}
++			return true;
++		}
++
++		bool Advance(std::uint64_t& nonce_counter)
++		{
++			if (m_failed || !m_tx.empty() || m_stage == Stage::Ready)
++				return !m_failed;
++			std::vector<std::uint8_t> packet;
++			const ParseResult parsed = TakePacket(m_rx, packet);
++			if (parsed == ParseResult::Incomplete)
++				return true;
++			if (parsed == ParseResult::Invalid)
++				return Fail();
++
++			if (m_stage == Stage::Challenge)
++			{
++				if (packet.size() != 1 + NonceSize || packet[0] != ChallengeCommand ||
++					nonce_counter == std::numeric_limits<std::uint64_t>::max())
++				{
++					return Fail();
++				}
++				std::copy_n(packet.begin() + 1, m_client_nonce.size(), m_client_nonce.begin());
++				m_server_nonce = MakeServerNonce(m_token, m_client_nonce, ++nonce_counter);
++				const Proof proof = MakeProof(m_token, "server", m_client_nonce, m_server_nonce);
++				std::array<std::uint8_t, NonceSize + ProofSize> reply{};
++				std::copy(m_server_nonce.begin(), m_server_nonce.end(), reply.begin());
++				std::copy(proof.begin(), proof.end(), reply.begin() + NonceSize);
++				m_tx = Reply(reply.data(), reply.size());
++				m_stage = Stage::ChallengeReply;
++				return true;
++			}
++
++			if (m_stage != Stage::ClientProof || packet.size() != 1 + ProofSize ||
++				packet[0] != ProofCommand)
++			{
++				return Fail();
++			}
++			const Proof expected = MakeProof(m_token, "client", m_client_nonce, m_server_nonce);
++			if (!ConstantTimeEqual(expected.data(), packet.data() + 1, expected.size()))
++				return Fail();
++			m_verified = true;
++			m_tx = Reply(nullptr, 0);
++			m_stage = Stage::SuccessReply;
++			return true;
++		}
++
++		const std::uint8_t* PendingData() const { return m_tx.data() + m_tx_offset; }
++		std::size_t PendingSize() const { return m_tx.size() - m_tx_offset; }
++
++		bool Wrote(std::size_t size)
++		{
++			if (size > PendingSize())
++				return Fail();
++			m_tx_offset += size;
++			if (m_tx_offset != m_tx.size())
++				return true;
++			m_tx.clear();
++			m_tx_offset = 0;
++			if (m_stage == Stage::ChallengeReply)
++				m_stage = Stage::ClientProof;
++			else if (m_stage == Stage::SuccessReply)
++				m_stage = Stage::Ready;
++			else
++				return Fail();
++			return true;
++		}
++
++		bool Verified() const { return m_verified; }
++		bool Ready() const { return m_stage == Stage::Ready && m_tx.empty(); }
++		bool Failed() const { return m_failed; }
++		std::vector<std::uint8_t> TakePrefetched() { return std::move(m_rx); }
++
++	private:
++		enum class Stage
++		{
++			Challenge,
++			ChallengeReply,
++			ClientProof,
++			SuccessReply,
++			Ready,
++		};
++
++		bool Fail()
++		{
++			m_failed = true;
++			return false;
++		}
++
++		std::string m_token;
++		Stage m_stage = Stage::Challenge;
++		std::vector<std::uint8_t> m_rx;
++		std::vector<std::uint8_t> m_tx;
++		std::size_t m_tx_offset = 0;
++		Nonce m_client_nonce{};
++		Nonce m_server_nonce{};
++		bool m_verified = false;
++		bool m_failed = false;
++	};
++} // namespace EmuCap::PineAuth
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+index 4b10542..b9a11a6 100644
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -15,6 +15,7 @@
+ #include "SIO/Sio.h"
+ #include "PINE.h"
+ #include "EmuCapFrameOperation.h"
++#include "EmuCapPineAuth.h"
+ #include "VMManager.h"
+ #include "vtlb.h"
+ #include "Counters.h"
+@@ -24,6 +25,8 @@
+ #include "common/Threading.h"
+ 
+ #include <atomic>
++#include <array>
++#include <cerrno>
+ #include <chrono>
+ #include <cmath>
+ #include <cstring>
+@@ -32,6 +35,7 @@
+ #include <span>
+ #include <sys/types.h>
+ #include <thread>
++#include <utility>
+ 
+ #include "fmt/format.h"
+ 
+@@ -62,7 +66,9 @@
+ 		} \
+ 	} while (0)
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <sys/un.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #else
+ #define read_portable(a, b, c) (read(a, b, c))
+@@ -77,12 +83,14 @@
+ 		} \
+ 	} while (0)
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <sys/un.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #endif
+ 
+ #define PINE_EMULATOR_NAME "pcsx2"
+-#define EMUCAP_HOST_API 8
++#define EMUCAP_HOST_API 9
+ #define EMUCAP_EE_RAM_SIZE 0x02000000
+ #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
+ #define EMUCAP_MAX_FRAME_ADVANCE 5000
+@@ -121,6 +129,9 @@ namespace PINEServer
+ 	static std::thread s_thread;
+ 	static int s_slot;
+ 	static std::vector<EmuCapBreakpoint> s_emucap_breakpoints;
++	static std::string s_native_token;
++	static std::vector<u8> s_client_prefetch;
++	static std::uint64_t s_nonce_counter = 0;
+ 
+ #ifdef _WIN32
+ 	// windows claim to have support for AF_UNIX sockets but that is a blatant lie,
+@@ -280,7 +291,6 @@ namespace PINEServer
+ 	/**
+ 	 * Initializes an open socket for IPC communication.
+ 	 */
+-	bool AcceptClient();
+ 
+ 	/**
+ 	 * Converts a primitive value to bytes in little endian
+@@ -537,6 +547,16 @@ bool PINEServer::Initialize(int slot)
+ {
+ 	s_end.store(false, std::memory_order_release);
+ 	s_slot = slot;
++	const char* native_token = std::getenv("EMUCAP_NATIVE_DEBUG_TOKEN");
++	if (native_token == nullptr || native_token[0] == '\0' || std::strlen(native_token) > 256)
++	{
++		Console.WriteLn(Color_Red, "PINE: EMUCAP_NATIVE_DEBUG_TOKEN must contain 1..256 bytes. Shutting down...");
++		Deinitialize();
++		return false;
++	}
++	s_native_token.assign(native_token);
++	s_nonce_counter = 0;
++	s_client_prefetch.clear();
+ 
+ #ifdef _WIN32
+ 	if (!InitializeWinsock())
+@@ -607,18 +627,34 @@ bool PINEServer::Initialize(int slot)
+ 		Deinitialize();
+ 		return false;
+ 	}
++	if (chmod(s_socket_name.c_str(), S_IRUSR | S_IWUSR) != 0)
++	{
++		Console.WriteLn(Color_Red, "PINE: Cannot make the control socket owner-only! Shutting down...");
++		Deinitialize();
++		return false;
++	}
+ #endif
+ 
+-	// maximum queue of 4096 commands before refusing, approximated to the
+-	// nearest legal value. We do not use SOMAXCONN as windows have this idea
+-	// that a "reasonable" value is 5, which is not.
+-	if (listen(s_sock, 4096))
++	if (listen(s_sock, 8))
+ 	{
+ 		Console.WriteLn(Color_Red, "PINE: Cannot listen for connections! Shutting down...");
+ 		Deinitialize();
+ 		return false;
+ 	}
+ 
++#ifdef _WIN32
++	u_long nonblocking = 1;
++	if (ioctlsocket(s_sock, FIONBIO, &nonblocking) != 0)
++#else
++	const int listener_flags = fcntl(s_sock, F_GETFL, 0);
++	if (listener_flags < 0 || fcntl(s_sock, F_SETFL, listener_flags | O_NONBLOCK) != 0)
++#endif
++	{
++		Console.WriteLn(Color_Red, "PINE: Cannot make the listener nonblocking! Shutting down...");
++		Deinitialize();
++		return false;
++	}
++
+ 	// we allocate once buffers to not have to do mallocs for each IPC
+ 	// request, as malloc is expansive when we optimize for µs.
+ 	s_ret_buffer.resize(MAX_IPC_RETURN_SIZE);
+@@ -654,52 +690,267 @@ std::vector<u8>& PINEServer::MakeFailIPC(std::vector<u8>& ret_buffer, uint32_t s
+ 	return ret_buffer;
+ }
+ 
+-bool PINEServer::AcceptClient()
++namespace
+ {
+-	s_msgsock = accept(s_sock, 0, 0);
+-	if (s_msgsock < 0)
+-	{
+-		// everything else is non recoverable in our scope
+-		// we also mark as recoverable socket errors where it would block a
+-		// non blocking socket, even though our socket is blocking, in case
+-		// we ever have to implement a non blocking socket.
+ #ifdef _WIN32
+-		const int errno_w = WSAGetLastError();
+-		if (!(errno_w == WSAECONNRESET || errno_w == WSAEINTR || errno_w == WSAEINPROGRESS || errno_w == WSAEMFILE || errno_w == WSAEWOULDBLOCK) && s_sock != INVALID_SOCKET)
+-			Console.Error("PINE: accept() returned error %d", errno_w);
++	using PineNativeSocket = SOCKET;
++	constexpr PineNativeSocket InvalidPineSocket = INVALID_SOCKET;
+ #else
+-		if (!(errno == ECONNABORTED || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) && s_sock >= 0)
+-			Console.Error("PINE: accept() returned error %d", errno);
++	using PineNativeSocket = int;
++	constexpr PineNativeSocket InvalidPineSocket = -1;
+ #endif
+ 
+-		return false;
++	constexpr std::size_t PineCandidateLimit = 8;
++	constexpr int PineAcceptBudget = 2;
++	constexpr std::size_t PineWorkBudget = 32 * 1024;
++	constexpr std::size_t PineIoChunk = 4096;
++	constexpr std::chrono::seconds PineAuthLifetime{5};
++
++	bool PineSocketValid(PineNativeSocket socket)
++	{
++		return socket != InvalidPineSocket;
+ 	}
+ 
+-#ifdef __APPLE__
+-	int nosigpipe = 1;
+-	setsockopt(s_msgsock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
++	void ClosePineSocket(PineNativeSocket& socket)
++	{
++		if (!PineSocketValid(socket))
++			return;
++#ifdef _WIN32
++		closesocket(socket);
++#else
++		close(socket);
+ #endif
++		socket = InvalidPineSocket;
++	}
+ 
+-	// Gross C-style cast, but SOCKET is a handle on Windows.
+-	Console.WriteLn("PINE: New client with FD %d connected.", (int)s_msgsock);
+-	return true;
++	bool SetPineSocketBlocking(PineNativeSocket socket, bool blocking)
++	{
++#ifdef _WIN32
++		u_long mode = blocking ? 0 : 1;
++		return ioctlsocket(socket, FIONBIO, &mode) == 0;
++#else
++		const int flags = fcntl(socket, F_GETFL, 0);
++		return flags >= 0 && fcntl(socket, F_SETFL,
++			blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK)) == 0;
++#endif
++	}
++
++	bool PineSocketWouldBlock()
++	{
++#ifdef _WIN32
++		const int error = WSAGetLastError();
++		return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEINTR;
++#else
++		return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
++#endif
++	}
++
++	bool PineAcceptTransient()
++	{
++#ifdef _WIN32
++		const int error = WSAGetLastError();
++		return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEINTR ||
++			error == WSAECONNRESET || error == WSAEMFILE || error == WSAENOBUFS;
++#else
++		return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
++			errno == ECONNABORTED || errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM;
++#endif
++	}
++
++	struct PineAuthCandidate
++	{
++		PineAuthCandidate(PineNativeSocket socket_, std::string_view token) :
++			socket(socket_), deadline(std::chrono::steady_clock::now() + PineAuthLifetime), auth(token)
++		{
++		}
++
++		PineNativeSocket socket = InvalidPineSocket;
++		std::chrono::steady_clock::time_point deadline;
++		EmuCap::PineAuth::ServerSession auth;
++	};
++
++	std::size_t PineEvictionCandidate(const std::vector<PineAuthCandidate>& candidates)
++	{
++		std::size_t oldest = candidates.size();
++		for (std::size_t index = 0; index < candidates.size(); ++index)
++		{
++			if (!candidates[index].auth.Verified() &&
++				(oldest == candidates.size() || candidates[index].deadline < candidates[oldest].deadline))
++			{
++				oldest = index;
++			}
++		}
++		return oldest;
++	}
++
++	enum class PineServiceResult
++	{
++		Keep,
++		Drop,
++		Ready,
++	};
++
++	PineServiceResult ServicePineCandidate(PineAuthCandidate& candidate, std::size_t& work,
++		std::uint64_t& nonce_counter)
++	{
++		if (std::chrono::steady_clock::now() >= candidate.deadline)
++			return PineServiceResult::Drop;
++		if (candidate.auth.Failed())
++			return PineServiceResult::Drop;
++		if (candidate.auth.Ready())
++			return PineServiceResult::Ready;
++		if (work == 0)
++			return PineServiceResult::Keep;
++
++		if (candidate.auth.PendingSize() != 0)
++		{
++			const std::size_t count = std::min({candidate.auth.PendingSize(), work, PineIoChunk});
++			const auto written = write_portable(candidate.socket, candidate.auth.PendingData(), count);
++			if (written > 0)
++			{
++				work -= static_cast<std::size_t>(written);
++				if (!candidate.auth.Wrote(static_cast<std::size_t>(written)))
++					return PineServiceResult::Drop;
++				return candidate.auth.Ready() ? PineServiceResult::Ready : PineServiceResult::Keep;
++			}
++			return PineSocketWouldBlock() ? PineServiceResult::Keep : PineServiceResult::Drop;
++		}
++
++		if (!candidate.auth.Advance(nonce_counter))
++			return PineServiceResult::Drop;
++		if (candidate.auth.PendingSize() != 0)
++			return PineServiceResult::Keep;
++		if (candidate.auth.Ready())
++			return PineServiceResult::Ready;
++
++		std::array<u8, PineIoChunk> buffer{};
++		const std::size_t count = std::min(work, buffer.size());
++		const auto received = read_portable(candidate.socket, buffer.data(), count);
++		if (received > 0)
++		{
++			work -= static_cast<std::size_t>(received);
++			if (!candidate.auth.Feed(buffer.data(), static_cast<std::size_t>(received)) ||
++				!candidate.auth.Advance(nonce_counter))
++			{
++				return PineServiceResult::Drop;
++			}
++			return candidate.auth.Ready() ? PineServiceResult::Ready : PineServiceResult::Keep;
++		}
++		if (received == 0)
++			return PineServiceResult::Drop;
++		return PineSocketWouldBlock() ? PineServiceResult::Keep : PineServiceResult::Drop;
++	}
+ }
+ 
+ void PINEServer::MainLoop()
+ {
+ 	Threading::SetNameOfCurrentThread("PINE Server");
++	std::vector<PineAuthCandidate> candidates;
++	candidates.reserve(PineCandidateLimit);
+ 
+ 	while (!s_end.load(std::memory_order_acquire))
+ 	{
+-		if (!AcceptClient())
++		std::size_t work = PineWorkBudget;
++		auto service_candidates = [&]() -> std::size_t {
++			for (std::size_t index = 0; index < candidates.size();)
++			{
++				const PineServiceResult result = ServicePineCandidate(candidates[index], work, s_nonce_counter);
++				if (result == PineServiceResult::Drop)
++				{
++					ClosePineSocket(candidates[index].socket);
++					candidates.erase(candidates.begin() + index);
++					continue;
++				}
++				if (result == PineServiceResult::Ready)
++					return index;
++				++index;
++			}
++			return candidates.size();
++		};
++
++		std::size_t ready = service_candidates();
++		const bool ready_before_accept = ready < candidates.size();
++		bool listener_failed = false;
++		for (int accepted = 0; accepted < PineAcceptBudget && !ready_before_accept &&
++			!s_end.load(std::memory_order_acquire); ++accepted)
++		{
++			PineNativeSocket socket = accept(s_sock, nullptr, nullptr);
++			if (!PineSocketValid(socket))
++			{
++				if (!PineAcceptTransient() && !s_end.load(std::memory_order_acquire))
++				{
++#ifdef _WIN32
++					Console.Error("PINE: accept() returned terminal error %d", WSAGetLastError());
++#else
++					Console.Error("PINE: accept() returned terminal error %d", errno);
++#endif
++					listener_failed = true;
++				}
++				break;
++			}
++
++#ifdef __APPLE__
++			int nosigpipe = 1;
++			setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
++#endif
++			if (!SetPineSocketBlocking(socket, false))
++			{
++				ClosePineSocket(socket);
++				continue;
++			}
++			if (candidates.size() >= PineCandidateLimit)
++			{
++				const std::size_t oldest = PineEvictionCandidate(candidates);
++				if (oldest == candidates.size())
++				{
++					ClosePineSocket(socket);
++					continue;
++				}
++				ClosePineSocket(candidates[oldest].socket);
++				candidates.erase(candidates.begin() + oldest);
++			}
++			candidates.emplace_back(socket, s_native_token);
++		}
++		if (listener_failed)
++		{
++			s_end.store(true, std::memory_order_release);
++			break;
++		}
++		// `ready` was computed against the pre-accept vector.  Once accept adds a
++		// candidate, that old end sentinel can become a valid index, so recompute
++		// before allowing any newly accepted socket to enter ClientLoop().
++		if (!ready_before_accept)
++			ready = service_candidates();
++
++		if (ready < candidates.size())
++		{
++			PineNativeSocket selected = candidates[ready].socket;
++			if (!SetPineSocketBlocking(selected, true))
++			{
++				ClosePineSocket(candidates[ready].socket);
++				candidates.erase(candidates.begin() + ready);
++				continue;
++			}
++			s_client_prefetch = candidates[ready].auth.TakePrefetched();
++			candidates[ready].socket = InvalidPineSocket;
++			for (PineAuthCandidate& candidate : candidates)
++				ClosePineSocket(candidate.socket);
++			candidates.clear();
++			s_msgsock = selected;
++			Console.WriteLn("PINE: Authenticated client connected.");
++			ClientLoop();
++			Console.WriteLn("PINE: Client disconnected.");
++			ClearEmuCapState();
++			safe_close_portable(s_msgsock);
++			s_client_prefetch.clear();
+ 			continue;
++		}
+ 
+-		ClientLoop();
+-
+-		Console.WriteLn("PINE: Client disconnected.");
+-		ClearEmuCapState();
+-		safe_close_portable(s_msgsock);
++		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+ 	}
++
++	for (PineAuthCandidate& candidate : candidates)
++		ClosePineSocket(candidate.socket);
+ }
+ 
+ void PINEServer::ClientLoop()
+@@ -712,11 +960,24 @@ void PINEServer::ClientLoop()
+ 		auto end_length = 4;
+ 		const std::span<u8> ipc_buffer_span(s_ipc_buffer);
+ 
+-		// while we haven't received the entire packet, maybe due to
+-		// socket datagram splittage, we continue to read
++		// Read exactly one packet. Authentication may already have consumed
++		// bytes from its first ordinary request, so drain those first.
+ 		while (receive_length < end_length)
+ 		{
+-			const auto tmp_length = read_portable(s_msgsock, &ipc_buffer_span[receive_length], MAX_IPC_SIZE - receive_length);
++			auto tmp_length = 0;
++			if (!s_client_prefetch.empty())
++			{
++				const std::size_t count = std::min<std::size_t>(
++					static_cast<std::size_t>(end_length - receive_length), s_client_prefetch.size());
++				std::memcpy(&ipc_buffer_span[receive_length], s_client_prefetch.data(), count);
++				s_client_prefetch.erase(s_client_prefetch.begin(), s_client_prefetch.begin() + count);
++				tmp_length = static_cast<decltype(tmp_length)>(count);
++			}
++			else
++			{
++				tmp_length = static_cast<decltype(tmp_length)>(read_portable(s_msgsock,
++					&ipc_buffer_span[receive_length], end_length - receive_length));
++			}
+ 
+ 			// we recreate the socket if an error happens
+ 			if (tmp_length <= 0)
+@@ -780,6 +1041,10 @@ void PINEServer::Deinitialize()
+ 
+ 	if (s_thread.joinable())
+ 		s_thread.join();
++
++	std::fill(s_native_token.begin(), s_native_token.end(), '\0');
++	s_native_token.clear();
++	s_client_prefetch.clear();
+ }
+ 
+ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8>& ret_buffer, u32 buf_size)

@@ -7,6 +7,8 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+const TEST_LAUNCH_ID: &str = "launch-01arz3ndektsv4rrffq69g5fav";
+
 struct SocketRuntimeEnv {
     _env: EnvGuard,
     _runtime_home: tempfile::TempDir,
@@ -144,14 +146,31 @@ fn run_reconnecting_projection_adapter(
         if let Some(ready) = ready.take() {
             ready.send(()).unwrap();
         }
-        stream.set_nodelay(true).unwrap();
+        let port = stream.peer_addr().unwrap().port();
+        let root = std::fs::read_to_string(super::tcp::session_token_path(port).unwrap()).unwrap();
+        let front_key = super::producer_auth::derive_front_key(
+            root.trim(),
+            super::producer_auth::Boundary::Direct,
+            port,
+            TEST_LAUNCH_ID,
+        )
+        .unwrap();
+        let stream = super::producer_auth::authenticate_producer_stream(
+            stream,
+            &front_key,
+            super::producer_auth::Boundary::Direct,
+            port,
+            TEST_LAUNCH_ID,
+            Duration::from_secs(2),
+        )
+        .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
 
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
         let hello: Value = serde_json::from_str(hello.trim()).unwrap();
-        let token = hello["params"]["session_token"].as_str().unwrap();
+        assert_eq!(hello["params"], json!({}));
         writeln!(
             writer,
             "{}",
@@ -162,8 +181,7 @@ fn run_reconnecting_projection_adapter(
                     "protocol_version": 1,
                     "system": "test",
                     "adapter": "reconnecting-projection",
-                    "session_token": token,
-                    "launch_id": "test-generation",
+                    "launch_id": TEST_LAUNCH_ID,
                     "methods": [
                         "status", "pause", "set_input", "step", "read_memory", "_shutdown"
                     ],
@@ -259,16 +277,8 @@ fn tap_reclaims_input_after_real_socket_disconnect_at_each_boundary() {
         (1, false, vec![]),
         (2, false, vec![]),
         (3, false, vec![vec!["a".to_string()], vec!["a".to_string()]]),
-        (
-            4,
-            true,
-            vec![vec!["a".to_string()], vec!["a".to_string()], vec![]],
-        ),
-        (
-            5,
-            false,
-            vec![vec!["a".to_string()], vec!["a".to_string()], vec![]],
-        ),
+        (4, true, vec![vec!["a".to_string()], vec!["a".to_string()]]),
+        (5, true, vec![vec!["a".to_string()], vec!["a".to_string()]]),
     ];
 
     for (disconnect_on, completes, projection) in expected {
@@ -289,7 +299,7 @@ fn tap_reclaims_input_after_real_socket_disconnect_at_each_boundary() {
             "unexpected terminal result after disconnect at request boundary {disconnect_on}: {result:?}"
         );
         let status =
-            call_session_cleanup(&mut link, "status", json!({}), Some("test-generation")).unwrap();
+            call_session_cleanup(&mut link, "status", json!({}), Some(TEST_LAUNCH_ID)).unwrap();
         assert_eq!(status["state"], "frozen");
         assert_eq!(status["input_override"]["engaged"], false);
 
@@ -346,7 +356,7 @@ fn hold_until_reclaims_input_after_real_socket_disconnect_at_each_boundary() {
             "unexpected terminal result after disconnect at request boundary {disconnect_on}: {result:?}"
         );
         let status =
-            call_session_cleanup(&mut link, "status", json!({}), Some("test-generation")).unwrap();
+            call_session_cleanup(&mut link, "status", json!({}), Some(TEST_LAUNCH_ID)).unwrap();
         assert_eq!(status["state"], "frozen");
         assert_eq!(status["input_override"]["engaged"], false);
 

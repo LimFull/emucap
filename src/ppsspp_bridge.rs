@@ -307,12 +307,9 @@ pub struct PpssppBridge<T> {
     /// (`game.status`'s `game` object is just `{id, version, title}`), so this bridge computes it
     /// locally, same as the NDS/PC-98 bridges' `EMUCAP_CONTENT`.
     content: Option<PathBuf>,
-    /// Identity-guard fields the launcher passes via `EMUCAP_NAME`/`EMUCAP_SESSION_TOKEN`
-    /// (`src/launch/ppsspp.rs`) — `hello` echoes them back so `emucap-mcp`'s TCP handshake
-    /// (`live/tcp.rs`'s `handshake_stream`) can confirm this bridge is the one it just spawned and
-    /// not a stale/foreign process holding the port (mirrors the NDS/PC-98 bridges' `BridgeEnv`).
+    /// Display name and launch identity supplied by the managed launcher. Transport
+    /// authentication validates the launch before `hello` is exchanged.
     name: Option<String>,
-    session_token: Option<String>,
     launch_id: Option<String>,
     /// Monotonic counter minting a unique `ticket` for each timed `input.buttons.press`, so the
     /// bridge can correlate a delayed release ack to the exact press that issued it (see
@@ -337,7 +334,7 @@ impl<T: WsTransport> PpssppBridge<T> {
             ws,
             std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from),
             std::env::var("EMUCAP_NAME").ok(),
-            std::env::var("EMUCAP_SESSION_TOKEN").ok(),
+            None,
         );
         bridge.launch_id = std::env::var("EMUCAP_LAUNCH_ID").ok();
         bridge
@@ -345,19 +342,18 @@ impl<T: WsTransport> PpssppBridge<T> {
 
     /// Explicit-content constructor — `new()` reads `EMUCAP_CONTENT` from the process environment
     /// (set by the launcher alongside the PPSSPP debugger port); this lets tests supply the
-    /// content path directly instead of mutating process-global env. `name`/`session_token` are
-    /// left unset (use `with_identity` to exercise `hello`'s echo).
+    /// content path directly instead of mutating process-global env. `name` is left unset.
     pub fn with_content(ws: T, content: Option<PathBuf>) -> Self {
         Self::with_identity(ws, content, None, None)
     }
 
-    /// Full constructor threading the identity-guard fields (`name`/`session_token`) alongside
-    /// `content` — lets tests exercise `hello`'s echo without mutating process env.
+    /// Full constructor retaining the former token argument for source compatibility. Transport
+    /// authentication consumes the token before requests reach this bridge.
     pub fn with_identity(
         ws: T,
         content: Option<PathBuf>,
         name: Option<String>,
-        session_token: Option<String>,
+        _front_key: Option<String>,
     ) -> Self {
         Self {
             ws,
@@ -366,7 +362,6 @@ impl<T: WsTransport> PpssppBridge<T> {
             events: Vec::new(),
             content,
             name,
-            session_token,
             launch_id: None,
             next_ticket: 1,
             held_buttons: None,

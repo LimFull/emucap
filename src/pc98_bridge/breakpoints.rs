@@ -1,7 +1,23 @@
 use super::*;
 
+const MAX_BREAKPOINTS: usize = 128;
+
 impl<G: GdbTransport> Bridge<G> {
+    fn admit_breakpoint(&self) -> BridgeResult<(u64, u64)> {
+        if self.bps.len() >= MAX_BREAKPOINTS {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 supports at most {MAX_BREAKPOINTS} retained breakpoint registrations"
+            )));
+        }
+        let id = self.next_bp;
+        let next_id = id
+            .checked_add(1)
+            .ok_or_else(|| BridgeError::Emulator("breakpoint id space exhausted".into()))?;
+        Ok((id, next_id))
+    }
+
     pub(super) fn set_breakpoint(&mut self, params: &Value) -> BridgeResult<Value> {
+        let (id, next_id) = self.admit_breakpoint()?;
         let kind = params
             .get("kind")
             .and_then(Value::as_str)
@@ -51,8 +67,7 @@ impl<G: GdbTransport> Bridge<G> {
         );
         let resp = self.lua_cmd_reply("setpoint", Some(&spec))?;
         let (backend, backend_id) = parse_breakpoint_reply(&resp)?;
-        let id = self.next_bp;
-        self.next_bp += 1;
+        self.next_bp = next_id;
         self.bps.insert(
             id,
             Breakpoint {
@@ -74,6 +89,7 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub(super) fn watch_register(&mut self, params: &Value) -> BridgeResult<Value> {
+        let (id, next_id) = self.admit_breakpoint()?;
         let raw_reg = params
             .get("register")
             .and_then(Value::as_str)
@@ -92,8 +108,7 @@ impl<G: GdbTransport> Bridge<G> {
         let spec = format!("{}|{condition}", if pause_on_hit { 1 } else { 0 });
         let resp = self.lua_cmd_reply("setregpoint", Some(&spec))?;
         let backend_id = parse_regpoint_reply(&resp)?;
-        let id = self.next_bp;
-        self.next_bp += 1;
+        self.next_bp = next_id;
         self.bps.insert(
             id,
             Breakpoint {
@@ -173,9 +188,12 @@ impl<G: GdbTransport> Bridge<G> {
         self.drain_stop()?;
         let saw_reset = self.drain_reset_event()?;
         let filter_id = optional_num(params, "breakpoint_id")?;
-        let mut events = Vec::new();
-        let mut remaining = Vec::new();
-        for mut event in std::mem::take(&mut self.events) {
+        // Enrichment may receive new stops while reading registers or snapshots. Keep those
+        // arrivals separate from this bounded batch, then merge them after older retained events.
+        let mut pending = std::mem::take(&mut self.events);
+        let mut enriched = events::PendingEvents::default();
+        for _ in 0..pending.len() {
+            let mut event = pending.pop_front().unwrap();
             if saw_reset
                 && event.get("type").and_then(Value::as_str) == Some("stop")
                 && event.get("raw").and_then(Value::as_str) == Some("S05")
@@ -186,15 +204,13 @@ impl<G: GdbTransport> Bridge<G> {
             if let Some(obj) = event.as_object_mut() {
                 obj.remove("_pc98_enriched");
             }
-            if let Some(filter_id) = filter_id {
-                if event.get("id").and_then(Value::as_u64) != Some(filter_id) {
-                    remaining.push(event);
-                    continue;
-                }
-            }
-            events.push(event);
+            enriched.push(event);
         }
-        self.events = remaining;
-        Ok(json!({ "events": events, "dropped": 0 }))
+        enriched.append(pending); // Carry loss accounting from the detached input batch.
+        let events = enriched.take_matching(filter_id);
+        let arrived = std::mem::replace(&mut self.events, enriched);
+        self.events.append(arrived);
+        let dropped = self.events.take_dropped();
+        Ok(json!({ "events": events, "dropped": dropped }))
     }
 }

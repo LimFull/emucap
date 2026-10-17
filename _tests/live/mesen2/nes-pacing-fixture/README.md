@@ -20,7 +20,7 @@ u16 held-A counter at `0x102`, then changes the backdrop every two fields.
 The main loop continuously executes. NMI preserves A and returns normally;
 maskable IRQs, APU channels and tile/sprite rendering are disabled.
 
-For a tap, expected deltas are `(press_frames + 1 + after_frames, press_frames)`
+For a tap, expected deltas are `(press_frames + after_frames, press_frames)`
 modulo 65536. No-input control leaves the input counter unchanged. Polling PPU
 status is used only for initial stabilization; per-frame polling can suppress
 a VBlank edge and is unsuitable for an exact field oracle.

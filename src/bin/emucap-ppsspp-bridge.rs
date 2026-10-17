@@ -16,6 +16,20 @@ fn main() -> anyhow::Result<()> {
     }
     let emucap_port = parse_port(&args[1]).context("invalid EMUCAP_PORT")?;
     let ppsspp_port = parse_port(&args[2]).context("invalid PPSSPP_DEBUGGER_PORT")?;
+    let session_token = std::env::var("EMUCAP_SESSION_TOKEN")
+        .context("EMUCAP_SESSION_TOKEN is required for the emucap control session")?;
+    if session_token.is_empty() {
+        return Err(anyhow!(
+            "EMUCAP_SESSION_TOKEN must be non-empty for the emucap control session"
+        ));
+    }
+    let native_debug_token = std::env::var("EMUCAP_NATIVE_DEBUG_TOKEN")
+        .context("EMUCAP_NATIVE_DEBUG_TOKEN is required for PPSSPP debugger authentication")?;
+    if native_debug_token.is_empty() {
+        return Err(anyhow!(
+            "EMUCAP_NATIVE_DEBUG_TOKEN must be non-empty for PPSSPP debugger authentication"
+        ));
+    }
 
     eprintln!(
         "[ppsspp-rust] connecting ppsspp=127.0.0.1:{ppsspp_port} emucap=127.0.0.1:{emucap_port}"
@@ -32,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     // budget above 15s (`SAVESTATE_READ_TIMEOUT`, threaded via `call_with_timeout`) instead of raising
     // this default. Screenshot also uses a dedicated budget for GE entry plus readback;
     // other ordinary reads keep the fast 8s so failures still surface quickly.
-    let ws = TungsteniteWs::connect(ppsspp_port, Duration::from_secs(8))
+    let ws = TungsteniteWs::connect(ppsspp_port, Duration::from_secs(8), &native_debug_token)
         .with_context(|| format!("connect PPSSPP debugger websocket at 127.0.0.1:{ppsspp_port}"))?;
     let mut bridge = PpssppBridge::new(ws);
     let dependency =

@@ -217,10 +217,8 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// Identity-guard handshake — the connect-time surface a caller inspects before trusting the
     /// bridge. Unlike `status`, `methods` here is the same truthful `METHODS` list (not a live
     /// probe), since PPSSPP's WebSocket needs no per-request emulator round-trip to answer it.
-    /// Echoes `name`/`session_token` (when the launcher set them via `EMUCAP_NAME`/
-    /// `EMUCAP_SESSION_TOKEN`) so `emucap-mcp`'s TCP handshake can verify this bridge is the one it
-    /// just spawned — without this echo the identity guard rejects every connection attempt with
-    /// `IdentityMismatch` (mirrors the NDS/PC-98 bridges' `hello`).
+    /// Echoes the display name and launch identity when the launcher supplied them. Transport
+    /// authentication runs before this method, so the hello result never carries bearer material.
     pub(super) fn hello(&self) -> BridgeResult<Value> {
         let mut result = json!({
             "protocol_version": PROTOCOL_VERSION,
@@ -259,9 +257,6 @@ impl<T: WsTransport> PpssppBridge<T> {
         let obj = result.as_object_mut().expect("hello is an object");
         if let Some(name) = &self.name {
             obj.insert("name".into(), json!(name));
-        }
-        if let Some(token) = &self.session_token {
-            obj.insert("session_token".into(), json!(token));
         }
         if let Some(launch_id) = &self.launch_id {
             obj.insert("launch_id".into(), json!(launch_id));

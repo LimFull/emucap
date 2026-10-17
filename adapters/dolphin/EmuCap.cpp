@@ -5,6 +5,7 @@
 // listener and translates NDJSON requests into Dolphin APIs.
 
 #include "Core/EmuCap.h"
+#include "Core/EmuCapFrontAuth.h"
 #include "Core/EmuCapInput.h"
 #include "Core/EmuCapTemporal.h"
 #include "Core/EmuCapWire.h"
@@ -96,7 +97,17 @@ std::mutex s_socket_mutex;
 SOCKET s_active_socket = INVALID_SOCKET;
 
 std::mutex s_ev_mutex;
-std::deque<picojson::value> s_events;
+constexpr size_t MAX_PENDING_EVENTS = 256;
+constexpr size_t MAX_PENDING_EVENT_BYTES = 1024 * 1024;
+constexpr uint64_t MAX_REPORTED_EVENT_DROPS = (uint64_t{1} << 53) - 1;
+struct PendingEvent
+{
+  picojson::value value;
+  size_t bytes;
+};
+std::deque<PendingEvent> s_events;
+size_t s_event_bytes = 0;
+uint64_t s_dropped_events = 0;
 
 std::mutex s_bp_mutex;
 enum class BreakpointKind
@@ -382,10 +393,57 @@ bool GetU64(const picojson::object& p, const char* key, uint64_t& out)
   return false;
 }
 
+// Retained event admission counts compact JSON without allocating an encoded copy.
+struct EventByteCounter
+{
+  using iterator_category = std::output_iterator_tag;
+  using value_type = void;
+  using difference_type = void;
+  using pointer = void;
+  using reference = void;
+  size_t* bytes;
+  EventByteCounter& operator*() { return *this; }
+  EventByteCounter& operator++() { return *this; }
+  EventByteCounter operator++(int) { return *this; }
+  // picojson uses an unqualified copy for escaped control characters.
+  friend EventByteCounter copy(const char* first, const char* last, EventByteCounter output)
+  {
+    return std::copy(first, last, output);
+  }
+  void operator=(char)
+  {
+    if (*bytes <= MAX_PENDING_EVENT_BYTES)
+      ++*bytes;
+  }
+};
+
+void NoteDroppedEvent()
+{
+  if (s_dropped_events < MAX_REPORTED_EVENT_DROPS)
+    ++s_dropped_events;
+}
+
 void PushEvent(picojson::value ev)
 {
+  size_t bytes = 0;
+  // Native notifications have fixed fields and a bounded register map. Saturation avoids
+  // overflow and supports Dolphin's no-exceptions build while measuring their encoded size.
+  ev.serialize(EventByteCounter{&bytes});
+  if (bytes > MAX_PENDING_EVENT_BYTES)
+  {
+    std::lock_guard<std::mutex> lk(s_ev_mutex);
+    NoteDroppedEvent();
+    return;
+  }
   std::lock_guard<std::mutex> lk(s_ev_mutex);
-  s_events.push_back(std::move(ev));
+  while (s_events.size() >= MAX_PENDING_EVENTS || bytes > MAX_PENDING_EVENT_BYTES - s_event_bytes)
+  {
+    s_event_bytes -= s_events.front().bytes;
+    s_events.pop_front();
+    NoteDroppedEvent();
+  }
+  s_event_bytes += bytes;
+  s_events.push_back({std::move(ev), bytes});
 }
 
 // Request handlers return a result object on success and set the request-scoped error on failure.
@@ -857,9 +915,6 @@ picojson::object Hello(Core::System& core_system, const picojson::object&)
     input_device["clock"] = picojson::value(std::string("wiimote_prepare_input"));
     r["input_device"] = picojson::value(input_device);
   }
-  const std::string tok = EnvOr("EMUCAP_SESSION_TOKEN", "");
-  if (!tok.empty())
-    r["session_token"] = picojson::value(tok);
   const std::string content = EnvOr("EMUCAP_CONTENT", "");
   if (!content.empty())
     r["content"] = picojson::value(content);
@@ -1759,17 +1814,21 @@ picojson::object ClearAllBreakpoints(Core::System& system, const picojson::objec
 picojson::object PollEvents(Core::System&, const picojson::object&)
 {
   picojson::array out;
+  uint64_t dropped;
   {
     std::lock_guard<std::mutex> lk(s_ev_mutex);
     while (!s_events.empty())
     {
-      out.push_back(std::move(s_events.front()));
+      out.push_back(std::move(s_events.front().value));
       s_events.pop_front();
     }
+    s_event_bytes = 0;
+    dropped = s_dropped_events;
+    s_dropped_events = 0;
   }
   picojson::object r;
   r["events"] = picojson::value(out);
-  r["dropped"] = picojson::value(0.0);
+  r["dropped"] = picojson::value(static_cast<double>(dropped));
   return r;
 }
 
@@ -2343,14 +2402,101 @@ void ThreadMain(Core::System& system, unsigned short port)
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
     {
+      const std::string front_key = EnvOr("EMUCAP_SESSION_TOKEN", "");
+      const std::string launch_id = EnvOr("EMUCAP_LAUNCH_ID", "");
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      const auto remaining_ms = [&] {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        return remaining <= 0 ? 0 : static_cast<int>(std::min<long long>(remaining, 5000));
+      };
+      const auto set_timeout = [&](int option, int milliseconds) {
+#ifdef _WIN32
+        const DWORD timeout = static_cast<DWORD>(std::max(milliseconds, 1));
+        return setsockopt(sock, SOL_SOCKET, option, reinterpret_cast<const char*>(&timeout),
+                          sizeof(timeout)) == 0;
+#else
+        const timeval timeout{milliseconds / 1000, (milliseconds % 1000) * 1000};
+        return setsockopt(sock, SOL_SOCKET, option, &timeout, sizeof(timeout)) == 0;
+#endif
+      };
+      const auto interrupted = [] {
+#ifdef _WIN32
+        return WSAGetLastError() == WSAEINTR;
+#else
+        return errno == EINTR;
+#endif
+      };
+      const auto read_exact = [&](std::uint8_t* bytes, size_t size) {
+        size_t offset = 0;
+        while (offset < size)
+        {
+          const int budget = remaining_ms();
+          if (budget == 0 || !set_timeout(SO_RCVTIMEO, budget))
+            return false;
+          const int count = recv(sock, reinterpret_cast<char*>(bytes + offset),
+                                 static_cast<int>(size - offset), 0);
+          if (count <= 0)
+          {
+            if (count < 0 && interrupted())
+              continue;
+            return false;
+          }
+          offset += static_cast<size_t>(count);
+        }
+        return true;
+      };
+      const auto write_all = [&](const std::uint8_t* bytes, size_t size) {
+        size_t offset = 0;
+        while (offset < size)
+        {
+          const int budget = remaining_ms();
+          if (budget == 0 || !set_timeout(SO_SNDTIMEO, budget))
+            return false;
+#ifdef MSG_NOSIGNAL
+          constexpr int flags = MSG_NOSIGNAL;
+#else
+          constexpr int flags = 0;
+#endif
+          const int count = send(sock, reinterpret_cast<const char*>(bytes + offset),
+                                 static_cast<int>(size - offset), flags);
+          if (count <= 0)
+          {
+            if (count < 0 && interrupted())
+              continue;
+            return false;
+          }
+          offset += static_cast<size_t>(count);
+        }
+        return true;
+      };
+      if (!emucap_front_auth::Authenticate(front_key, launch_id, port, read_exact, write_all))
+      {
+        closesocket(sock);
+        if (!s_stop.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+#ifdef _WIN32
+      const DWORD receive_timeout = 0;
+      const DWORD service_send_timeout = 1000;
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&receive_timeout), sizeof(receive_timeout));
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                 reinterpret_cast<const char*>(&service_send_timeout),
+                 sizeof(service_send_timeout));
+#else
+      const timeval receive_timeout{0, 0};
+      const timeval service_send_timeout{1, 0};
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &service_send_timeout,
+                 sizeof(service_send_timeout));
+#endif
       {
         std::lock_guard<std::mutex> lk(s_socket_mutex);
         s_active_socket = sock;
       }
-      if (!EnvOr("EMUCAP_LAUNCH_ID", "").empty())
-        ServeOwnedSession(system, sock);
-      else
-        ServeSession(system, sock);
+      ServeOwnedSession(system, sock);
       {
         std::lock_guard<std::mutex> lk(s_socket_mutex);
         if (s_active_socket == sock)

@@ -1,6 +1,8 @@
---- a/.github/workflows/scripts/windows/build-dependencies.bat
-+++ b/.github/workflows/scripts/windows/build-dependencies.bat
-@@ -333,8 +333,7 @@
+diff --git c/.github/workflows/scripts/windows/build-dependencies.bat i/.github/workflows/scripts/windows/build-dependencies.bat
+index 9abb4c2..22e34c4 100755
+--- c/.github/workflows/scripts/windows/build-dependencies.bat
++++ i/.github/workflows/scripts/windows/build-dependencies.bat
+@@ -547,8 +547,7 @@ exit 0
  
  :error
  echo Failed with error #%errorlevel%.

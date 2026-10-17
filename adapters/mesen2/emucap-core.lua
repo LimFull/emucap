@@ -40,6 +40,8 @@ local HAS_SNES_DEEP_EVENTS = SYS.system == "snes"
 -- 브레이크포인트는 별도로 얹는다.
 
 local socket = require("socket.core")
+local Auth = require("emucap_auth")
+local FrontAuth = require("emucap_front_auth")
 local Tx = require("emucap_tx")
 local Rx = require("emucap_rx")
 local Json = require("emucap_json")
@@ -141,6 +143,7 @@ local INSTR_CHUNK = 20000      -- 명령 step 청크(≤1s 안에서 keepalive)
 local TX_CAP = tonumber(os.getenv("EMUCAP_TX_CAP") or "") or (8 * 1024 * 1024)
 if TX_CAP < 1024 then TX_CAP = 1024 end
 local conn = nil
+local auth_pending = nil
 local session_epoch = 0       -- response IDs are scoped to one accepted frontend connection
 local rx = Rx.new(8 * 1024 * 1024)
 local tx = Tx.new(TX_CAP)
@@ -157,6 +160,7 @@ local pending_line = nil       -- request read during a pacing wait, handled at 
 local boundary_seq = 0         -- bumped by every request that can change memory or the stop
 local pacing_state = Pacing.new_state()
 local pacing_control_unverified = false
+StateIo.restore_guard = { unverified = false }
 local HOST_AUDIO = os.getenv("EMUCAP_MESEN_AUDIO") ~= "0"
 
 local function start_deferred(...)
@@ -327,25 +331,57 @@ end
 -- ── 소켓 ─────────────────────────────────────────────────────
 local function disconnect()
   local old = conn
+  local pending = auth_pending
   conn = nil
+  auth_pending = nil
   pending_line = nil
   Rx.reset(rx)
   Tx.reset(tx)
   if control then control:disconnected() end
   if abort_inflight then abort_inflight() end
   if old then pcall(function() old:close() end) end
+  if pending then pcall(function() pending.socket:close() end) end
 end
 
 local function connect()
   if control and (control:busy() or control:retired()) then return end
+  if auth_pending then
+    local status, err = FrontAuth.poll(auth_pending.state, auth_pending.socket, socket.gettime())
+    if status == "authenticated" then
+      local established = auth_pending.socket
+      auth_pending = nil
+      established:settimeout(0)
+      session_epoch = session_epoch + 1
+      if control then control:connected(session_epoch) end
+      conn = established
+      Rx.reset(rx)
+      Tx.reset(tx)
+    elseif status == "failed" then
+      local failed = auth_pending.socket
+      auth_pending = nil
+      pcall(function() failed:close() end)
+      emu.log("[emucap] producer authentication failed: " .. tostring(err))
+    end
+    return
+  end
+  local front_key = Auth.front_key()
+  local launch_id = os.getenv("EMUCAP_LAUNCH_ID")
+  if not front_key or front_key == "" or not launch_id or launch_id == "" then return end
   local c = socket.tcp()
+  c:settimeout(0.05)
+  local connected = c:connect(HOST, PORT)
+  if not connected then
+    pcall(function() c:close() end)
+    return
+  end
   c:settimeout(0)
-  c:connect(HOST, PORT)
-  session_epoch = session_epoch + 1
-  if control then control:connected(session_epoch) end
-  conn = c
-  Rx.reset(rx)
-  Tx.reset(tx)
+  local state = FrontAuth.new(front_key, launch_id, PORT, socket.gettime())
+  if not state then
+    pcall(function() c:close() end)
+    return
+  end
+  auth_pending = { socket = c, state = state }
+  connect()
 end
 
 local function send_line(s)
@@ -760,8 +796,6 @@ function handlers.hello()
   if HAS_AGENT_PACING then result.execution_speed_capability = Pacing.capability(as_array, HOST_AUDIO) end
   local name = os.getenv("EMUCAP_NAME")
   if name then result.name = name end
-  local token = os.getenv("EMUCAP_SESSION_TOKEN")
-  if token then result.session_token = token end
   local content = os.getenv("EMUCAP_CONTENT")
   if content then result.content = content end
   local launch_id = os.getenv("EMUCAP_LAUNCH_ID")
@@ -1120,6 +1154,22 @@ local EXEC_MAX = SYS.exec_range_max or 0xFFFFFF
 
 -- ── 세이브스테이트 (createSavestate/loadSavestate는 exec 콜백 컨텍스트 필요) ──
 local IO_LO, IO_HI = 0, EXEC_MAX
+
+function StateIo.restore_guard.quarantine()
+  StateIo.restore_guard.unverified = true
+  boundary_seq = boundary_seq + 1
+  freeze_snapshot = nil
+  STATE = "frozen"
+  freeze_state = FreezeState.halt("restore_unverified", false)
+  deferred, step_operation, input_hold = nil, nil, nil
+  advance_deadline_ms, pending_line, restart_after_reply = nil, nil, nil
+  -- The latch survives controller disconnects and requires a new generation.
+  pcall(emu.breakExecution)
+end
+
+function StateIo.restore_guard.load(path)
+  return StateIo.load(emu, path, StateIo.restore_guard.quarantine)
+end
 local function on_io_exec()
   if not pending_io then return end
   local op = pending_io
@@ -1129,7 +1179,7 @@ local function on_io_exec()
   -- 결정론적이다(loadSavestate가 상태를 정확 복원하므로 주입 시점은 무관).
   if op.kind == "probe" then
     local ok, err = pcall(function()
-      StateIo.load(emu, op.path)
+      StateIo.restore_guard.load(op.path)
     end)
     if not ok then reply_err(op.id, "io_error", err); return end
     if op.probe.frame <= 0 then
@@ -1145,7 +1195,7 @@ local function on_io_exec()
     if op.kind == "save" then
       StateIo.save(emu, op.path, op.id)
     else
-      StateIo.load(emu, op.path)
+      StateIo.restore_guard.load(op.path)
     end
   end)
   if ok then reply_ok(op.id, { status = "completed", path = op.path })
@@ -1220,7 +1270,7 @@ local function frozen_state_io(method, id, p)
     if method == "save_state" then
       return StateIo.save(emu, path, id)
     end
-    return StateIo.load(emu, path)
+    return StateIo.restore_guard.load(path)
   end)
   if not ok then
     reply_err(id, "io_error", bytes_or_err)
@@ -1612,8 +1662,9 @@ local function start_recording(id, p)
   if not prepared then reply_err(id, kind, message); return nil end
 
   if p.origin == "state_load" then
-    local ok, loaded_or_error = pcall(StateIo.load, emu, p.initial_state.path)
+    local ok, loaded_or_error = pcall(StateIo.restore_guard.load, p.initial_state.path)
     if not ok or loaded_or_error ~= p.initial_state.bytes then
+      if ok then StateIo.restore_guard.quarantine() end
       freeze_snapshot = nil
       freeze_state = FreezeState.halt("state_load_failed", false)
       reply_err(id, "io_error", ok and "loaded state byte count mismatch" or loaded_or_error)
@@ -1756,7 +1807,8 @@ end
 local function parse_snapshot_specs(raw)
   if raw == nil then return nil end
   if type(raw) ~= "table" then return nil, "snapshot must be an array of memory_type:address:length strings" end
-  local specs = {}
+  if #raw > 64 then return nil, "snapshot count exceeds limit 64" end
+  local specs, total = {}, 0
   for _, raw_spec in ipairs(raw) do
     local mt_name, addr_text, len_text = tostring(raw_spec):match("^%s*([^:]+):([^:]+):([^:]+)%s*$")
     if not mt_name then return nil, "invalid snapshot specification: " .. tostring(raw_spec) end
@@ -1766,6 +1818,8 @@ local function parse_snapshot_specs(raw)
     if len > READ_CAP then
       return nil, string.format("snapshot length %d exceeds limit %d", len, READ_CAP)
     end
+    total = total + len
+    if total > READ_CAP then return nil, "snapshot aggregate exceeds limit 131072 bytes" end
     local region, _, range_message = Memory.range(emu, SYS, mt_name, addr, len)
     if not region then return nil, range_message end
     specs[#specs + 1] = {
@@ -1847,28 +1901,87 @@ local function record_reg_hit(bp, pc, v)
   if bp.pause_on_hit then halt_for_debug_stop("register_break", bp.id) end
 end
 
+-- Persistent registrations own every native ref, including partial installations.
+do
+local pending_breakpoint_refs = nil
+local function add_breakpoint_memory_callback(callback, kind, lo, hi, cpu)
+  local ref = emu.addMemoryCallback(callback, kind, lo, hi, cpu)
+  pending_breakpoint_refs[#pending_breakpoint_refs + 1] = { ref = ref, kind = kind, lo = lo, hi = hi, cpu = cpu }
+  return ref
+end
+local function add_breakpoint_event_callback(callback, kind)
+  local ref = emu.addEventCallback(callback, kind)
+  pending_breakpoint_refs[#pending_breakpoint_refs + 1] = { ref = ref, kind = kind, event = true }
+  return ref
+end
+local function release_breakpoint_refs(bp)
+  local remaining, first_error = {}, nil
+  for _, item in ipairs(bp.owned_refs) do
+    local ok, err
+    if item.event then ok, err = pcall(emu.removeEventCallback, item.ref, item.kind)
+    else ok, err = pcall(emu.removeMemoryCallback, item.ref, item.kind, item.lo, item.hi, item.cpu) end
+    if not ok then
+      remaining[#remaining + 1] = item
+      first_error = first_error or tostring(err)
+    end
+  end
+  bp.owned_refs = remaining
+  return #remaining == 0, first_error
+end
+local function breakpoint_instruction_budget(value, default, maximum)
+  if value == nil then return default end
+  if type(value) ~= "number" or value ~= value or value < 0 or value > maximum
+      or value ~= math.floor(value) then
+    return nil, "max_instructions must be an integer in 0.." .. tostring(maximum)
+  end
+  return math.max(1, value)
+end
+local function admit_breakpoint(p, install)
+  local count = 0
+  for _ in pairs(breakpoints) do count = count + 1 end
+  if count >= 128 then return false, "bad_params", "breakpoint limit exceeded (128 retained registrations)" end
+  if next_bp_id >= 9007199254740991 then
+    return false, "bad_state", "breakpoint id space exhausted"
+  end
+  local id, refs = next_bp_id, {}
+  pending_breakpoint_refs = refs
+  local called, ok, result, message = pcall(install, p, id)
+  pending_breakpoint_refs = nil
+  if called and ok then
+    breakpoints[id].owned_refs = refs
+    next_bp_id = id + 1
+    return true, result
+  end
+  local failed = { id = id, kind = p.kind or "reg", owned_refs = refs, registration_failed = true }
+  local released, release_error = release_breakpoint_refs(failed)
+  if not released then
+    breakpoints[id] = failed
+    next_bp_id = id + 1
+    return false, "cleanup_failed", "breakpoint " .. tostring(id) .. " retains native callbacks: " .. release_error
+  end
+  breakpoints[id] = nil
+  if not called then return false, "emulator_error", tostring(ok) end
+  return false, result, message
+end
+
 -- 레지스터 범위 워치: full-range exec 콜백에서 매 명령 레지스터를 보고 [min,max] 벗어나면 break.
 -- SP 폭주 등 레지스터 derail을 그 명령에서 잡는다. 매 명령 getState라 느리니 hunting 전용(끝나면 clear).
-function handlers.watch_register(p)
-  local id = next_bp_id; next_bp_id = next_bp_id + 1
+local function install_register_watch(p, id)
   local reg = "cpu." .. (p.register or "sp")
-  local budget = math.max(1, p.max_instructions or WATCH_REG_BUDGET)
+  local budget, budget_error = breakpoint_instruction_budget(p.max_instructions, WATCH_REG_BUDGET, 50000000)
+  if not budget then return false, "bad_params", budget_error end
   local bp = {
     id = id, kind = "reg", register = p.register or "sp",
     min = p.min or 0, max = p.max or 0xffff, pause_on_hit = p.pause_on_hit,
     cbtype = emu.callbackType.exec, start = 0, end_ = EXEC_MAX,
     seen = 0, budget = budget,
   }
-  bp.ref = emu.addMemoryCallback(function(addr, value)
-    -- 플러드 가드: 버퍼가 차고 비-pausing이면 매-명령 getState 전에 즉시 드롭.
-    if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
-    -- 자동 해제: full-range exec가 매 명령 getState라, 레지스터가 범위 안이면 이벤트도 안 쌓여 위 가드가
-    -- 안 걸린 채 무기한 emu 스레드를 굶긴다. 명령 예산을 넘으면 스스로 콜백을 떼고(hunting 전용)
-    -- watch_disarmed 이벤트를 남긴다 → 조용한 stall이 아니게. 더 오래 감시하려면 max_instructions를 키우거나
-    -- 다시 무장. (자기 콜백 내 removeMemoryCallback은 Mesen에서 안전 — on_io_exec와 동일 패턴.)
+  bp.ref = add_breakpoint_memory_callback(function(addr, value)
+    -- 큐가 가득 차도 명령 예산을 소비하고 만료 시 native 콜백과 등록 슬롯을 함께 해제한다.
     bp.seen = bp.seen + 1
     if bp.seen > bp.budget then
-      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.start, bp.end_, CPU)
+      local released = release_breakpoint_refs(bp)
+      if not released then return end
       breakpoints[id] = nil
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "watch_disarmed", breakpoint_id = id, register = bp.register,
@@ -1876,6 +1989,7 @@ function handlers.watch_register(p)
       else dropped = dropped + 1 end
       return
     end
+    if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
     local v = emu.getState()[reg]
     if v and (v < bp.min or v > bp.max) then record_reg_hit(bp, addr, v) end
   end, bp.cbtype, bp.start, bp.end_, CPU)
@@ -1975,14 +2089,14 @@ local function setup_vram_recon_bp(bp, budget)
   bp.cbtype = emu.callbackType.exec
   bp.recon_lo, bp.recon_hi = 0, EXEC_MAX
   bp.seen, bp.budget = 0, budget
-  bp.ref = emu.addMemoryCallback(function(pc, opcode)
+  bp.ref = add_breakpoint_memory_callback(function(pc, opcode)
     -- 실제 정지 중에는 per-instruction 콜백을 무시해 예산을 태우지 않는다. Exact step은 STATE를
     -- frozen으로 유지한 채 guest를 진행하므로 예외이며, 그 transaction 안에서도 BP가 발화해야 한다.
     if STATE == "frozen" and not Step.active(step_operation) then return end
-    if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
     bp.seen = bp.seen + 1
     if bp.seen > bp.budget then            -- 예산 초과: 자동해제(무기한 per-instruction으로 emu 스레드 굶김 방지)
-      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
+      local released = release_breakpoint_refs(bp)
+      if not released then return end
       breakpoints[bp.id] = nil
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "watch_disarmed", breakpoint_id = bp.id, kind = "write",
@@ -1990,6 +2104,7 @@ local function setup_vram_recon_bp(bp, budget)
       else dropped = dropped + 1 end
       return
     end
+    if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
     local va, data = SYS.vram_write_target(pc, opcode)
     if va and va >= bp.start and va <= bp.end_ then
       if bp.has_value then
@@ -2001,7 +2116,7 @@ local function setup_vram_recon_bp(bp, budget)
   end, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
 end
 
-function handlers.set_breakpoint(p)
+local function install_breakpoint(p, id)
   -- auto_savestate: BP 히트는 read/write/이벤트(nmi·irq·dma) 콜백 안에서
   -- 일어나는데 emu.createSavestate는 exec 콜백 컨텍스트 전용이고 이벤트·codeBreak 컨텍스트에선
   -- 실패하므로 히트 순간 세이브스테이트를 원자적으로 못 뜬다. 조용히 받아 no-op하면
@@ -2013,7 +2128,6 @@ function handlers.set_breakpoint(p)
       "auto_savestate is unavailable on breakpoint hits because createSavestate is valid only in an exec callback. "
       .. "Use snapshot specs for atomic hit-time capture; save_state while running is not atomic with the hit."
   end
-  local id = next_bp_id; next_bp_id = next_bp_id + 1
   if p.kind == "snes_obj_eval_start" or p.kind == "snes_obj_handoff" then
     if not HAS_SNES_PPU_OBJ_EVENTS then
       return false, "unsupported", "SNES OBJ boundary events require host feature snes_ppu_obj_events"
@@ -2040,7 +2154,7 @@ function handlers.set_breakpoint(p)
       pause_on_hit = p.pause_on_hit,
       snapshot_specs = snapshot_specs,
     }
-    bp.ref = emu.addEventCallback(function()
+    bp.ref = add_breakpoint_event_callback(function()
       local state = emu.getState()
       local scanline = state["ppu.scanline"]
       if scanline == nil or scanline < bp.start or scanline > bp.end_ then return end
@@ -2071,7 +2185,7 @@ function handlers.set_breakpoint(p)
   if p.kind == "nmi" or p.kind == "irq" then
     local evtype = (p.kind == "nmi") and emu.eventType.nmi or emu.eventType.irq
     local bp = { id = id, kind = p.kind, is_event = true, evtype = evtype, pause_on_hit = p.pause_on_hit }
-    bp.ref = emu.addEventCallback(function()
+    bp.ref = add_breakpoint_event_callback(function()
       -- 플러드 가드: 스캔라인 IRQ는 프레임당 ~224회다. 버퍼가 차고 비-pausing이면 비싼 getState
       -- 전에 즉시 드롭. pausing BP는 첫 히트에서 freeze해 스스로 멈추므로 예외.
       if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
@@ -2131,7 +2245,7 @@ function handlers.set_breakpoint(p)
       if bp.pause_on_hit then halt_for_debug_stop("dma", id) end
     end
     for _, reg in ipairs(regs) do
-      bp.dma_refs[#bp.dma_refs + 1] = { ref = emu.addMemoryCallback(on_dma, bp.cbtype, reg, reg, CPU), reg = reg }
+      bp.dma_refs[#bp.dma_refs + 1] = { ref = add_breakpoint_memory_callback(on_dma, bp.cbtype, reg, reg, CPU), reg = reg }
     end
     breakpoints[id] = bp
     return true, { id = id }
@@ -2197,7 +2311,8 @@ function handlers.set_breakpoint(p)
       if p.kind ~= "write" then
         return false, "unsupported", bp.memory_type .. " read BP reconstruction is unavailable; only write reconstruction is implemented"
       end
-      local budget = math.max(1, p.max_instructions or VRAM_RECON_BUDGET)
+      local budget, budget_error = breakpoint_instruction_budget(p.max_instructions, VRAM_RECON_BUDGET, VRAM_RECON_BUDGET)
+      if not budget then return false, "bad_params", budget_error end
       setup_vram_recon_bp(bp, budget)
       breakpoints[id] = bp
       return true, { id = id, mechanism = "vdp_write_reconstruction", max_instructions = budget }
@@ -2240,25 +2355,25 @@ function handlers.set_breakpoint(p)
   bp.mirror_refs = {}
   for _, m in ipairs(mirrors) do
     bp.mirror_refs[#bp.mirror_refs + 1] =
-      { ref = emu.addMemoryCallback(on_access, cbtype, m[1], m[2], CPU), lo = m[1], hi = m[2] }
+      { ref = add_breakpoint_memory_callback(on_access, cbtype, m[1], m[2], CPU), lo = m[1], hi = m[2] }
   end
   breakpoints[id] = bp
   return true, { id = id }
 end
 
+function handlers.watch_register(p)
+  return admit_breakpoint(p, install_register_watch)
+end
+
+function handlers.set_breakpoint(p)
+  return admit_breakpoint(p, install_breakpoint)
+end
+
 function handlers.clear_breakpoint(p)
   local bp = breakpoints[p.id]
   if not bp then return false, "not_found", "breakpoint not found" end
-  if bp.is_event then emu.removeEventCallback(bp.ref, bp.evtype)
-  elseif bp.is_dma then
-    for _, d in ipairs(bp.dma_refs) do emu.removeMemoryCallback(d.ref, bp.cbtype, d.reg, d.reg, CPU) end
-  elseif bp.is_vram_recon then
-    emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
-  elseif bp.kind == "reg" then
-    emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.start, bp.end_, CPU)   -- watch_register: 단일 full-range exec ref(mirror 없음)
-  else
-    for _, m in ipairs(bp.mirror_refs) do emu.removeMemoryCallback(m.ref, bp.cbtype, m.lo, m.hi, CPU) end
-  end
+  local released, err = release_breakpoint_refs(bp)
+  if not released then return false, "cleanup_failed", tostring(err) end
   breakpoints[p.id] = nil
   return true, { cleared = p.id }
 end
@@ -2268,6 +2383,7 @@ function handlers.list_breakpoints()
   for _, bp in pairs(breakpoints) do
     out[#out + 1] = {
       id = bp.id, kind = bp.kind, memory_type = bp.memory_type,
+      registration_failed = bp.registration_failed,
       start = bp.start, ["end"] = bp.end_,
       register = bp.register, min = bp.min, max = bp.max,   -- reg 워치(watch_register)
       pc_min = bp.pc_min, pc_max = bp.pc_max,            -- pc 조건
@@ -2278,23 +2394,16 @@ function handlers.list_breakpoints()
 end
 
 function handlers.clear_all_breakpoints()
-  local n = 0
-  for id, bp in pairs(breakpoints) do
-    if bp.is_event then emu.removeEventCallback(bp.ref, bp.evtype)
-    elseif bp.is_dma then
-      for _, d in ipairs(bp.dma_refs) do emu.removeMemoryCallback(d.ref, bp.cbtype, d.reg, d.reg, CPU) end
-    elseif bp.is_vram_recon then
-      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
-    elseif bp.kind == "reg" then
-      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.start, bp.end_, CPU)
-    else
-      for _, m in ipairs(bp.mirror_refs) do emu.removeMemoryCallback(m.ref, bp.cbtype, m.lo, m.hi, CPU) end
-    end
-    breakpoints[id] = nil
-    n = n + 1
+  local n, first_error = 0, nil
+  for id in pairs(breakpoints) do
+    local ok, kind, message = handlers.clear_breakpoint({ id = id })
+    if ok then n = n + 1 else first_error = first_error or message or kind end
   end
+  if first_error then return false, "cleanup_failed", first_error end
   return true, { cleared = n }
 end
+
+end -- persistent breakpoint registration scope
 
 function handlers.poll_events()
   local out = { events = as_array(events), dropped = dropped }
@@ -2453,6 +2562,9 @@ function handlers.find_pattern(p)
   if type(hex) ~= "string" or #hex < 2 or #hex % 2 ~= 0 then
     return false, "bad_params", "hex must contain at least one byte and have even length"
   end
+  if #hex > SCAN_CAP * 2 then
+    return false, "bad_params", "pattern exceeds the supported scan window"
+  end
   local pat = {}
   for i = 1, #hex, 2 do
     local b = tonumber(hex:sub(i, i + 1), 16)
@@ -2522,7 +2634,7 @@ do
     control = Control.new(runtime, emu, {
       array = as_array, reply = reply_ok, error = reply_err, disconnect = disconnect,
       validate = normalize_debug_selection,
-      healthy = function() return not pacing_control_unverified end,
+      healthy = function() return not pacing_control_unverified and not StateIo.restore_guard.unverified end,
       frame = function() return frame end,
       legacy_busy = function()
         return Step.active(step_operation) or deferred ~= nil or recording ~= nil
@@ -2573,6 +2685,10 @@ local function dispatch(line)
   end
   local id, method, p = parse_request(line)
   id = id or 0
+  if StateIo.restore_guard.unverified then
+    reply_err(id, "restore_unverified", "savestate restoration is unverified: restart the managed session")
+    return nil
+  end
   if pacing_control_unverified then
     reply_err(id, "emulator_error", "execution_speed unverified: restart the managed session")
     return nil
@@ -2632,6 +2748,10 @@ local function handle_in_freeze(line)
   end
   local id, method, p = parse_request(line)
   id = id or 0
+  if StateIo.restore_guard.unverified then
+    reply_err(id, "restore_unverified", "savestate restoration is unverified: restart the managed session")
+    return nil
+  end
   if pacing_control_unverified then
     reply_err(id, "emulator_error", "execution_speed unverified: restart the managed session")
     return nil
@@ -2704,6 +2824,7 @@ local function do_step_chunk()
 end
 
 resume_from_freeze = function()
+  if StateIo.restore_guard.unverified then return end
   boundary_seq = boundary_seq + 1
   STATE = "running"
   freeze_start_ms = nil
@@ -2810,7 +2931,9 @@ local function service_frozen_once()
       resume_from_freeze()
       return
     end
-    if now - last_reconnect_ms >= 500 then
+    if auth_pending then
+      connect()
+    elseif now - last_reconnect_ms >= 500 then
       last_reconnect_ms = now
       connect()
     end
@@ -2825,7 +2948,7 @@ end
 emu.addEventCallback(function()
   if STATE ~= "frozen" then return end
   if not freeze_start_ms then freeze_start_ms = wall_ms() end
-  if not freeze_snapshot then freeze_snapshot = emu.getState() end
+  if not StateIo.restore_guard.unverified and not freeze_snapshot then freeze_snapshot = emu.getState() end
 end, emu.eventType.codeBreak)
 
 -- Unsafe halt kinds are still serviceable, but savestate operations remain disabled.
@@ -2890,6 +3013,10 @@ end, emu.eventType.inputPolled)
 
 -- RUNNING 프레임 루프
 emu.addEventCallback(function()
+  if StateIo.restore_guard.unverified then
+    StateIo.restore_guard.quarantine()
+    return
+  end
   halt_savestate_safe = false
   frame = frame + 1
   if control and (control:busy() or control:owns_parent()) then return end

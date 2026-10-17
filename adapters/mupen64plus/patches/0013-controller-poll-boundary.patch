@@ -1,0 +1,64 @@
+--- a/src/backends/plugins_compat/input_plugin_compat.c
++++ b/src/backends/plugins_compat/input_plugin_compat.c
+@@ -77,6 +77,22 @@
+     SDL_AtomicUnlock(&emucap_input_lock);
+ }
+ 
++/* Registered before execution; retired after the execution thread has stopped. */
++static void (*emucap_poll_callback)(uint32_t);
++EXPORT m64p_error CALL CoreEmucapSetPollCallback(uint32_t version, void (*callback)(uint32_t))
++{
++    if (version != 1) return M64ERR_INPUT_INVALID;
++    emucap_poll_callback = callback;
++    return M64ERR_SUCCESS;
++}
++void emucap_controller_response(void* opaque, const struct controller_input_backend_interface* backend,
++    uint32_t word)
++{
++    if (backend != &g_icontroller_input_backend_plugin_compat) return;
++    const struct controller_input_compat* controller = opaque;
++    if (controller->control_id == 0 && emucap_poll_callback) emucap_poll_callback(word);
++}
++
+ static int is_button_released(uint32_t input, uint32_t last_input, uint32_t mask)
+ {
+     return ((input & mask) == 0)
+--- a/src/backends/plugins_compat/plugins_compat.h
++++ b/src/backends/plugins_compat/plugins_compat.h
+@@ -58,6 +58,8 @@
+ extern const struct controller_input_backend_interface
+     g_icontroller_input_backend_plugin_compat;
+ 
++void emucap_controller_response(void* opaque, const struct controller_input_backend_interface* backend, uint32_t word);
++
+ /* Rumble backend interface */
+ 
+ extern const struct rumble_backend_interface
+--- a/src/device/controllers/game_controller.c
++++ b/src/device/controllers/game_controller.c
+@@ -20,6 +20,7 @@
+  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ #include "game_controller.h"
++#include "backends/plugins_compat/plugins_compat.h"
+ 
+ #include "api/callbacks.h"
+ #include "api/m64p_types.h"
+@@ -212,6 +213,7 @@
+ #ifdef COMPARE_CORE
+         CoreCompareDataSync(4, rx_buf);
+ #endif
++        emucap_controller_response(cont->cin, cont->icin, *((uint32_t*)(rx_buf)));
+     } break;
+ 
+     case JCMD_PAK_READ: {
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -43,6 +43,7 @@
+ CoreStartup;
+ CoreEmucapPacing;
+ CoreEmucapInput;
++CoreEmucapSetPollCallback;
+ DebugBreakpointCommand;
+ DebugBreakpointLookup;
+ DebugBreakpointTriggeredBy;

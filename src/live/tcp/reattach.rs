@@ -2,7 +2,7 @@ use std::net::TcpListener;
 
 use serde_json::Value;
 
-use super::{io_to_link, split_addr, TcpLink, AUTO_PORT_RANGE};
+use super::{io_to_link, is_current_reclaim_token, split_addr, TcpLink, AUTO_PORT_RANGE};
 use crate::live::link::{EmulatorLink, LinkError};
 use crate::live::{continuity, runtime};
 
@@ -73,6 +73,11 @@ pub(super) fn returned_generation(
             kind: "reclaim_capability_unavailable".into(),
             message: "the requested runtime generation has no private reclaim capability".into(),
         })?;
+    if !is_current_reclaim_token(&token) {
+        return Err(LinkError::Protocol(
+            "runtime reclaim capability uses an obsolete or weak format".into(),
+        ));
+    }
     let holder = runtime::capture_process(std::process::id());
     let existing_record = link
         .runtime_store
@@ -151,8 +156,13 @@ pub(super) fn returned_generation(
         return Err(LinkError::Busy);
     }
 
+    // Candidate tokens are captured when accepted. Retire them even when this
+    // handoff retains the listener, before admitting the returned generation.
+    link.cancel_preaccept();
+    if link.expected_session_token() != token {
+        link.drop_conn();
+    }
     if let Some(listener) = prepared_listener {
-        link.cancel_preaccept();
         link.drop_conn();
         link.addr = listener
             .local_addr()

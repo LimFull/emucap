@@ -20,6 +20,11 @@ struct Fake {
     token: RequestCancellation,
 }
 impl GdbTransport for Fake {
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
     fn send(&mut self, p: &str) -> Result<String, GdbError> {
         let n = self.native.lock().unwrap();
         if n.reject_query_before_ack && n.interrupts > 0 && !n.emitted {

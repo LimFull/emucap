@@ -20,6 +20,32 @@ impl DelayedStepGdb {
 }
 
 impl GdbTransport for DelayedStepGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        let previous = self.timeout;
+        self.timeout = previous.min(budget);
+        let result = self.send(payload);
+        self.timeout = previous;
+        result
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         match payload {
             "?" => Ok("S05".into()),

@@ -1,0 +1,11 @@
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -1508,6 +1508,8 @@
+ 
+ 				bool armed = false;
+ 				Host::RunOnCPUThread([kind, start, end, &armed]() {
++					if (s_emucap_breakpoints.size() >= 128)
++						return;
+ 					const auto duplicate = std::find_if(
+ 						s_emucap_breakpoints.begin(), s_emucap_breakpoints.end(),
+ 						[kind, start, end](const EmuCapBreakpoint& breakpoint) {

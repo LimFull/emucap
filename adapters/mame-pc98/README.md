@@ -10,12 +10,13 @@ fetches a pinned MAME release into `work/mame-src`, applies `patches/*.patch`,
 and writes `work/mame` as a safe headless wrapper.  The raw executable is linked
 as `work/mame.raw` only for explicit diagnostics.  `launch.sh` prefers
 `work/mame` only when it is an executable regular file; a stale source directory
-at that path is ignored with a warning.  A global `mame` binary is only a
-bootstrap smoke fallback.
+at that path is ignored with a warning. Every selected binary, including an override or global
+installation, must provide the maintained bounded-control bindings from patch 0016. The plugin
+reports a rebuild error before opening its endpoint when these bindings are missing.
 
 ## Backend and compatibility
 
-- The pinned MAME 0.288 source target exposes PC-98 drivers: `pc9801`,
+- The pinned MAME 0.289 source target exposes PC-98 drivers: `pc9801`,
   `pc9801vm`, `pc9821`, `pc9821ap2`.
 - `pc9821` and `pc9821ap2` accept `.d88`, `.hdm`, and `.hdi` media.
 - `pc9821` is the closest match for existing RetroArch-style BIOS names
@@ -35,6 +36,20 @@ bootstrap smoke fallback.
 - MAME's native `machine:load()`/debugger `stateload` path does not restore RAM
   in the headless debugger setup, so the bridge implements emucap-owned PC-98
   state bundles instead.
+
+The maintained MAME 0.289 subset builds pass selected macOS and Linux ARM64 checks for
+memory batching, pacing, input and repeated restored-PC/breakpoint behavior. Linux also
+passes Arle opening restore after live data-disk replacement and a 20-frame Enter `tap`.
+Broader game/media checks, Windows and Linux x86-64 remain open.
+
+## Read-only media
+
+The native image loader tries read/write access first and then read-only access for readable
+media. Both a permission denial and a read-only filesystem trigger that fallback. Writable
+media retain normal guest writes; a write-protected mount stays write-protected. Creation,
+write-only devices and unrelated I/O failures retain their native failure results.
+
+`_tests/native/mame-media-open.py --source <patched-mame-source>` checks this retry boundary.
 
 ## State-bundle lifecycle
 
@@ -90,11 +105,10 @@ through providing each, and confirm before launching.
 
 ### OS reality
 
-macOS is the tested path.  Building the repo-local MAME with `build.sh` is slow
-and disk-heavy — it fetches and compiles a pinned MAME source tree.  Linux builds
-the same way and is experimental.  On Windows this adapter is BETA; treat it as
-unverified rather than assuming Windows-specific steps that are not documented
-here.
+Selected macOS and Linux ARM64 paths have runtime evidence. Building the repo-local MAME with
+`build.sh` is slow and disk-heavy because it fetches and compiles a pinned MAME source tree.
+The final maintained patch stack still needs consolidated runtime requalification; Windows and
+Linux x86-64 qualification remains pending.
 
 ## Launch
 
@@ -127,9 +141,7 @@ adapters/mame-pc98/work/mame.raw
 ignores it and `build.sh` removes it before writing the wrapper.  Put
 emulator-source changes under `adapters/mame-pc98/patches/` as normal
 `patch -p1` files; they are applied in sorted order on each clean source
-extract.  Do not treat the `PATH` fallback as the target architecture.  It is
-there so agents can keep proving boot, memory, screenshot, and input behavior
-while the next C++ hook is being developed.
+extract. An installed binary selected through `PATH` must supply the same required native hooks.
 
 Set `MAME_WORK=/path/to/build-dir` only to an empty directory or a directory
 previously created by `build.sh`.  The script refuses non-empty custom work
@@ -177,10 +189,10 @@ with a symlink named for the driver:
 
 The launcher uses `~/mame/roms` or `%USERPROFILE%/mame/roms` as the default
 rompath when either directory exists.  Otherwise it creates an emucap-owned
-empty rompath under the per-OS data root.  It also writes MAME runtime state
-under that emucap data root by default so probe runs do not create `cfg/`,
-`nvram/`, or `snap/` in the repo.  Fallback pidfiles and logs also live in the
-same per-port emucap directory unless `EMUCAP_LOG` overrides the log path.
+empty rompath under the per-OS data root. Managed launch writes MAME runtime state, pidfiles and
+logs in the launch-generation capsule so probe runs do not create `cfg/`, `nvram/`, or `snap/` in
+the repo. The legacy shell fallback keeps its pidfile, log and writable home in its own port-scoped
+directory unless `EMUCAP_LOG` or `MAME_HOME` overrides it.
 It ignores the user's global `mame.ini` by default and forces
 `SDL_VIDEODRIVER=dummy`, `-video none`, `-window`, and `-nomaximize` in
 headless mode; this prevents saved fullscreen/window settings from opening a
@@ -203,7 +215,7 @@ The MCP launcher separately accepts optional
 board installs that emulated device but does not enable host output, so audible
 sound normally requires both `sound:true` and `pc98_sound_board`. The matching
 MAME `pc9801_26.zip` or `pc9801_86.zip` ROM set must be available on the MAME
-rompath; emucap does not distribute or copy it. MAME 0.288 also lists the
+rompath; emucap does not distribute or copy it. The pinned MAME 0.289 source also lists the
 PC-9801-118, but its board ROM is undumped in the pinned source, so emucap does
 not advertise it as a supported choice.
 
@@ -330,7 +342,9 @@ than a cartridge ROM; regression ROM checks use the same `sha1` field.
 `emucap-mame-pc98-state-v2`, not MAME's native `.sta` format.  The bundle stores
 the i386 register packet, RAM, TVRAM, GVRAM regions, MAME save-manager items
 exposed through Lua, and the last raster image actually presented by MAME;
-legacy bundles remain readable.
+legacy bundles remain readable. Register packets are validated before restoration.
+A legacy v1 bundle without registers loads with `post_restore_instruction_exact=false`;
+`probe` requires a complete register packet. A register readback mismatch fails the load.
 Loading restores save-manager items first, writes the memory regions back, and
 finishes MAME's post-load callbacks before restoring the saved presented raster,
 then restores registers through the Lua bridge's `regload` command.  Before
@@ -414,9 +428,8 @@ four sequential `tap` calls for `l`, `i`, `s`, and `t` typed `list`.
 The pinned MAME patch adds relative analog deltas to MAME's existing mouse
 accumulator. It does not use a persistent analog override, so a completed MCP
 move does not lock out a visible launch's native mouse. The adapter advertises
-`move_pointer` only when that host API and both PC-98 mouse axes are present;
-the system-MAME smoke fallback therefore fails closed instead of claiming the
-operation. Managed launch also enables MAME's mouse device explicitly. Headless
+`move_pointer` only when that host API and both PC-98 mouse axes are present.
+Managed launch also enables MAME's mouse device explicitly. Headless
 launch keeps the host provider disabled while accepting injected deltas; visible
 launch keeps native mouse input available. PC-98 motion is signed and relative,
 with each `dx` and `dy` limited
@@ -461,6 +474,19 @@ the emulator stays frozen for inspection; with `pause_on_hit=false` the hit is
 only queued through `poll_events` and the emulator keeps running.
 `list_breakpoints` includes the generated condition string for audit.
 
+The bridge retains at most 128 public breakpoint/register-watch IDs, including records retained
+after one-shot hits. Clear these records to release their slots. The shared MAME Lua backend
+separately limits armed exec/watch/register points to 128 across qEmucap and standard GDB commands.
+Native hits retire their armed points; Neo Geo can rearm the same public ID. Point IDs remain
+monotonic and registration fails before signed native ID exhaustion.
+Conditions are passed as separate native arguments, so their text cannot introduce additional
+console commands or breakpoint actions. This requires the maintained host binding from patch `0018`.
+
+The bridge retains at most 256 events and 1 MiB of compact JSON, including register/snapshot
+enrichment. Overflow removes oldest events; a single oversized event is discarded whole. Each
+successful `poll_events` reports and resets the global `dropped` count, including filtered polls.
+Unmatched events remain queued within the same limits. Event loss does not change the native stop.
+
 `disassemble(address, count)` uses MAME debugger `dasm` through the same
 repo-local Lua bridge and returns i386sx instruction rows with `addr`, `text`,
 and `bytes`.  This was verified both at the live `cpu.pc` and immediately after
@@ -471,6 +497,9 @@ the same repo-local console-command path.  The bridge maps emucap register names
 such as `pc`, `sp`, `cpu.eip`, and `cpu.esp` to MAME debugger expressions and
 returns `register_break` events with the emucap id, register name, bounds,
 hit-time i386 registers, `pc`, and the offending value.
+
+The current MAME path does not enforce `max_instructions`; clear a retained watch explicitly
+with `clear_breakpoint`.
 
 `set_trace`/`get_trace` use MAME debugger `trace`/`traceflush` with an
 adapter-owned temporary trace file.  `get_trace` parses recent trace rows into
@@ -491,8 +520,8 @@ returns a `reset` event with hit-time i386 registers and `pc`.
 ## BIOS note
 
 Do not commit BIOS files.  For MAME, the required names and checksums are
-available from the repo-local binary after `build.sh`, or from the bootstrap
-fallback if no local build exists:
+available from the repo-local binary after `build.sh`, or from a MAME installation matching
+the source version:
 
 ```sh
 adapters/mame-pc98/work/mame -listroms pc9801rs
@@ -517,17 +546,39 @@ ROMs and other driver-specific dumps.
 
 ## Batched memory and execution speed
 
-Requires the current patch stack (0006 side-effect-free reads and fast-forward readback, 0007
-throttle-wait hook and sub-second waits); the bridge advertises the methods only when the plugin
-reports those bindings. `read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen stop with
-device side effects disabled, the view MAME's debugger uses; `read_memory` uses the same read.
+PC-98 and Neo Geo share the maintained patch stack and Lua backend. The bridge advertises
+batch reads when the plugin reports `peek_block`; speed control requires `throttle_wait_hook`,
+`fastforward_readback` and `validated_pacing` (native tuple validation from patch 0015).
+Earlier producers retain pacing readback and pacing-aware operation deadlines when supported.
+`read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen stop with device side effects
+disabled, the view MAME's debugger uses; `read_memory` uses the same read.
 `debug.execution_speed` drives MAME's own governor (`speed_factor`, 0.1 percent steps from 0.1 to
 10000, or unlimited); the launch default is MAME's 100 percent. Fast-forward, refresh-rate speed or
 a non-unit throttle rate reads back as `custom`. Read-only requests are answered during throttle
 waits, so polling never advances a slow guest; a paced frame advance that would outlive its host
 budget stops with `reason: "host_deadline"`.
 
+Backend GDB `m`/`M` requests admit 1–64 KiB within the 32-bit address space and validate the
+address, length and complete hex data before accessing memory. Both Rust bridges split larger
+direct writes into 16 KiB chunks after checking the whole target region. A failed chunk stops subsequent writes;
+bytes already written remain changed.
+
 With the patched scheduler boundary available, completed frame requests publish
 frozen state after the native timeslice and timer callbacks unwind. This applies
 to PC-98 and Neo Geo. Instruction breakpoints retain their explicit debugger halt;
 the PC-98 state-bundle format and media-binding requirements remain unchanged.
+
+## Shared native control I/O
+
+PC-98 and Neo Geo use a mutually authenticated nonblocking native socket. Managed launch creates a
+separate native credential for the exact MAME/bridge pair. A bounded candidate pool completes the
+challenge before one peer becomes visible to Lua; ordinary GDB/qEmucap bytes, raw interrupts and
+wrong or incomplete handshakes cannot reach the dispatcher. The bridge verifies the producer before
+returning its client proof, so a process that pre-binds the predictable loopback port learns no
+reusable credential. The shared Lua transport then validates checksums and bounds payloads, retained
+queues and each service iteration. Authentication and incomplete-frame work use absolute five-second
+deadlines. Connection loss retires that backend, attempts input release and retains halt intent. Stop
+the existing managed generation before launching its replacement.
+
+Framebuffer restore validates geometry and an opened regular file's exact size before allocation,
+with a 16 MiB ceiling. A failed read leaves the presented screen unchanged.

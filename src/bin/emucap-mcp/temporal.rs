@@ -20,7 +20,15 @@ pub enum Operation {
 impl Operation {
     fn method(&self) -> &'static str {
         match self {
-            Self::Step(args) if args.unit == tools::StepUnit::Instructions => "step_instructions",
+            Self::Step(args) => args.unit.capability_method(),
+            Self::Tap(args)
+                if args
+                    .timing
+                    .as_ref()
+                    .is_some_and(|t| t.unit == tools::StepUnit::InputPolls) =>
+            {
+                "step_input_polls"
+            }
             _ => "step",
         }
     }
@@ -35,6 +43,19 @@ impl Operation {
         crate::ensure_capabilities_loaded(link)?;
         if cancellation.is_cancelled() {
             return Err(LinkError::Cancelled);
+        }
+        if let Self::Tap(args) = &self {
+            args.resolved_timing()?;
+            if !args.axes.is_empty() {
+                let status = link.call("status", serde_json::json!({}))?;
+                crate::debug_surface::input::validate_controller_axes(
+                    &status, args.port, &args.axes,
+                )
+                .map_err(|message| LinkError::Emulator {
+                    kind: "bad_params".into(),
+                    message,
+                })?;
+            }
         }
         let controlled = link
             .capabilities()
@@ -62,18 +83,24 @@ impl Operation {
                 cancellation,
                 &owner,
             ),
-            (Self::Tap(a), Some(owner)) => tools::tap_with_cancellation(
-                link,
-                a.port,
-                &a.buttons,
-                a.press_frames,
-                a.after_frames,
-                cancellation,
-                &owner,
-            ),
+            (Self::Tap(a), Some(owner)) => {
+                let (unit, press, after) = a.resolved_timing()?;
+                tools::tap_axes_in_unit_with_cancellation(
+                    link,
+                    a.port,
+                    &a.buttons,
+                    &a.axes,
+                    press,
+                    after,
+                    unit,
+                    cancellation,
+                    &owner,
+                )
+            }
             (Self::Step(a), None) => tools::step(link, a.count, a.unit, a.cpu.as_deref()),
             (Self::Tap(a), None) => {
-                tools::tap(link, a.port, &a.buttons, a.press_frames, a.after_frames)
+                let (unit, press, after) = a.resolved_timing()?;
+                tools::tap_axes_in_unit(link, a.port, &a.buttons, &a.axes, press, after, unit)
             }
         }
     }

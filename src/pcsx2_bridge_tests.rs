@@ -174,7 +174,7 @@ fn hello_reports_the_managed_ps2_surface() {
     assert_eq!(result["build"], crate::build_identity::BUILD_HASH);
     assert_eq!(result["content"], "/tmp/managed-ps2.iso");
     assert_eq!(result["name"], "ps2-test");
-    assert_eq!(result["session_token"], "token");
+    assert!(result.get("session_token").is_none());
     assert_eq!(result["breakpoint_kinds"][0]["range_mode"], "exact");
     assert_eq!(result["breakpoint_kinds"][1]["range_mode"], "inclusive");
     assert_eq!(result["breakpoint_kinds"][2]["snapshot"], false);
@@ -920,6 +920,46 @@ fn breakpoint_crud_uses_exact_native_ranges_and_rejects_lossy_options() {
         let rejected = bridge.handle_request(Request::new(33, "set_breakpoint", params));
         assert_eq!(rejected.error.unwrap().kind, "bad_params");
     }
+}
+
+#[test]
+fn breakpoint_budget_bounds_mixed_pine_registrations_before_mutation() {
+    fn command(method: u8, i: u32) -> Vec<u8> {
+        let mut bytes = vec![method];
+        for word in [i % 3, i * 32, i * 32] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+    let mut expectations = (0..128)
+        .map(|i| (command(MSG_EMUCAP_SET_BREAKPOINT, i), Ok(vec![])))
+        .collect::<Vec<_>>();
+    expectations.push((command(MSG_EMUCAP_CLEAR_BREAKPOINT, 0), Ok(vec![])));
+    expectations.push((command(MSG_EMUCAP_SET_BREAKPOINT, 128), Ok(vec![])));
+    let mut bridge = bridge(expectations);
+    for i in 0..128 {
+        let kind = ["exec", "read", "write"][i % 3];
+        assert_eq!(
+            bridge
+                .set_breakpoint(&json!({"kind":kind,"memory_type":"ee","start":i*32}))
+                .unwrap()["id"],
+            i + 1
+        );
+    }
+    assert!(bridge
+        .set_breakpoint(&json!({"kind":"write","memory_type":"ee","start":4096}))
+        .unwrap_err()
+        .to_string()
+        .contains("128"));
+    assert_eq!(bridge.next_breakpoint_id, 129);
+    bridge.clear_breakpoint(&json!({"id":1})).unwrap();
+    assert_eq!(
+        bridge
+            .set_breakpoint(&json!({"kind":"write","memory_type":"ee","start":4096}))
+            .unwrap()["id"],
+        129
+    );
+    assert_eq!(bridge.breakpoints.len(), 128);
 }
 
 #[test]

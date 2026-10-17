@@ -1,6 +1,41 @@
 use super::*;
+use std::fs;
+use std::path::Path;
 
 impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
+    fn stage_read_only_disc(
+        &self,
+        source: &Path,
+        expected: &crate::launch::xemu::FileIdentity,
+    ) -> XemuResult<PathBuf> {
+        let machine_root = self.state_environment.hdd.parent().ok_or_else(|| {
+            XemuBridgeError::BadState("managed Xbox HDD path has no parent".into())
+        })?;
+        let media_root = machine_root.join("removable-media");
+        fs::create_dir_all(&media_root)?;
+        let metadata = fs::symlink_metadata(&media_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(XemuBridgeError::BadState(
+                "managed Xbox removable-media root is not a plain directory".into(),
+            ));
+        }
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("xiso")
+            .to_ascii_lowercase();
+        let staged = media_root.join(format!(
+            "disc-{}.{}",
+            ulid::Ulid::generate().to_string().to_ascii_lowercase(),
+            extension
+        ));
+        crate::launch::xemu::copy_verified(source, &staged, expected)?;
+        let mut permissions = fs::metadata(&staged)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&staged, permissions)?;
+        Ok(staged)
+    }
+
     pub(super) fn get_rom_info(&self) -> XemuResult<Value> {
         let content = self
             .current_disc
@@ -73,16 +108,28 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 )));
             }
         }
-        self.qmp.execute(
+        let source_identity = crate::launch::xemu::identity_for_regular_file(&path)?;
+        let staged = self.stage_read_only_disc(&path, &source_identity)?;
+        let (staged_size, staged_sha1) = sha1_regular_file(&staged)?;
+        if staged_size != size || staged_sha1 != sha1 {
+            let _ = fs::remove_file(&staged);
+            return Err(XemuBridgeError::BadState(
+                "Xbox source disc changed while creating its generation copy".into(),
+            ));
+        }
+        if let Err(error) = self.qmp.execute(
             "xemu-emucap-load-disc",
-            Some(json!({"path":path.display().to_string()})),
-        )?;
-        self.current_disc = Some(path.clone());
+            Some(json!({"path":staged.display().to_string()})),
+        ) {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        self.current_disc = Some(staged.clone());
         self.state_media_identity_cache = None;
         Ok(json!({
             "status":"completed", "state":"frozen", "device":"dvd", "action":"mount",
             "previous":previous,
-            "current":{"path":path.display().to_string(), "sha1":sha1, "size":size, "readonly":true}
+            "current":{"path":staged.display().to_string(), "source_path":path.display().to_string(), "sha1":sha1, "sha256":source_identity.sha256, "size":size, "readonly":true, "binding":"generation_copy"}
         }))
     }
 }

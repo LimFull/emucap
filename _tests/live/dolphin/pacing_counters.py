@@ -105,7 +105,7 @@ def main():
             if held:
                 result=w.call('tap',{'buttons':['a'],'press_frames':2,'after_frames':3})
             else:
-                result=w.call('step',{'count':6,'unit':'frames'})
+                result=w.call('step',{'count':5,'unit':'frames'})
             after=w.call('status')
             current=record()
             cpu=w.call('get_state',{'groups':['cpu']})
@@ -117,10 +117,10 @@ def main():
         reference = rows[0]
         for row in rows:
             current = row['record']
-            assert current[0] - base[0] == 6, row
+            assert current[0] - base[0] == 5, row
             assert current[1] - base[1] == (2 if row['held'] else 0), row
             # 2 fields/scan * 525 half-lines * 429 samples * 3 TB ticks/sample.
-            expected = 6 * 2 * 525 * 429 * 3
+            expected = 5 * 2 * 525 * 429 * 3
             # Each true scan edge lies between the guest's previous-read lower
             # sample and current-read upper sample. Compare the resulting interval.
             lower = (current[2] - base[5]) % (1 << 32)
@@ -128,7 +128,7 @@ def main():
             assert lower <= expected <= upper, (lower, expected, upper, row)
             for sample in (base, current):
                 assert (sample[5] - sample[2]) % (1 << 32) < 429 * 3, sample
-            assert row['frame_delta'] == 12, row
+            assert row['frame_delta'] == 10, row
             if row['held']:
                 assert row['record'] == reference['record'] and row['cpu'] == reference['cpu'], row
         (out/'completed.json').write_text(json.dumps({'passed':True,'launch':launch,'cases':len(rows)},indent=2))

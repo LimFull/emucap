@@ -18,7 +18,7 @@ use super::{
     RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 8;
+pub const REQUIRED_HOST_API: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -305,12 +305,20 @@ pub struct PreparedSession {
     pub pine_socket: Option<PathBuf>,
 }
 
-fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<PreparedSession> {
-    let home = super::emu_home_dir("pcsx2", port);
+fn prepare_session(
+    port: u16,
+    bios: &Path,
+    pine_slot: u16,
+    runtime: Option<RuntimeEnv<'_>>,
+) -> io::Result<PreparedSession> {
+    let home = super::emu_generation_dir("pcsx2", port, runtime)?;
     let data_root = home.join("data");
     let settings = data_root.join("inis");
     let memory_cards = data_root.join("memcards");
-    let pine_runtime = home.join("pine");
+    // Unix-domain socket paths are sharply bounded. Keep only the authenticated, slot-unique
+    // transport rendezvous in the short port root; guest and emulator state remain generation-owned.
+    let pine_root = super::emu_home_dir("pcsx2", port)?;
+    let pine_runtime = pine_root.join("pine");
     let pine_socket = pine_socket_path(&pine_runtime, pine_slot);
     if let Some(socket) = pine_socket
         .as_deref()
@@ -325,7 +333,7 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
             ),
         ));
     }
-    let base = super::emu_home_base();
+    let base = super::emu_home_base()?;
     for path in [&home, &data_root, &settings, &memory_cards, &pine_runtime] {
         if super::has_symlink_component_under(&base, path) {
             return Err(io::Error::new(
@@ -337,9 +345,9 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
             ));
         }
     }
-    std::fs::create_dir_all(&settings)?;
-    std::fs::create_dir_all(&memory_cards)?;
-    std::fs::create_dir_all(&pine_runtime)?;
+    crate::private_fs::ensure_private_dir_tree(&home, &settings)?;
+    crate::private_fs::ensure_private_dir_tree(&home, &memory_cards)?;
+    crate::private_fs::ensure_private_dir_tree(&pine_root, &pine_runtime)?;
     let bios_directory = bios.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -365,7 +373,7 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
         bios_name,
         pine_slot
     );
-    std::fs::write(settings.join("PCSX2.ini"), ini)?;
+    crate::private_fs::write_private_file(&settings.join("PCSX2.ini"), ini.as_bytes())?;
     Ok(PreparedSession {
         pine_socket,
         home,
@@ -396,7 +404,12 @@ pub struct Launched {
     pub data_root: PathBuf,
 }
 
-fn emulator_spec(launch: &Launch<'_>, prepared: &PreparedSession, slot: u16) -> LaunchSpec {
+fn emulator_spec(
+    launch: &Launch<'_>,
+    prepared: &PreparedSession,
+    slot: u16,
+    native_token: &str,
+) -> LaunchSpec {
     let mut spec = LaunchSpec::new(launch.binary, launch.log_path)
         .arg("-batch")
         .arg("-fastboot")
@@ -405,6 +418,7 @@ fn emulator_spec(launch: &Launch<'_>, prepared: &PreparedSession, slot: u16) -> 
             "EMUCAP_PCSX2_DATAROOT",
             prepared.data_root.to_string_lossy().into_owned(),
         )
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_token)
         .env("HOME", prepared.home.to_string_lossy().into_owned());
     if !launch.display {
         spec = spec.arg("-nogui");
@@ -428,11 +442,17 @@ fn emulator_spec(launch: &Launch<'_>, prepared: &PreparedSession, slot: u16) -> 
     spec
 }
 
-fn bridge_spec(launch: &Launch<'_>, prepared: &PreparedSession, pine_slot: u16) -> LaunchSpec {
+fn bridge_spec(
+    launch: &Launch<'_>,
+    prepared: &PreparedSession,
+    pine_slot: u16,
+    native_token: &str,
+) -> LaunchSpec {
     let mut spec = LaunchSpec::new(launch.bridge, launch.log_path)
         .arg(launch.port.to_string())
         .arg(pine_slot.to_string())
         .env("EMUCAP_CONTENT", launch.content)
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_token)
         .env(
             "EMUCAP_PCSX2_DATAROOT",
             prepared.data_root.to_string_lossy().into_owned(),
@@ -507,19 +527,23 @@ fn wait_survives(pid: u32, settle: Duration, message: &str) -> io::Result<()> {
 
 fn write_pidfile(log_path: &Path, name: &str, pid: u32) {
     if let Some(directory) = log_path.parent() {
-        let _ = std::fs::write(directory.join(name), format!("{pid}\n"));
+        let _ = crate::private_fs::write_private_file(
+            &directory.join(name),
+            format!("{pid}\n").as_bytes(),
+        );
     }
 }
 
 pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
     let pine = resolve_pine_slot()?;
-    let prepared = prepare_session(launch.port, launch.bios, pine.slot)?;
+    let prepared = prepare_session(launch.port, launch.bios, pine.slot, launch.runtime)?;
+    let native_token = super::new_native_debug_token();
     if let Some(path) = prepared.pine_socket.as_deref() {
         let _ = std::fs::remove_file(path);
     }
     drop(pine.reservation);
 
-    let pcsx2_pid = spawn_detached(&emulator_spec(launch, &prepared, pine.slot))?;
+    let pcsx2_pid = spawn_detached(&emulator_spec(launch, &prepared, pine.slot, &native_token))?;
     write_pidfile(launch.log_path, "pcsx2.pid", pcsx2_pid);
     if let Err(error) = wait_pine_ready(
         pcsx2_pid,
@@ -534,7 +558,9 @@ pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
         super::spawn_display_caffeinate(pcsx2_pid);
     }
 
-    let bridge = match bridge_spec(launch, &prepared, pine.slot).emulator_dependency(pcsx2_pid) {
+    let bridge = match bridge_spec(launch, &prepared, pine.slot, &native_token)
+        .emulator_dependency(pcsx2_pid)
+    {
         Ok(spec) => spec,
         Err(error) => {
             let _ = terminate_detached(pcsx2_pid);

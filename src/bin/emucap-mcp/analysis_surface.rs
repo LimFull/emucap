@@ -6,6 +6,17 @@ pub(crate) fn describe() -> serde_json::Value {
     serde_json::json!({
         "surface": "analysis",
         "execution_owner": "current_control_session",
+        "limits": {
+            "suite_cases": emucap::analysis::regression::MAX_SUITE_CASES,
+            "suite_entries": emucap::analysis::regression::MAX_SUITE_ENTRIES,
+            "suite_case_json_bytes": emucap::analysis::regression::MAX_SUITE_CASE_JSON_BYTES,
+            "suite_movie_bytes": emucap::analysis::regression::MAX_SUITE_MOVIE_BYTES,
+            "movie_bytes": emucap::analysis::regression::MAX_REGRESSION_MOVIE_BYTES,
+            "movie_rows": emucap::analysis::regression::MAX_REGRESSION_MOVIE_ROWS,
+            "guest_advances": emucap::analysis::regression::MAX_REGRESSION_ADVANCES,
+            "determinism_guest_advances": emucap::analysis::regression::MAX_DETERMINISM_ADVANCES,
+            "operation_ms": emucap::live::temporal::MAX_SYNC_OPERATION_MS,
+        },
         "operations": {
             "regression_run": {
                 "description": "Replay a regression suite and return pass, fail, or invalid buckets.",

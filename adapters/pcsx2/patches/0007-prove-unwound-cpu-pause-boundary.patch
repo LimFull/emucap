@@ -1,6 +1,8 @@
---- a/pcsx2/VMManager.cpp
-+++ b/pcsx2/VMManager.cpp
-@@ -156,6 +156,10 @@
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index de50e4d..317f304 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -159,6 +159,10 @@ static bool s_log_force_file_log = false;
  
  static std::atomic<VMState> s_state{VMState::Shutdown};
  static bool s_cpu_implementation_changed = false;
@@ -11,7 +13,7 @@
  static Threading::ThreadHandle s_vm_thread_handle;
  
  static std::deque<std::thread> s_save_state_threads;
-@@ -265,8 +269,16 @@
+@@ -271,8 +275,16 @@ void VMManager::ResetResumeTimestamp()
  	s_session_resume_timestamp = static_cast<u64>(Common::Timer::GetCurrentValue());
  }
  
@@ -28,7 +30,7 @@
  	++s_emucap_memory_epoch;
  	// Some state transitions aren't valid.
  	const VMState old_state = s_state.load(std::memory_order_acquire);
-@@ -308,7 +320,9 @@
+@@ -315,7 +327,9 @@ void VMManager::SetState(VMState state)
  	}
  	else if (state == VMState::Stopping && old_state == VMState::Running)
  	{
@@ -39,7 +41,7 @@
  		Cpu->ExitExecution();
  	}
  }
-@@ -2740,6 +2754,8 @@
+@@ -2794,6 +2808,8 @@ void VMManager::Internal::ClearCPUExecutionCaches()
  
  void VMManager::Execute()
  {
@@ -48,9 +50,11 @@
  	// Check for interpreter<->recompiler switches.
  	if (std::exchange(s_cpu_implementation_changed, false))
  	{
---- a/pcsx2/VMManager.h
-+++ b/pcsx2/VMManager.h
-@@ -66,6 +66,9 @@
+diff --git c/pcsx2/VMManager.h i/pcsx2/VMManager.h
+index 8d3b656..18b0ac0 100644
+--- c/pcsx2/VMManager.h
++++ i/pcsx2/VMManager.h
+@@ -69,6 +69,9 @@ using VMBootDoneCallback = std::function<void(VMBootResult result, const Error&
  namespace VMManager
  {
  	u64 GetEmucapMemoryEpoch();

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -17,6 +17,17 @@ use super::protocol::{parse_response, read_ndjson_frame, to_line, Request, PROTO
 mod call;
 mod preaccept;
 mod reattach;
+mod session;
+
+use session::{
+    is_current_auth_token, is_current_reclaim_token, own_session_identity, read_persisted_port,
+};
+pub use session::{
+    new_session_token, same_session_identity, session_token_is_own, session_token_path,
+};
+#[cfg(test)]
+pub(crate) use session::{port_persist_path, port_persist_path_with_store};
+pub(crate) use session::{reusable_session_token, write_persisted_port, write_session_token};
 
 pub struct TcpLink {
     addr: String,
@@ -63,13 +74,14 @@ type PreacceptResult = Result<(Conn, Capabilities, String), LinkError>;
 
 struct Preaccept {
     rx: Receiver<PreacceptResult>,
+    errors: Receiver<LinkError>,
     handle: JoinHandle<()>,
     stop: Arc<AtomicBool>,
 }
 
-fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLink {
+fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> std::io::Result<TcpLink> {
     let session_token = new_session_token();
-    TcpLink {
+    Ok(TcpLink {
         addr: addr.to_string(),
         base_port: split_addr(addr).1,
         listener,
@@ -81,192 +93,14 @@ fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLin
         staged_reclaim_token: None,
         next_id: 1,
         preaccept: None,
-        runtime_store: super::runtime::RuntimeStore::discover(),
+        runtime_store: super::runtime::RuntimeStore::discover()?,
         runtime_candidates: Vec::new(),
         consecutive_timeouts: 0,
         deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
-    }
-}
-
-pub fn new_session_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    // 포맷 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`. 세션 식별부는 앞 두 필드
-    // `{cwd_hash}-{session_anchor}` — cwd는 세션마다 다르고, session_anchor는 제어 세션 id 해시라
-    // 같은 세션의 서버 respawn(/mcp 재연결)엔 불변이면서 동시 실행되는 다른 세션과는 달라, 같은 cwd의
-    // 형제 세션을 구별한다(reclaim 오인 방지). 부모 PID는 respawn이 다른 부모 아래로 재spawn되면 값이
-    // 바뀌어, 자기 토큰을 foreign으로 오판해 실행 중 에뮬을 strand하므로 앵커로 쓰지 않는다.
-    // 안정 세션 id가 없으면 앵커 필드는 0으로 적는다(값은 무의미) — 소유 판정은 저장된 앵커가 아니라
-    // own_session_identity()가 Some일 때만 매칭하므로, 이 0은 형제 간 own 오판으로 이어지지 않는다.
-    format!(
-        "{:016x}-{:x}-{:x}-{:x}",
-        cwd_hash(),
-        session_anchor().unwrap_or(0),
-        std::process::id(),
-        nanos
-    )
-}
-
-/// 세션-안정·세션-고유 제어 lease label의 앵커. 명시적인 공통 ID를 우선하고 알려진 host session ID를
-/// fallback으로 쓴다. 같은 세션은 /mcp 재연결·서버 respawn에도 값이 불변이고, 동시 실행되는 다른 세션은
-/// 값이 달라 형제 에뮬레이터의 조용한 인계를 막는다. 부모 PID(respawn 시 변동)는 쓰지 않는다.
-/// 안정된 per-session id가 없으면(plain shell·CI·테스트) `None` — 같은 cwd 형제를
-/// 구별할 수 없으므로 fail-closed로 강등한다. `None`이면 어떤 기존 토큰/포트도 own으로 재사용하지 않아
-/// (session_token_is_own·reusable_session_token·port_persist_path가 모두 거부/None) 형제가 살아있는
-/// 에뮬을 조용히 이어받지 못한다. 옛 동작(앵커 0으로 강등)은 두 형제가 같은 식별부로 붕괴해 서로의
-/// 토큰을 own으로 오판하는 인계 회귀를 냈다 — 그래서 0-강등이 아니라 None-거부로 일반화했다.
-fn session_anchor() -> Option<u64> {
-    for key in [
-        "EMUCAP_SESSION_ID",
-        "CODEX_THREAD_ID",
-        "CLAUDE_CODE_SESSION_ID",
-        "CLAUDE_SESSION_ID",
-    ] {
-        if let Ok(v) = std::env::var(key) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(fnv1a_64(v.as_bytes()));
-            }
-        }
-    }
-    None
+    })
 }
 
 const AUTO_PORT_RANGE: u16 = 16; // 기준 포트부터 이만큼 빈 포트를 탐색(N 세션 자동 격리)
-
-// ── 세션당 포트 영속화 ───────────────────────────────────────
-// 서버는 매 (재)시작 시 [base, base+RANGE)에서 가장 낮은 빈 포트를 잡는다. 그래서 서버가 재시작
-// (/mcp 재연결·크래시 등)하면 더 낮은 포트가 비어 있을 때 그리로 옮겨가, 그 세션이 옛 포트로 띄워둔
-// 에뮬레이터가 고아가 되고(freeze 화면 손실), 에이전트는 not connected를 본다. 이를 막기 위해 바인드한
-// 포트를 파일에 적어두고, 다음 바인드 때 그 포트를 먼저 정확히 재바인드한다 — 서버가 죽으면 리스너가
-// 닫혀 포트가 비므로 재시작 서버가 같은 포트를 되찾고, 에뮬레이터(옛 포트 고정)가 자동 재연결된다.
-// 세션 구분 키는 세션 식별부(cwd+session id 앵커) — /mcp 재연결에도 유지되고 형제 세션과는 다르다.
-// 안정 세션 id가 없으면 영속화 자체를 건너뛴다(port_persist_path=None) — 형제와 같은 포트 파일을
-// 공유해 서로의 포트를 가로채는 창을 없앤다(fail-closed). 점유 중이면 스캔 폴백.
-/// FNV-1a(64) — 프로세스·실행 무관 결정론적 해시(DefaultHasher의 시드 모호성 회피).
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-fn cwd_hash() -> u64 {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_default();
-    fnv1a_64(cwd.as_bytes())
-}
-
-/// 이 세션(식별부 `{cwd_hash}-{session_anchor}`)+기준 포트의 포트 영속화 파일 경로. 세션 식별부로 키해
-/// 형제 세션과 다른 파일을 쓴다(cwd만으로 키하면 형제가 같은 파일을 공유해 포트를 가로챈다). 안정 세션
-/// id가 없거나(fail-closed) base==0(임시포트, 세션 고정 무의미)이면 `None` — 영속화를 건너뛴다.
-#[cfg(test)]
-pub(crate) fn port_persist_path(base: u16) -> Option<std::path::PathBuf> {
-    port_persist_path_with_store(&super::runtime::RuntimeStore::discover(), base)
-}
-
-#[cfg(test)]
-pub(crate) fn port_persist_path_with_store(
-    store: &super::runtime::RuntimeStore,
-    base: u16,
-) -> Option<std::path::PathBuf> {
-    if base == 0 {
-        return None;
-    }
-    let identity = own_session_identity()?;
-    store.persisted_port_path(&identity, base).ok()
-}
-
-fn read_persisted_port(
-    store: &super::runtime::RuntimeStore,
-    base: u16,
-) -> std::io::Result<Option<u16>> {
-    let identity = own_session_identity().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "stable control session id is required for listener port persistence",
-        )
-    })?;
-    store.read_persisted_port(&identity, base)
-}
-
-pub(crate) fn write_persisted_port(
-    store: &super::runtime::RuntimeStore,
-    base: u16,
-    port: u16,
-) -> std::io::Result<()> {
-    let identity = own_session_identity().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "stable control session id is required for listener port persistence",
-        )
-    })?;
-    store.write_persisted_port(&identity, base, port)
-}
-
-pub fn session_token_path(port: u16) -> std::path::PathBuf {
-    super::runtime::RuntimeStore::discover().compatibility_token_path(port)
-}
-
-pub(crate) fn write_session_token(port: u16, token: &str) -> std::io::Result<()> {
-    super::runtime::RuntimeStore::discover().write_compatibility_token(port, token)
-}
-
-/// 토큰 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`의 세션 식별부 `{cwd_hash}-{session_anchor}`
-/// (앞 두 필드)를 반환한다. 형식이 아니면(구분자 부족) None.
-fn identity_of(token: &str) -> Option<&str> {
-    let cwd_end = token.find('-')?;
-    let anchor_end = token[cwd_end + 1..].find('-')?;
-    Some(&token[..cwd_end + 1 + anchor_end])
-}
-
-/// 이 세션의 식별부 `{cwd_hash}-{session_anchor}` — 안정 세션 id가 있을 때만 Some. 없으면
-/// None으로 fail-closed 신호를 전파해, 소유 판정·포트 영속화가 모두 거부된다.
-fn own_session_identity() -> Option<String> {
-    session_anchor().map(|anchor| format!("{:016x}-{anchor:x}", cwd_hash()))
-}
-
-/// 토큰이 *이 세션* 소유인지 — cwd만이 아니라 세션 식별부(`{cwd_hash}-{session_anchor}`) 전체
-/// 일치로 판정한다. 소유면 서버 respawn/재연결 시 토큰을 회전하지 않고 재사용해, 실행 중인 자기
-/// 에뮬레이터를 strand하지 않는다(reclaim-own). 앵커가 session id라 부모 pid가 바뀌는 respawn에도
-/// 자기 토큰은 계속 own이다. 같은 cwd라도 session id가 다른 형제 세션의 토큰은 own이 아니라, 그
-/// 형제의 살아있는 에뮬레이터를 조용히 이어받지 않는다(identity-guard 충돌 방지).
-pub fn session_token_is_own(existing: &str) -> bool {
-    // 안정 세션 id가 없으면 own_session_identity()가 None → 어떤 토큰도 own이 아니다(fail-closed).
-    // 이것이 두 형제 세션이 앵커 0으로 붕괴해 서로의 토큰을 own으로 오판(=조용한 인계)하던 회귀를 막는다.
-    match own_session_identity() {
-        Some(identity) => identity_of(existing) == Some(identity.as_str()),
-        None => false,
-    }
-}
-
-/// 두 세션 토큰이 같은 세션(식별부 `{cwd_hash}-{session_anchor}` 일치)인지 — 같은 cwd라도 session id가
-/// 다르면 false. 형제 세션 간 reclaim 금지를 프로세스 밖에서(테스트 등) 검증할 때 쓴다.
-pub fn same_session_identity(a: &str, b: &str) -> bool {
-    match (identity_of(a), identity_of(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
-    }
-}
-
-/// 이 포트의 기존 토큰파일이 *이 세션 소유*면 재사용 후보로 반환한다(없거나 foreign이면 None →
-/// 새 토큰 유지; foreign 에뮬은 여전히 mismatch → 진입점이 graceful 처리). 토큰파일은 포트별이나,
-/// 같은 cwd의 형제 세션이 잠깐 이 포트를 놓쳐 이 세션이 바인드하더라도, 식별부(cwd+session id)가 달라
-/// 형제의 살아있는 토큰은 재사용하지 않는다 — 그 형제 에뮬레이터를 조용히 이어받는 것을 막는다.
-pub(crate) fn reusable_session_token(port: u16) -> std::io::Result<Option<String>> {
-    let existing = super::runtime::RuntimeStore::discover().read_compatibility_token(port)?;
-    if existing.as_deref().is_some_and(session_token_is_own) {
-        Ok(existing)
-    } else {
-        Ok(None)
-    }
-}
 
 fn split_addr(addr: &str) -> (String, u16) {
     if let Some(idx) = addr.rfind(':') {
@@ -283,7 +117,7 @@ pub fn bind(addr: &str, timeout: Duration) -> std::io::Result<TcpLink> {
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     let port = local.port();
-    let mut link = fresh(addr, Some(listener), timeout);
+    let mut link = fresh(addr, Some(listener), timeout)?;
     link.addr = local.to_string();
     write_session_token(port, &link.session_token)?;
     Ok(link)
@@ -292,26 +126,28 @@ pub fn bind(addr: &str, timeout: Duration) -> std::io::Result<TcpLink> {
 /// 지연 바인드한다 — 포트를 즉시 잡지 않고 첫 에뮬레이터 호출에서 바인드한다. 그래서 MCP
 /// 핸드셰이크가 포트와 무관하게 성공하고(헬스체크 통과), 포트가 이미 점유 중이면(다른
 /// 인스턴스) 그 호출만 graceful하게 NotConnected가 된다(서버는 죽지 않는다).
-pub fn lazy(addr: &str, timeout: Duration) -> TcpLink {
+pub fn lazy(addr: &str, timeout: Duration) -> std::io::Result<TcpLink> {
     fresh(addr, None, timeout)
-}
-
-fn handshake_stream(
-    stream: TcpStream,
-    timeout: Duration,
-    expected_session_token: Option<&str>,
-) -> Result<(Conn, Capabilities), LinkError> {
-    handshake_stream_with_stop(stream, timeout, expected_session_token, None)
 }
 
 fn handshake_stream_with_stop(
     stream: TcpStream,
     timeout: Duration,
-    expected_session_token: Option<&str>,
+    expected_session_token: &str,
     stop: Option<&AtomicBool>,
 ) -> Result<(Conn, Capabilities), LinkError> {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + timeout.min(Duration::from_secs(5));
     let poll = timeout.min(Duration::from_millis(25));
+    let port = stream.local_addr().map_err(io_to_link)?.port();
+    let (stream, authenticated_launch_id) = super::producer_auth::authenticate_listener_stream(
+        stream,
+        expected_session_token,
+        super::producer_auth::Boundary::Direct,
+        port,
+        deadline,
+        stop,
+    )
+    .map_err(io_to_link)?;
     stream.set_nonblocking(false).map_err(io_to_link)?;
     let mut writer = stream.try_clone().map_err(io_to_link)?;
     // Configure the handles that perform I/O: Windows duplicates retain separate timeouts.
@@ -330,35 +166,42 @@ fn handshake_stream_with_stop(
             to_line(&Request::new(
                 0,
                 "hello",
-                match expected_session_token {
-                    Some(token) => serde_json::json!({ "session_token": token }),
-                    None => serde_json::json!({}),
-                },
+                // The adapter receives the capability out of band through its launch
+                // environment/private token file. Never disclose it to an unauthenticated peer.
+                serde_json::json!({}),
             ))
             .as_bytes(),
         )
         .map_err(io_to_link)?;
 
     let mut pending = Vec::new();
-    let line = if let Some(stop) = stop {
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return Err(LinkError::NotConnected);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(LinkError::Timeout);
-            }
-            match super::protocol::read_ndjson_chunk(&mut reader, &mut pending) {
-                Ok(Some(line)) => break line,
-                Ok(None) => return Err(LinkError::NotConnected),
-                Err(error) if is_timeout(&error) => continue,
-                Err(error) => return Err(io_to_link(error)),
-            }
+    let line = loop {
+        if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(LinkError::NotConnected);
         }
-    } else {
-        read_ndjson_frame(&mut reader, &mut pending)
-            .map_err(io_to_link)?
-            .ok_or(LinkError::NotConnected)?
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(LinkError::Timeout);
+        }
+        // SO_RCVTIMEO is a per-read idle timeout. Clamp every read to the absolute
+        // admission deadline as well, otherwise a peer can retain this synchronous
+        // control path forever by sending one byte just before each idle timeout.
+        let read_budget = if stop.is_some() {
+            remaining.min(poll)
+        } else {
+            remaining
+        }
+        .max(Duration::from_millis(1));
+        reader
+            .get_ref()
+            .set_read_timeout(Some(read_budget))
+            .map_err(|error| socket_config_error(reader.get_ref(), error))?;
+        match super::protocol::read_ndjson_chunk_with_limit(&mut reader, &mut pending, 64 * 1024) {
+            Ok(Some(line)) => break line,
+            Ok(None) => return Err(LinkError::NotConnected),
+            Err(error) if is_timeout(&error) => continue,
+            Err(error) => return Err(io_to_link(error)),
+        }
     };
     reader
         .get_ref()
@@ -369,6 +212,11 @@ fn handshake_stream_with_stop(
         .map_err(|error| socket_config_error(&writer, error))?;
 
     let resp = parse_response(line.trim()).map_err(|e| LinkError::Protocol(e.to_string()))?;
+    if resp.id != 0 {
+        return Err(LinkError::Protocol(
+            "hello response used an unexpected request id".into(),
+        ));
+    }
     if !resp.ok {
         return if let Some(err) = resp.error {
             Err(LinkError::Emulator {
@@ -381,11 +229,37 @@ fn handshake_stream_with_stop(
             ))
         };
     }
-    let caps_val = resp.result.unwrap_or(Value::Null);
+    let mut caps_val = resp.result.unwrap_or(Value::Null);
     let protocol_version = caps_val
         .get("protocol_version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    if protocol_version != PROTOCOL_VERSION {
+        return Err(LinkError::Protocol(format!(
+            "protocol version mismatch: server {PROTOCOL_VERSION}, client {protocol_version}"
+        )));
+    }
+    let mut identity = super::link::EmulatorIdentity::from_hello(&caps_val);
+    if identity.session_token.is_some() {
+        return Err(LinkError::Protocol(
+            "hello disclosed a producer authentication credential".into(),
+        ));
+    }
+    if identity
+        .launch_id
+        .as_deref()
+        .is_some_and(|launch_id| launch_id != authenticated_launch_id)
+    {
+        return Err(LinkError::IdentityMismatch {
+            expected: authenticated_launch_id.clone(),
+            actual: identity.launch_id.clone(),
+            identity: Box::new(identity),
+        });
+    }
+    identity.launch_id = Some(authenticated_launch_id.clone());
+    if let Some(result) = caps_val.as_object_mut() {
+        result.insert("launch_id".into(), Value::String(authenticated_launch_id));
+    }
     let methods: Vec<String> = caps_val
         .get("methods")
         .and_then(|v| v.as_array())
@@ -417,14 +291,8 @@ fn handshake_stream_with_stop(
                 .collect()
         })
         .unwrap_or_default();
-    if protocol_version != PROTOCOL_VERSION {
-        return Err(LinkError::Protocol(format!(
-            "protocol version mismatch: server {PROTOCOL_VERSION}, client {protocol_version}"
-        )));
-    }
     crate::debug_selection::parse_debug_capabilities(&caps_val)
         .map_err(|error| LinkError::Protocol(format!("invalid debug capabilities: {error}")))?;
-    let identity = super::link::EmulatorIdentity::from_hello(&caps_val);
     let registry = crate::event_contracts::EventContractRegistry::builtin()
         .map_err(|error| LinkError::Protocol(error.to_string()))?;
     let recording = super::recording_capability::RecordingCapability::from_hello(
@@ -440,16 +308,6 @@ fn handshake_stream_with_stop(
                 .to_string(),
         ));
     }
-    if let Some(expected) = expected_session_token {
-        if identity.session_token.as_deref() != Some(expected) {
-            return Err(LinkError::IdentityMismatch {
-                expected: expected.to_string(),
-                actual: identity.session_token.clone(),
-                identity: Box::new(identity),
-            });
-        }
-    }
-
     Ok((
         Conn {
             attachment_id: super::temporal::fresh_identity(),
@@ -525,6 +383,11 @@ impl TcpLink {
     }
 
     fn set_reclaim_token(&mut self, token: &str) -> Result<(), LinkError> {
+        if !is_current_auth_token(token) {
+            return Err(LinkError::Protocol(
+                "session/reclaim token does not use the current strong format".into(),
+            ));
+        }
         if let Some(port) = self.endpoint_port() {
             write_session_token(port, token).map_err(io_to_link)?;
         }
@@ -535,30 +398,18 @@ impl TcpLink {
             .preaccept_token
             .write()
             .unwrap_or_else(|e| e.into_inner()) = token.to_string();
+        self.cancel_preaccept();
+        if self.listener.is_some() {
+            self.arm_preaccept()?;
+        }
         Ok(())
     }
 
-    /// conn을 보유 중이라도, listener에 새 클라이언트가 대기하면(ROM 교체 relaunch 등 새 에뮬 접속)
-    /// 그것을 handshake한다. 성공하면(같은 세션 토큰) 기존 conn을 버리고 새 것을 채택한다 — 죽은 이전
-    /// conn이 read에서 EOF 대신 timeout(EAGAIN)을 내 MAX_CONSECUTIVE_TIMEOUTS×timeout 동안 재연결을
-    /// wedge하던 문제를, "새 접속 대기" 신호로 즉시 해소한다. handshake 실패(foreign/불완전)면 새 것을
-    /// 버리고 기존 conn을 유지한다(건강한 conn을 spurious 접속에 잃지 않는다). 대기 없으면(WouldBlock) no-op.
+    /// Adopt only completed authenticated replacements; candidate I/O belongs to the supervisor.
     fn try_adopt_pending_client(&mut self) {
-        let Some(listener) = self.listener.as_ref() else {
-            return;
-        };
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(_) => return, // WouldBlock(대기 없음)·기타 → 기존 conn 유지
-        };
-        let expected = self.expected_session_token().to_string();
-        if let Ok((conn, caps)) = handshake_stream(stream, self.timeout, Some(&expected)) {
-            self.conn = Some(conn);
-            self.caps = caps;
-            self.runtime_candidates.clear();
-            self.consecutive_timeouts = 0;
+        if self.arm_preaccept().is_ok() {
+            let _ = self.finish_preaccept(Duration::ZERO);
         }
-        // handshake 실패면 stream은 handshake_stream이 소비·폐기 — 기존 conn 그대로.
     }
 
     /// 대기 중인 클라이언트를 수락하고 hello를 교환한다. 없으면 NotConnected.
@@ -710,50 +561,12 @@ impl TcpLink {
                 }
             }
         }
-        // 막 연결된 클라이언트가 accept 큐에 들어올 짧은 여유를 준다(논블로킹 accept가
-        // connect 직후를 한 박자 놓치는 레이스 흡수). 연결이 없으면 ~20ms 후 NotConnected.
-        let stream = {
-            let mut accepted = None;
-            let listener = self.listener.as_ref().expect("listener bound above");
-            for attempt in 0..10 {
-                match listener.accept() {
-                    Ok((s, _)) => {
-                        accepted = Some(s);
-                        break;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if attempt < 9 {
-                            std::thread::sleep(Duration::from_millis(2));
-                        }
-                    }
-                    Err(e) => return Err(io_to_link(e)),
-                }
-            }
-            match accepted {
-                Some(s) => s,
-                None => {
-                    self.arm_preaccept()?;
-                    return Err(LinkError::NotConnected);
-                }
-            }
-        };
-        // hello 교환. 실패하면 half-connected 상태를 남기지 않고 비운다(다음 시도가
-        // 깨끗이 재수락하도록).
-        let expected = self.expected_session_token().to_string();
-        let (conn, caps) = match handshake_stream(stream, self.timeout, Some(&expected)) {
-            Ok(v) => v,
-            Err(e) => {
-                self.drop_conn();
-                return Err(e);
-            }
-        };
-        self.conn = Some(conn);
-        self.caps = caps;
-        self.runtime_candidates.clear();
-        // 새 클라이언트를 갓 채택했으니 이전 죽은 conn에서 누적된 타임아웃 카운트를 지운다(try_adopt_
-        // pending_client와 동일). 안 그러면 stale 카운트가 신규 conn 첫 타임아웃에 그대로 이어져 조기 드롭.
-        self.consecutive_timeouts = 0;
-        Ok(())
+        self.arm_preaccept()?;
+        if self.finish_preaccept(Duration::from_millis(250))? {
+            Ok(())
+        } else {
+            Err(LinkError::NotConnected)
+        }
     }
 
     #[cfg(all(test, windows))]
@@ -837,9 +650,9 @@ impl EmulatorLink for TcpLink {
     }
 
     fn stage_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
-        if token.is_empty() {
+        if !is_current_reclaim_token(token) {
             return Err(LinkError::Protocol(
-                "cannot stage an empty reclaim token".into(),
+                "reclaim token does not use the current strong format".into(),
             ));
         }
         if self
@@ -855,6 +668,10 @@ impl EmulatorLink for TcpLink {
             .preaccept_token
             .write()
             .unwrap_or_else(|e| e.into_inner()) = token.to_string();
+        self.cancel_preaccept();
+        if self.listener.is_some() {
+            self.arm_preaccept()?;
+        }
         Ok(true)
     }
 
@@ -886,6 +703,10 @@ impl EmulatorLink for TcpLink {
                     .preaccept_token
                     .write()
                     .unwrap_or_else(|e| e.into_inner()) = self.session_token.clone();
+                self.cancel_preaccept();
+                if self.listener.is_some() {
+                    self.arm_preaccept()?;
+                }
                 Ok(true)
             }
             None => Ok(true),
@@ -896,6 +717,11 @@ impl EmulatorLink for TcpLink {
     }
 
     fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if !is_current_auth_token(token) {
+            return Err(LinkError::Protocol(
+                "session/reclaim token does not use the current strong format".into(),
+            ));
+        }
         self.drop_conn();
         self.set_reclaim_token(token)?;
         Ok(true)
@@ -944,7 +770,7 @@ fn discover_runtime_reservations(store: &super::runtime::RuntimeStore, base: u16
             .read_auth(port, &current.launch_id)
             .ok()
             .flatten()
-            .is_some();
+            .is_some_and(|token| is_current_reclaim_token(&token));
         let backend_alive =
             bridge_state.is_none_or(|state| state == super::runtime::ProcessState::Alive);
         let can_reattach = emulator_state == super::runtime::ProcessState::Alive
@@ -1050,7 +876,8 @@ pub(crate) fn select_runtime_generation(
         }
         let token = store
             .read_auth(port, &current.launch_id)
-            .map_err(io_to_link)?;
+            .map_err(io_to_link)?
+            .filter(|token| is_current_reclaim_token(token));
         let mut candidate = current.public_value_with_lease(&super::runtime::LeaseView {
             state: lease_state,
             holder_pid: Some(lease.holder.pid),

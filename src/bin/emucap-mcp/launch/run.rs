@@ -115,7 +115,10 @@ pub(crate) fn make_launch(
         return transition_rejection(EntryReason::ListenerUnavailable, status, None);
     };
     let token = link.session_token().map(str::to_string);
-    let store = RuntimeStore::discover();
+    let store = match RuntimeStore::discover() {
+        Ok(store) => store,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let previous = match store.read_current(port) {
         Ok(value) => value,
         Err(e) => {
@@ -301,20 +304,40 @@ pub(crate) fn make_launch(
         return transition_rejection(EntryReason::LeaseUnknown, status, refreshed.as_ref());
     }
 
+    let prepared = match store.prepare(port) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "failed to prepare runtime launch generation",
+                "error": e.to_string(),
+            })
+        }
+    };
+    let bound_content =
+        match super::media::bind_approved_content(a, adapter, content_identity.as_ref(), &prepared)
+        {
+            Ok(bound) => bound,
+            Err(response) => return response,
+        };
+    let effective_args = &bound_content.args;
+
     let before_signal = match store.read_current(port) {
         Ok(current) => current,
         Err(error) => {
+            let _ = prepared.abort();
             return serde_json::json!({
                 "launched": false,
                 "reason": "runtime current capsule became unreadable immediately before process transition",
                 "error": error.to_string(),
-            })
+            });
         }
     };
     let before_signal_launch_id = before_signal
         .as_ref()
         .map(|current| current.launch_id.as_str());
     if expected_launch_id != before_signal_launch_id {
+        let _ = prepared.abort();
         return serde_json::json!({
             "launched": false,
             "reason": "runtime current generation changed immediately before process transition; no process was signalled",
@@ -326,21 +349,23 @@ pub(crate) fn make_launch(
     if let Some(current) = before_signal.as_ref() {
         match (current.process_state(), current.bridge_process_state()) {
             (ProcessState::Unknown, _) => {
-                return transition_rejection(
+                let response = transition_rejection(
                     EntryReason::ProcessIdentityUnknown,
                     status,
                     Some(current),
                 );
+                let _ = prepared.abort();
+                return response;
             }
             (_, Some(ProcessState::Unknown)) => {
-                return transition_rejection(
-                    EntryReason::BridgeIdentityUnknown,
-                    status,
-                    Some(current),
-                );
+                let response =
+                    transition_rejection(EntryReason::BridgeIdentityUnknown, status, Some(current));
+                let _ = prepared.abort();
+                return response;
             }
             (ProcessState::Alive, _) => {
                 if let Err(error) = current.terminate_owned_processes() {
+                    let _ = prepared.abort();
                     return serde_json::json!({
                         "launched": false,
                         "reason": "verified current generation could not be terminated for replacement",
@@ -351,6 +376,7 @@ pub(crate) fn make_launch(
             }
             (ProcessState::Exited, Some(ProcessState::Alive)) => {
                 if let Err(error) = current.terminate_owned_processes() {
+                    let _ = prepared.abort();
                     return serde_json::json!({
                         "launched": false,
                         "reason": "the emulator exited but its verified bridge could not be cleaned up",
@@ -363,16 +389,6 @@ pub(crate) fn make_launch(
         }
     }
 
-    let prepared = match store.prepare(port) {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            return serde_json::json!({
-                "launched": false,
-                "reason": "failed to prepare runtime launch generation",
-                "error": e.to_string(),
-            })
-        }
-    };
     let direct_reclaim = match link.stage_reclaim_token(prepared.reclaim_token()) {
         Ok(true) => Some(prepared.reclaim_token()),
         Ok(false) if token.is_none() => None,
@@ -398,27 +414,66 @@ pub(crate) fn make_launch(
         launch_id: prepared.launch_id(),
         adapter_failure_path: &failure_path,
     };
-    let mut outcome = match adapter {
-        "mesen2" => launch_mesen(port, direct_reclaim, runtime, system, a),
-        "mednafen" => launch_mednafen(port, direct_reclaim, runtime, module, a),
-        "flycast" => launch_flycast(port, direct_reclaim, runtime, a),
-        "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
-        "np2kai" => launch_np2kai(port, direct_reclaim, runtime, a),
-        "mame_neogeo" => {
-            super::mame_neogeo::launch_mame_neogeo(port, direct_reclaim, runtime, system, a)
+    let front_boundary = if direct_reclaim.is_some() {
+        emucap::live::producer_auth::Boundary::Direct
+    } else {
+        emucap::live::producer_auth::Boundary::BrokerProducer
+    };
+    let Some(front_root) = direct_reclaim.or(token.as_deref()) else {
+        let _ = prepared.abort();
+        return serde_json::json!({
+            "launched": false,
+            "reason": "managed launch requires a private producer authentication root",
+        });
+    };
+    let front_key = match emucap::live::producer_auth::derive_front_key(
+        front_root,
+        front_boundary,
+        port,
+        prepared.launch_id(),
+    ) {
+        Ok(key) => key,
+        Err(error) => {
+            let cleanup = abort_staged_reclaim(link, direct_reclaim);
+            let _ = prepared.abort();
+            let mut failure = serde_json::json!({
+                "launched": false,
+                "reason": "failed to derive the launch-bound producer authentication key",
+                "error": error.to_string(),
+            });
+            record_token_cleanup_error(&mut failure, cleanup);
+            return failure;
         }
-        "mupen64plus" => launch_mupen64plus(port, direct_reclaim, runtime, a),
-        "openmsx" => super::openmsx::launch_openmsx(port, direct_reclaim, runtime, system, a),
-        "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
-        "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
-        "pcsx2" => launch_pcsx2(port, direct_reclaim, runtime, a),
-        "dolphin" => launch_dolphin(port, direct_reclaim, runtime, system, a),
-        "xemu" => super::xemu::launch_xemu(port, direct_reclaim, runtime, a),
+    };
+    let producer_key = Some(front_key.as_str());
+    let mut outcome = match adapter {
+        "mesen2" => launch_mesen(port, producer_key, runtime, system, effective_args),
+        "mednafen" => launch_mednafen(port, producer_key, runtime, module, effective_args),
+        "flycast" => launch_flycast(port, producer_key, runtime, effective_args),
+        "mame_pc98" => launch_mame(port, producer_key, runtime, effective_args),
+        "np2kai" => launch_np2kai(port, producer_key, runtime, effective_args),
+        "mame_neogeo" => super::mame_neogeo::launch_mame_neogeo(
+            port,
+            producer_key,
+            runtime,
+            system,
+            effective_args,
+        ),
+        "mupen64plus" => launch_mupen64plus(port, producer_key, runtime, effective_args),
+        "openmsx" => {
+            super::openmsx::launch_openmsx(port, producer_key, runtime, system, effective_args)
+        }
+        "desmume_nds" => launch_desmume_nds(port, producer_key, runtime, effective_args),
+        "ppsspp" => launch_ppsspp(port, producer_key, runtime, effective_args),
+        "pcsx2" => launch_pcsx2(port, producer_key, runtime, effective_args),
+        "dolphin" => launch_dolphin(port, producer_key, runtime, system, effective_args),
+        "xemu" => super::xemu::launch_xemu(port, producer_key, runtime, effective_args),
         _ => serde_json::json!({
             "launched": false,
             "reason": format!("system {system} is not supported by the Rust launcher"),
         }),
     };
+    super::media::annotate_bound_content(&mut outcome, &bound_content);
     if !outcome
         .get("launched")
         .and_then(serde_json::Value::as_bool)
@@ -454,10 +509,15 @@ pub(crate) fn make_launch(
     let backend_endpoint = backend_endpoint_from_launch(&outcome);
     // 즉시 exec 실패·동적 로더 오류가 이전 current를 덮지 않게 짧은 process-readiness 창을 둔다.
     std::thread::sleep(std::time::Duration::from_millis(500));
+    let runtime_content = outcome
+        .get("runtime_content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&a.content_path)
+        .to_owned();
     let mut manifest = prepared.manifest(ManifestSpec {
         adapter: adapter.into(),
         system: system.into(),
-        content: a.content_path.clone(),
+        content: runtime_content,
         emulator_pid,
         bridge_pid,
         backend_endpoint,
@@ -740,7 +800,10 @@ pub(super) fn launch_mupen64plus(
         }
     };
     let content = Path::new(&a.content_path);
-    let log = adapter_log_path("mupen64plus", port, "mupen64plus.log");
+    let log = match adapter_log_path(port, runtime, "mupen64plus.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let launch = mupen64plus_launch::Launch {
         binary: &binary,
         repo_root: &root,
@@ -765,7 +828,7 @@ pub(super) fn launch_mupen64plus(
             "emucap_home": launched.runtime_home.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
-            "isolation": "Mupen64Plus uses an emucap-owned per-port configuration and does not read or change the user's emulator settings.",
+            "isolation": "Mupen64Plus uses an emucap-owned launch-generation configuration and does not read or change the user's emulator settings.",
             "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
@@ -789,7 +852,10 @@ pub(super) fn launch_desmume_nds(
     let Some(bridge) = desmume_nds_launch::resolve_bridge(&root) else {
         return serde_json::json!({ "launched": false, "reason": "NDS bridge binary was not found; build emucap-desmume-nds-bridge in release mode or set EMUCAP_NDS_BRIDGE_BIN" });
     };
-    let log = adapter_log_path("desmume-nds", port, "desmume-nds.log");
+    let log = match adapter_log_path(port, runtime, "desmume-nds.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let display = a.display.unwrap_or(false);
     let spec = desmume_nds_launch::Launch {
         binary: &binary,
@@ -852,7 +918,10 @@ pub(super) fn launch_ppsspp(
     let Some(bridge) = ppsspp_launch::resolve_bridge(&root) else {
         return serde_json::json!({ "launched": false, "reason": "PSP bridge binary was not found; build emucap-ppsspp-bridge in release mode or set EMUCAP_PSP_BRIDGE_BIN" });
     };
-    let log = adapter_log_path("ppsspp", port, "ppsspp.log");
+    let log = match adapter_log_path(port, runtime, "ppsspp.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let spec = ppsspp_launch::Launch {
         binary: &binary,
         bridge: &bridge,
@@ -934,7 +1003,10 @@ pub(super) fn launch_pcsx2(
         }
     };
     let display = a.display.unwrap_or(false);
-    let log = adapter_log_path("pcsx2", port, "pcsx2.log");
+    let log = match adapter_log_path(port, runtime, "pcsx2.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let launch = pcsx2_launch::Launch {
         binary: &binary,
         bridge: &bridge,
@@ -965,7 +1037,7 @@ pub(super) fn launch_pcsx2(
             "host_build": host_build,
             "bios": bios.display().to_string(),
             "log": log.display().to_string(),
-            "isolation": "PCSX2 uses an emucap-owned per-port data root; the selected BIOS is referenced in place.",
+            "isolation": "PCSX2 uses an emucap-owned launch-generation data root; the selected BIOS is referenced in place.",
             "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
@@ -983,7 +1055,10 @@ pub(super) fn launch_flycast(
     let Some(binary) = emucap::launch::flycast::resolve_binary() else {
         return serde_json::json!({ "launched": false, "reason": "Flycast binary was not found; build it with adapters/flycast/build.sh or set FLYCAST_APP to an executable or macOS Flycast.app path" });
     };
-    let log = adapter_log_path("flycast", port, "flycast.log");
+    let log = match adapter_log_path(port, runtime, "flycast.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let spec = emucap::launch::flycast::Launch {
         binary: &binary,
         content: &a.content_path,
@@ -1011,7 +1086,7 @@ pub(super) fn launch_flycast(
 }
 
 /// Dolphin leg of `make_launch`: select the compatible no-GUI or DolphinQt fork, copy it into the
-/// per-port runtime, and launch with an isolated `--user` directory.
+/// generation-owned runtime, and launch with an isolated `--user` directory.
 pub(super) fn launch_dolphin(
     port: u16,
     token: Option<&str>,
@@ -1045,7 +1120,10 @@ pub(super) fn launch_dolphin(
             });
         }
     };
-    let log = adapter_log_path("dolphin", port, "dolphin.log");
+    let log = match adapter_log_path(port, runtime, "dolphin.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let launch = dolphin_launch::Launch {
         binary: &binary,
         content: &a.content_path,
@@ -1070,72 +1148,11 @@ pub(super) fn launch_dolphin(
             "binary": binary.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
-            "emucap_home": emucap::launch::emu_home_dir("dolphin", port).display().to_string(),
-            "isolation": "Dolphin runs from an emucap-owned portable copy with a per-port --user directory.",
+            "emucap_home": log.parent().map(|path| path.display().to_string()),
+            "isolation": "Dolphin runs from an emucap-owned portable copy with a launch-generation --user directory.",
             "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
-    }
-}
-
-/// Mednafen leg of `make_launch` (Saturn/PSX/PCE/MD): resolve the built fork (per-port copy unless
-/// MEDNAFEN_BIN is pinned) and hand off with the force_module.
-pub(super) fn launch_mednafen(
-    port: u16,
-    token: Option<&str>,
-    runtime: RuntimeEnv<'_>,
-    module: Option<&'static str>,
-    a: &LaunchArgs,
-) -> serde_json::Value {
-    let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
-    };
-    let Some((binary, explicit)) = emucap::launch::mednafen::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "Mednafen binary was not found; build it with adapters/mednafen/build.sh or set MEDNAFEN_BIN" });
-    };
-    let log = adapter_log_path("mednafen", port, "mednafen.log");
-    let host_build = emucap::launch::mednafen::read_build_metadata(&binary)
-        .ok()
-        .flatten();
-    let sound = a.sound.unwrap_or(false);
-    let display = a.display.unwrap_or(false);
-    let repeatable = a.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
-    let spec = emucap::launch::mednafen::Launch {
-        binary: &binary,
-        explicit_binary: explicit,
-        content: &a.content_path,
-        module,
-        log_path: &log,
-        port,
-        name: a.name.as_deref(),
-        session_token: token,
-        runtime: Some(runtime),
-        headless: !display,
-        sound,
-        start_frozen: a.start_frozen,
-        repeatable,
-    };
-    match emucap::launch::mednafen::launch(&spec) {
-        Ok(pid) => serde_json::json!({
-            "launched": true,
-            "adapter": "mednafen",
-            "module": module,
-            "display": display,
-            "sound": sound,
-            "pid": pid,
-            "port": port,
-            "binary": binary.display().to_string(),
-            "host_build": host_build,
-            "log": log.display().to_string(),
-            "emucap_home": emucap::launch::mednafen::runtime_home(port, repeatable).display().to_string(),
-            "isolation": "Mednafen uses an emucap-owned per-port home and copies known BIOS files from the shared emucap firmware inventory; the user's ~/.mednafen profile is not read or changed.",
-            "execution_profile": repeatable.then(|| emucap::live::runtime::ExecutionProfileIdentity {
-                id: emucap::launch::mednafen::MD_REPEATABLE_PROFILE_ID.into(),
-                conditions_sha256: emucap::launch::mednafen::MD_REPEATABLE_CONDITIONS_SHA256.into(),
-            }),
-            "next_action": "launch returns after the adapter connects",
-        }),
-        Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }
 }
 

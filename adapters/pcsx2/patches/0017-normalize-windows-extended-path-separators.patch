@@ -1,21 +1,23 @@
-diff --git a/common/FileSystem.cpp b/common/FileSystem.cpp
---- a/common/FileSystem.cpp
-+++ b/common/FileSystem.cpp
-@@ -235,6 +235,10 @@
- 		_freea(wstr_buf);
+diff --git c/common/FileSystem.cpp i/common/FileSystem.cpp
+index 24eddeb..1f4d173 100644
+--- c/common/FileSystem.cpp
++++ i/common/FileSystem.cpp
+@@ -237,6 +237,10 @@ bool FileSystem::GetWin32Path(std::wstring* dest, std::string_view str)
  		return false;
  	}
-+
+ 
 +	// Extended-length paths bypass Win32 slash normalization. Canonicalize
 +	// separators before PathCch adds the extended-length prefix.
 +	std::replace(wstr_buf, wstr_buf + wlen, L'/', L'\\');
- 
++
  	// And use PathCchCanonicalizeEx() to fix up any non-direct elements.
  	wstr_buf[wlen] = '\0';
-diff --git a/tests/ctest/common/filesystem_tests.cpp b/tests/ctest/common/filesystem_tests.cpp
---- a/tests/ctest/common/filesystem_tests.cpp
-+++ b/tests/ctest/common/filesystem_tests.cpp
-@@ -56,3 +56,15 @@
+ 	dest->resize(std::max<size_t>(static_cast<size_t>(wlen) + (IsUNCPath(str) ? 9 : 5), 16));
+diff --git c/tests/ctest/common/filesystem_tests.cpp i/tests/ctest/common/filesystem_tests.cpp
+index 7faf88a..2e68ed4 100644
+--- c/tests/ctest/common/filesystem_tests.cpp
++++ i/tests/ctest/common/filesystem_tests.cpp
+@@ -56,3 +56,15 @@ TEST(FileSystem, RecursiveDeleteDirectoryDontFollowSymbolicLinks)
  }
  
  #endif

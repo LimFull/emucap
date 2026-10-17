@@ -1,13 +1,57 @@
---- a/.github/workflows/scripts/windows/build-dependencies.bat
-+++ b/.github/workflows/scripts/windows/build-dependencies.bat
+diff --git c/.github/workflows/scripts/windows/build-dependencies.bat i/.github/workflows/scripts/windows/build-dependencies.bat
+index 22e34c4..4c95be3 100755
+--- c/.github/workflows/scripts/windows/build-dependencies.bat
++++ i/.github/workflows/scripts/windows/build-dependencies.bat
 @@ -1,5 +1,6 @@
  @echo off
  setlocal enabledelayedexpansion
 +if not defined EMUCAP_BUILD_JOBS set EMUCAP_BUILD_JOBS=1
  
  echo Setting environment...
- if defined EMUCAP_PCSX2_VCVARS (
-@@ -101,8 +102,8 @@
+ rem Favour VS2022 over VS2026 for now.
+@@ -171,8 +172,8 @@ if %BUILD_FFMPEG%==1 (
+   %SEVENZIP% x "libvpl-%LIBVPL%.zip" || goto error
+   cd "libvpl-%LIBVPL%" || goto error
+   cmake -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=OFF -DINSTALL_EXAMPLES=OFF -DINSTALL_LIB=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -B build -G Ninja || goto error
+-  cmake --build build --parallel || goto error
+-  ninja -C build install || goto error
++  cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
++  ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
+   cd .. || goto error
+ 
+   echo "Installing libopus"
+@@ -180,8 +181,8 @@ if %BUILD_FFMPEG%==1 (
+   tar -xf "opus-%LIBOPUS%.tar.gz" || goto error
+   cd "opus-%LIBOPUS%" || goto error
+   cmake -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -B build -G Ninja || goto error
+-  cmake --build build --parallel || goto error
+-  ninja -C build install || goto error
++  cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
++  ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
+   cd .. || goto error
+ 
+   echo "Installing libsvtav1"
+@@ -192,8 +193,8 @@ if %BUILD_FFMPEG%==1 (
+     set LIBSTVAV1_NASM=-DCOMPILE_C_ONLY=ON
+   )
+   cmake -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_APPS=OFF -DSVT_AV1_LTO=ON !LIBSTVAV1_NASM! -B build -G Ninja || goto error
+-  cmake --build build --parallel || goto error
+-  ninja -C build install || goto error
++  cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
++  ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
+   cd .. || goto error
+ 
+   echo "Extracting meson"
+@@ -210,7 +211,7 @@ if %BUILD_FFMPEG%==1 (
+   cd "pkgconf-pkgconf-%PKGCONF%" || goto error
+   !MASON_PY! setup --buildtype=release --prefix="%INSTALLDIR%" -Dtests=disabled build --backend=ninja || goto error
+   !MASON_PY! compile -C build || goto error
+-  ninja -C build install || goto error
++  ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
+   set PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1
+   set PKG_CONFIG_ALLOW_SYSTEM_LIBS=1
+   Set "PKG_CONFIG_PATH=%INSTALLDIR%\lib\pkgconfig"
+@@ -286,8 +287,8 @@ rmdir /S /Q "zlib-%ZLIB%"
  %SEVENZIP% x "zlib%ZLIBSHORT%.zip" || goto error
  cd "zlib-%ZLIB%" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DZLIB_BUILD_EXAMPLES=OFF -B build -G Ninja || goto error
@@ -18,7 +62,7 @@
  cd .. || goto error
  
  echo Building libpng...
-@@ -113,8 +114,8 @@
+@@ -298,8 +299,8 @@ rem apng not in released libpng yet
  cd "lpng%LIBPNG%" || goto error
  %PATCH% -p1 < "../libpng-%LIBPNGLONG%-apng.patch" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DBUILD_SHARED_LIBS=ON -DPNG_TESTS=OFF -DPNG_STATIC=OFF -DPNG_SHARED=ON -DPNG_TOOLS=OFF -B build -G Ninja || goto error
@@ -29,7 +73,7 @@
  cd .. || goto error
  
  echo Building libjpegturbo...
-@@ -122,8 +123,8 @@
+@@ -307,8 +308,8 @@ rmdir /S /Q "libjpeg-turbo-%LIBJPEGTURBO%"
  tar -xf "libjpeg-turbo-%LIBJPEGTURBO%.tar.gz" || goto error
  cd "libjpeg-turbo-%LIBJPEGTURBO%" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -B build -G Ninja || goto error
@@ -40,7 +84,7 @@
  cd .. || goto error
  
  echo Building LZ4...
-@@ -132,8 +133,8 @@
+@@ -317,8 +318,8 @@ rmdir /S /Q "lz4"
  rename "lz4-%LZ4%" "lz4" || goto error
  cd "lz4" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF -DCMAKE_C_FLAGS="/wd4711 /wd5045" -B build-dir -G Ninja build/cmake || goto error
@@ -51,7 +95,7 @@
  cd ..
  
  echo Building FreeType without HarfBuzz...
-@@ -141,8 +142,8 @@
+@@ -326,8 +327,8 @@ rmdir /S /Q "freetype-%FREETYPE%"
  tar -xf "freetype-%FREETYPE%.tar.gz" || goto error
  cd "freetype-%FREETYPE%" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DFT_REQUIRE_ZLIB=TRUE -DFT_REQUIRE_PNG=TRUE -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_DISABLE_HARFBUZZ=TRUE -B build -G Ninja || goto error
@@ -62,10 +106,10 @@
  cd .. || goto error
  
  echo Building HarfBuzz...
-@@ -150,8 +151,8 @@
+@@ -335,8 +336,8 @@ rmdir /S /Q "harfbuzz-%HARFBUZZ%"
  %SEVENZIP% x "-x^!harfbuzz-%HARFBUZZ%\README" "harfbuzz-%HARFBUZZ%.zip" || goto error
  cd "harfbuzz-%HARFBUZZ%" || goto error
- cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DHB_BUILD_UTILS=OFF -B build -G Ninja || goto error
+ cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DHB_BUILD_UTILS=OFF -DHB_BUILD_GPU=OFF -B build -G Ninja || goto error
 -cmake --build build --parallel || goto error
 -ninja -C build install || goto error
 +cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
@@ -73,7 +117,7 @@
  cd .. || goto error
  
  echo Building FreeType with HarfBuzz...
-@@ -159,8 +160,8 @@
+@@ -344,8 +345,8 @@ rmdir /S /Q "freetype-%FREETYPE%"
  tar -xf "freetype-%FREETYPE%.tar.gz" || goto error
  cd "freetype-%FREETYPE%" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DFT_REQUIRE_ZLIB=TRUE -DFT_REQUIRE_PNG=TRUE -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_REQUIRE_HARFBUZZ=TRUE -B build -G Ninja || goto error
@@ -84,7 +128,7 @@
  cd .. || goto error
  
  echo Building Zstandard...
-@@ -168,8 +169,8 @@
+@@ -353,8 +354,8 @@ rmdir /S /Q "zstd-%ZSTD%"
  %SEVENZIP% x "-x^!zstd-%ZSTD%\tests\cli-tests\bin" "zstd-%ZSTD%.zip" || goto error
  cd "zstd-%ZSTD%"
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DZSTD_BUILD_SHARED=ON -DZSTD_BUILD_STATIC=OFF -DZSTD_BUILD_PROGRAMS=OFF -B build -G Ninja build/cmake
@@ -95,7 +139,7 @@
  cd .. || goto error
  
  echo Building WebP...
-@@ -177,8 +178,8 @@
+@@ -362,8 +363,8 @@ rmdir /S /Q "libwebp-%WEBP%"
  tar -xf "libwebp-%WEBP%.tar.gz" || goto error
  cd "libwebp-%WEBP%" || goto error
  cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF -DBUILD_SHARED_LIBS=ON -G Ninja || goto error
@@ -106,10 +150,10 @@
  cd .. || goto error
  
  echo Building SDL...
-@@ -186,8 +187,8 @@
+@@ -371,8 +372,8 @@ rmdir /S /Q "%SDL%"
  %SEVENZIP% x "%SDL%.zip" || goto error
  cd "%SDL%" || goto error
- cmake -B build -DCMAKE_BUILD_TYPE=Release %FORCEPDB% -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DSDL_SHARED=ON -DSDL_STATIC=OFF -G Ninja || goto error
+ cmake -B build -DCMAKE_BUILD_TYPE=Release %FORCEPDB% -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_VIDEO=OFF -DSDL_POWER=OFF -DSDL_SENSOR=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF -DSDL_TEST_LIBRARY=OFF -G Ninja || goto error
 -cmake --build build --parallel || goto error
 -ninja -C build install || goto error
 +cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
@@ -117,10 +161,10 @@
  copy build\SDL3.pdb "%INSTALLDIR%\bin" || goto error
  cd .. || goto error
  
-@@ -206,8 +207,8 @@
- %PATCH% -p1 < "%SCRIPTDIR%\qtbase-disable-pcre2-jit.patch" || goto error
- 
- cmake -B build -DFEATURE_sql=OFF -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" %FORCEPDB% -DINPUT_gui=yes -DINPUT_widgets=yes -DINPUT_ssl=yes -DINPUT_openssl=no -DINPUT_schannel=yes -DFEATURE_system_png=ON -DFEATURE_system_jpeg=ON -DFEATURE_system_zlib=ON -DFEATURE_system_freetype=ON -DFEATURE_system_harfbuzz=ON %QTBUILDSPEC% || goto error
+@@ -387,8 +388,8 @@ rmdir /S /Q "qtbase-everywhere-src-%QT%"
+ %SEVENZIP% x "qtbase-everywhere-src-%QT%.zip" || goto error
+ cd "qtbase-everywhere-src-%QT%" || goto error
+ cmake -B build -DFEATURE_sql=OFF -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" %FORCEPDB% -DINPUT_gui=yes -DINPUT_widgets=yes -DINPUT_ssl=yes -DINPUT_openssl=no -DINPUT_schannel=yes -DFEATURE_system_png=ON -DFEATURE_system_jpeg=ON -DFEATURE_system_zlib=ON -DFEATURE_system_freetype=ON -DFEATURE_system_harfbuzz=ON -DQT_FEATURE_windows_ioring=OFF %QTBUILDSPEC% || goto error
 -cmake --build build --parallel || goto error
 -ninja -C build install || goto error
 +cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
@@ -128,7 +172,7 @@
  cd .. || goto error
  
  echo Building Qt SVG...
-@@ -217,8 +218,8 @@
+@@ -398,8 +399,8 @@ cd "qtsvg-everywhere-src-%QT%" || goto error
  mkdir build || goto error
  cd build || goto error
  call "%INSTALLDIR%\bin\qt-configure-module.bat" .. -- %FORCEPDB% -DCMAKE_PREFIX_PATH="%INSTALLDIR%" || goto error
@@ -139,7 +183,7 @@
  cd ..\.. || goto error
  
  echo Building Qt Image Formats...
-@@ -228,8 +229,8 @@
+@@ -409,8 +410,8 @@ cd "qtimageformats-everywhere-src-%QT%" || goto error
  mkdir build || goto error
  cd build || goto error
  call "%INSTALLDIR%\bin\qt-configure-module.bat" .. -- %FORCEPDB% -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DFEATURE_system_webp=ON || goto error
@@ -150,7 +194,7 @@
  cd ..\.. || goto error
  
  echo Building Qt Tools...
-@@ -239,8 +240,8 @@
+@@ -420,8 +421,8 @@ cd "qttools-everywhere-src-%QT%" || goto error
  mkdir build || goto error
  cd build || goto error
  call "%INSTALLDIR%\bin\qt-configure-module.bat" .. -- %FORCEPDB% -DFEATURE_assistant=OFF -DFEATURE_clang=OFF -DFEATURE_designer=ON -DFEATURE_kmap2qmap=OFF -DFEATURE_pixeltool=OFF -DFEATURE_pkg_config=OFF -DFEATURE_qev=OFF -DFEATURE_qtattributionsscanner=OFF -DFEATURE_qtdiag=OFF -DFEATURE_qtplugininfo=OFF || goto error
@@ -161,7 +205,7 @@
  cd ..\.. || goto error
  
  echo Building Qt Translations...
-@@ -250,8 +251,8 @@
+@@ -431,8 +432,8 @@ cd "qttranslations-everywhere-src-%QT%" || goto error
  mkdir build || goto error
  cd build || goto error
  call "%INSTALLDIR%\bin\qt-configure-module.bat" .. -- %FORCEPDB% || goto error
@@ -172,7 +216,7 @@
  cd ..\.. || goto error
  
  if %DEBUG%==1 (
-@@ -266,8 +267,8 @@
+@@ -447,8 +448,8 @@ rmdir /S /Q "QtApng-%QTAPNG%"
  cd "QtApng-%QTAPNG%" || goto error
  %PATCH% -p1 < "%SCRIPTDIR%\..\common\qtapng-cmake.patch" || goto error
  cmake -B build -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" %FORCEPDB% %QTAPNGBUILDSPEC% || goto error
@@ -183,7 +227,7 @@
  cd .. || goto error
  
  if %DEBUG%==1 (
-@@ -284,8 +285,8 @@
+@@ -465,8 +466,8 @@ rmdir /S /Q "KDDockWidgets-%KDDOCKWIDGETS%"
  %SEVENZIP% x "KDDockWidgets-%KDDOCKWIDGETS%.zip" || goto error
  cd "KDDockWidgets-%KDDOCKWIDGETS%" || goto error
  cmake -B build -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DKDDockWidgets_QT6=true -DKDDockWidgets_EXAMPLES=false -DKDDockWidgets_FRONTENDS=qtwidgets %KDDOCKWIDGETSBUILDSPEC% || goto error
@@ -194,7 +238,7 @@
  cd .. || goto error
  
  echo "Building PlutoVG..."
-@@ -293,8 +294,8 @@
+@@ -474,8 +475,8 @@ rmdir /S /Q "plutovg-%PLUTOVG%"
  %SEVENZIP% x "plutovg-%PLUTOVG%.zip" || goto error
  cd "plutovg-%PLUTOVG%" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DPLUTOVG_BUILD_EXAMPLES=OFF -B build -G Ninja || goto error
@@ -205,7 +249,7 @@
  cd .. || goto error
  
  echo "Building PlutoSVG..."
-@@ -302,8 +303,8 @@
+@@ -483,8 +484,8 @@ rmdir /S /Q "plutosvg-%PLUTOSVG%"
  %SEVENZIP% x "plutosvg-%PLUTOSVG%.zip" || goto error
  cd "plutosvg-%PLUTOSVG%" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -DPLUTOSVG_ENABLE_FREETYPE=ON -DPLUTOSVG_BUILD_EXAMPLES=OFF -B build -G Ninja || goto error
@@ -215,8 +259,30 @@
 +ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
  cd .. || goto error
  
+ echo "Building RapidYAML..."
+@@ -492,8 +493,8 @@ rmdir /S /Q "rapidyaml-%RAPIDYAML%-src"
+ %SEVENZIP% x "rapidyaml-%RAPIDYAML%-src.zip" || goto error
+ cd "rapidyaml-%RAPIDYAML%-src" || goto error
+ cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DBUILD_SHARED_LIBS=ON -B build -G Ninja || goto error
+-cmake --build build --parallel || goto error
+-ninja -C build install || goto error
++cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
++ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
+ cd .. || goto error
+ 
+ echo Unpacking Agility SDK
+@@ -516,8 +517,8 @@ rmdir /S /Q "DirectX-Headers-%DXHEADERS%"
+ %SEVENZIP% x "DirectX-Headers-%DXHEADERS%.zip" || goto error
+ cd "DirectX-Headers-%DXHEADERS%" || goto error
+ cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DDXHEADERS_BUILD_TEST=OFF -DDXHEADERS_BUILD_GOOGLE_TEST=OFF -B build -G Ninja || goto error
+-cmake --build build --parallel || goto error
+-ninja -C build install || goto error
++cmake --build build --parallel "%EMUCAP_BUILD_JOBS%" || goto error
++ninja -j "%EMUCAP_BUILD_JOBS%" -C build install || goto error
+ cd .. || goto error
+ 
  echo Building shaderc...
-@@ -320,8 +321,8 @@
+@@ -534,8 +535,8 @@ rename "SPIRV-Tools-%SHADERC_SPIRVTOOLS%" "spirv-tools" || goto error
  cd .. || goto error
  %PATCH% -p1 < "%SCRIPTDIR%\..\common\shaderc-changes.patch" || goto error
  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%INSTALLDIR%" -DCMAKE_INSTALL_PREFIX="%INSTALLDIR%" -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON -DSHADERC_ENABLE_SHARED_CRT=ON -B build -G Ninja || goto error

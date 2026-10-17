@@ -126,19 +126,12 @@ impl PreparedSession {
                 "openMSX user-data directory has no session root",
             )
         })?;
-        if self.media.kind == MediaKind::Cartridge {
-            if self.media.mounted_path != self.media.source_path {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "openMSX cartridge session unexpectedly changed the mounted path",
-                ));
-            }
-        } else if self.media.mounted_path == self.media.source_path
+        if self.media.mounted_path == self.media.source_path
             || !self.media.mounted_path.starts_with(session_root)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "openMSX mutable media must use a session-owned working copy",
+                "openMSX media must use a session-owned staged copy",
             ));
         }
 
@@ -461,17 +454,6 @@ pub(crate) fn prepare_media(
     working: &Path,
 ) -> io::Result<PreparedMedia> {
     let (source_sha1, source_size) = hash_file(source, MAX_MEDIA_BYTES)?;
-    if kind == MediaKind::Cartridge {
-        return Ok(PreparedMedia {
-            kind,
-            source_path: source.to_path_buf(),
-            source_sha1: source_sha1.clone(),
-            source_size,
-            mounted_path: source.to_path_buf(),
-            mounted_sha1: source_sha1,
-            source_writable: false,
-        });
-    }
     if let Some(parent) = working.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -481,6 +463,11 @@ pub(crate) fn prepare_media(
         return Err(io::Error::other(
             "MSX working media copy did not preserve source identity",
         ));
+    }
+    if kind == MediaKind::Cartridge {
+        let mut permissions = fs::metadata(working)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(working, permissions)?;
     }
     Ok(PreparedMedia {
         kind,
@@ -585,9 +572,7 @@ pub fn prepare_session(
         let final_media = root.join("media").join(media_name);
         let temporary_media = temporary.join("media").join(media_name);
         let mut media = prepare_media(media_kind, content, &temporary_media)?;
-        if media_kind != MediaKind::Cartridge {
-            media.mounted_path = final_media;
-        }
+        media.mounted_path = final_media;
         let session = PreparedSession {
             system: profile.system().to_owned(),
             machine: profile.machine().to_owned(),

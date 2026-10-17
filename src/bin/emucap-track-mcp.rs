@@ -22,6 +22,7 @@ const STATIC_MCP_METADATA_TTL_MS: u64 = 3_600_000;
 #[derive(Clone)]
 struct EmucapTrack {
     active_run: Arc<Mutex<Option<ActiveRun>>>,
+    transaction_gate: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<EmucapTrack>,
 }
 
@@ -102,8 +103,8 @@ struct LogGateArgs {
 #[serde(deny_unknown_fields)]
 struct LogArtifactArgs {
     kind: String,
-    /// Path to an existing captured file. Relative paths are resolved from the
-    /// working repository root, not the MCP server's current directory.
+    /// Path to an existing regular, non-symlink captured file of at most 1 GiB. Relative paths are
+    /// resolved from the working repository root, not the MCP server's current directory.
     path: String,
 }
 
@@ -253,7 +254,7 @@ Logging and reproduction updates require an active run; `log_finding` also accep
 
 Record relevant Control mutations explicitly with `log_intervention`. Use `log_metric` for numeric observations and `log_gate` for machine or judgment evidence; an omitted `passed` means pending. `log_artifact` registers an existing file and computes its SHA-256. `set_reproduction` sets the base and movie reference from which reproduction status is derived. Promote a finding after its claim is confirmed.
 
-Use run queries, comparisons and summaries to inspect stored evidence, then assess the outcome against the experiment's criteria. Query results report skipped corrupt records. Missing runs and malformed identifiers have distinct structured errors.
+Use run queries, comparisons and summaries to inspect stored evidence, then assess the outcome against the experiment's criteria. Query results report skipped corrupt records. A resource_limit error means the complete scan or result exceeded its budget; use known record identifiers or partition the ledger. Missing runs and malformed identifiers have distinct structured errors.
 
 For large query or summary results, use `output_path` to receive a compact summary and a JSON file. Produce emulator artifacts through Control and register the resulting files here."#;
 
@@ -264,6 +265,7 @@ impl EmucapTrack {
     fn new() -> Self {
         Self {
             active_run: Arc::new(Mutex::new(None)),
+            transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
             tool_router: Self::tool_router(),
         }
     }
@@ -341,6 +343,7 @@ impl EmucapTrack {
         description = "Start here. Returns the ledger path, active run, stored unfinished runs, and available record/query operations. This server stores `.emucap/` experiment records and never controls an emulator. Obtain rom_sha1 from Control MCP get_rom_info and pass it to run_start."
     )]
     async fn bootstrap(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         track_ok(self.make_bootstrap_value())
     }
 
@@ -348,24 +351,31 @@ impl EmucapTrack {
         description = "Start or resume an experiment run without contacting an emulator. rom_sha1 is required and must come from Control MCP get_rom_info. With connection_ref and a stored running run for the same ROM, rebind that run and return resumed:true. With a different ROM, supersede the previous unfinished run for that connection and create a new one. Subsequent log_* calls target the active run."
     )]
     async fn run_start(&self, Parameters(a): Parameters<TrackRunStartArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let root = emucap::track::store::root_from_env();
         let now = emucap::track::clock::now_rfc3339();
-        // resume(재연결 복원): connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running
-        // run이 있으면 supersede+새 run이 아니라 그 run을 active로 재바인딩한다(파편화 0). rom이 다르거나
-        // 일치 running이 없으면 None → 아래 supersede 경로(start_run의 finish_stale_running)가 직전 run을
-        // 마감하고 새 run을 만든다. best-effort: 조회 에러는 fall-through해 start_run이 노출한다.
         if let Some(cref) = a.connection_ref.as_deref() {
-            if let Ok(Some(binding)) =
-                emucap::track::mcp_ops::find_resumable_run(&root, cref, &a.rom_sha1)
-            {
-                return self.rebind_active(
-                    &root,
-                    &now,
-                    binding,
-                    a.goal.is_some() || a.description.is_some() || !a.tags.is_empty(),
-                );
+            match emucap::track::mcp_ops::find_resumable_run(&root, cref, &a.rom_sha1) {
+                Ok(Some(binding)) => {
+                    return self.rebind_active(
+                        &root,
+                        &now,
+                        binding,
+                        a.goal.is_some() || a.description.is_some() || !a.tags.is_empty(),
+                    )
+                }
+                Err(error) if error.code() == "resource_limit" => return track_err(error),
+                _ => {}
             }
         }
+        let plan = match emucap::track::mcp_ops::prepare_start_run(
+            &root,
+            &a.rom_sha1,
+            a.connection_ref.clone(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return track_err(error),
+        };
         // 원장 위생: 새 run 전 직전 in-memory 활성 run을 aborted(superseded)로 정리한다.
         // 같은 connection의 디스크 고아 running 정리(서버 재시작 복구)는 mcp_ops::start_run이 맡는다.
         if let Some(ar) = self
@@ -382,12 +392,10 @@ impl EmucapTrack {
                 &now,
             );
         }
-        match emucap::track::mcp_ops::start_run(
-            &root,
+        match emucap::track::mcp_ops::start_run_prepared(
+            plan,
             &emucap::track::id::UlidGen,
             &now,
-            &a.rom_sha1,
-            a.connection_ref.clone(),
             a.goal,
             a.description,
             a.tags,
@@ -416,6 +424,7 @@ impl EmucapTrack {
         description = "Rebind a stored running run as the in-memory active run. Use its run_id from bootstrap.running_runs after an MCP reconnect. This returns resumed:true and does not create a new run. A finished run is rejected. run_start with the same connection_ref can perform the same resume automatically."
     )]
     async fn run_resume(&self, Parameters(a): Parameters<RunResumeArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let root = emucap::track::store::root_from_env();
         let now = emucap::track::clock::now_rfc3339();
         match emucap::track::mcp_ops::resume_run_by_id(&root, &a.run_id) {
@@ -428,6 +437,7 @@ impl EmucapTrack {
         description = "Finish a run with status done, aborted, or error. With run_id, finish that stored run even when it is not active; this supports orphan recovery after a restart. Without run_id, finish the active run. run_start already supersedes an older unfinished run for the same connection when necessary."
     )]
     async fn run_finish(&self, Parameters(a): Parameters<RunFinishArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let status =
             match emucap::track::mcp_ops::parse_run_status(a.status.as_deref().unwrap_or("done")) {
                 Ok(s) => s,
@@ -477,6 +487,7 @@ impl EmucapTrack {
 
     #[tool(description = "Record a numeric metric on the active run.")]
     async fn log_metric(&self, Parameters(a): Parameters<LogMetricArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         self.with_active(|root, ar, gen, now| {
             emucap::track::mcp_ops::log_metric(
                 root,
@@ -494,6 +505,7 @@ impl EmucapTrack {
         description = "Record verification evidence on the active run. kind must be machine or judgment; omit passed for a pending result. Use this for Control MCP analysis results."
     )]
     async fn log_gate(&self, Parameters(a): Parameters<LogGateArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         // kind 검증을 active 검사보다 먼저(에러 우선순위 보존) — 로직은 mcp_ops::log_gate가 재검증·기록.
         if let Err(e) = emucap::track::mcp_ops::parse_gate_kind(&a.kind) {
             return track_err(e);
@@ -516,9 +528,12 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "Register an existing file as an artifact of the active run and compute its SHA-256. This tool does not capture a new artifact."
+        description = "Register an existing regular, non-symlink file of at most 1 GiB as an artifact of the active run and compute its SHA-256. This tool does not capture a new artifact."
     )]
     async fn log_artifact(&self, Parameters(a): Parameters<LogArtifactArgs>) -> CallToolResult {
+        // Transfer ownership into the blocking writer so request cancellation
+        // cannot unlock the ledger while that writer is still running.
+        let transaction = self.transaction_gate.clone().lock_owned().await;
         let active = self
             .active_run
             .lock()
@@ -530,18 +545,26 @@ impl EmucapTrack {
         let root = emucap::track::store::root_from_env();
         // 상대경로는 MCP 서버 cwd가 아니라 *작업 repo* 루트 기준으로 해소(최소놀람·재현성).
         let git_root = emucap::track::store::nearest_git_root();
-        match emucap::track::mcp_ops::log_artifact(
-            &root,
-            &ar.rom_sha1,
-            &ar.run_id,
-            &emucap::track::id::UlidGen,
-            &a.kind,
-            Path::new(&a.path),
-            git_root.as_deref(),
-            None,
-        ) {
-            Ok(v) => track_ok(v),
-            Err(e) => track_err(e),
+        let path = std::path::PathBuf::from(a.path);
+        let kind = a.kind;
+        let result = tokio::task::spawn_blocking(move || {
+            let _transaction = transaction;
+            emucap::track::mcp_ops::log_artifact(
+                &root,
+                &ar.rom_sha1,
+                &ar.run_id,
+                &emucap::track::id::UlidGen,
+                &kind,
+                &path,
+                git_root.as_deref(),
+                None,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(v)) => track_ok(v),
+            Ok(Err(e)) => track_err(e),
+            Err(e) => track_err(format!("artifact hash worker failed: {e}")),
         }
     }
 
@@ -549,6 +572,7 @@ impl EmucapTrack {
         description = "Set the active run's reproduction base and movie reference. reproduction status is derived automatically."
     )]
     async fn set_reproduction(&self, Parameters(a): Parameters<SetReproArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         self.with_active(|root, ar, _gen, _now| {
             emucap::track::mcp_ops::set_reproduction(
                 root,
@@ -567,6 +591,7 @@ impl EmucapTrack {
         &self,
         Parameters(a): Parameters<LogInterventionArgs>,
     ) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         self.with_active(|root, ar, gen, now| {
             emucap::track::mcp_ops::log_intervention(
                 root,
@@ -587,6 +612,7 @@ impl EmucapTrack {
         description = "Record a ROM-scoped finding. promoted:true marks it as confirmed. When rom_sha1 is omitted, use the active run's ROM identifier."
     )]
     async fn log_finding(&self, Parameters(a): Parameters<LogFindingArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let active = self
             .active_run
             .lock()
@@ -620,6 +646,7 @@ impl EmucapTrack {
 
     #[tool(description = "Query stored runs using optional rom_sha1, goal, and status filters.")]
     async fn query_runs(&self, Parameters(a): Parameters<QueryRunsArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let root = emucap::track::store::root_from_env();
         match emucap::track::mcp_ops::query_runs(
             &root,
@@ -642,6 +669,7 @@ impl EmucapTrack {
 
     #[tool(description = "Return the stored run.json record for a run.")]
     async fn get_run(&self, Parameters(a): Parameters<GetRunArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let root = emucap::track::store::root_from_env();
         match emucap::track::mcp_ops::get_run(&root, &a.rom_sha1, &a.run_id) {
             Ok(v) => track_ok(v),
@@ -653,6 +681,7 @@ impl EmucapTrack {
         description = "Compare two runs and return changes in metrics, gates, reproduction, interventions, and files without contacting an emulator. Run IDs are globally unique. For repeated gate or metric names, the latest value is representative and the occurrence count is included."
     )]
     async fn compare_runs(&self, Parameters(a): Parameters<CompareRunsArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let root = emucap::track::store::root_from_env();
         match emucap::track::mcp_ops::compare_runs(&root, &a.run_id_a, &a.run_id_b) {
             Ok(v) => track_ok(v),
@@ -664,6 +693,7 @@ impl EmucapTrack {
         description = "Summarize runs filtered by goal, tag, or ROM: status and reproduction distributions, gate outcomes, intervention kinds, metric names, and per-run summaries. This does not contact an emulator or decide success. Corrupt runs are skipped and counted."
     )]
     async fn summarize_runs(&self, Parameters(a): Parameters<SummarizeRunsArgs>) -> CallToolResult {
+        let _transaction = self.transaction_gate.lock().await;
         let root = emucap::track::store::root_from_env();
         let filter = emucap::track::summary::SummaryFilter {
             goal: a.goal,
@@ -702,15 +732,20 @@ impl EmucapTrack {
             None => serde_json::Value::Null,
         };
         // 디스크의 미종료(running) run을 노출해 고아 복구(run_finish(run_id))를 돕는다. best-effort.
-        let running = match emucap::track::mcp_ops::query_runs(
+        let (running, lookup_error) = match emucap::track::mcp_ops::query_runs(
             &root,
             emucap::track::query::RunFilter {
                 status: Some("running".into()),
                 ..Default::default()
             },
         ) {
-            Ok(v) => v.get("runs").cloned().unwrap_or(serde_json::json!([])),
-            Err(_) => serde_json::json!([]),
+            Ok(mut v) => (v["runs"].take(), None),
+            Err(error) => (
+                serde_json::json!([]),
+                Some(serde_json::json!({
+                    "code": error.code(), "message": error.to_string()
+                })),
+            ),
         };
         let mut out = serde_json::json!({
             "ok": true,
@@ -735,6 +770,10 @@ impl EmucapTrack {
             "orphan_recovery": "Use run_finish(run_id=...) only for a genuinely abandoned run. Resume a run that will continue.",
             "next_action": "If active_run is null and running_runs contains this session, call run_resume. Otherwise call run_start with rom_sha1. Finish only a genuinely abandoned run."
         });
+        if let Some(error) = lookup_error {
+            out["running_runs_error"] = error;
+            out["next_action"] = "Unfinished-run lookup failed. Inspect running_runs_error or use a known run identifier for direct access.".into();
+        }
         // ledger 경로 모호 케이스: cwd_fallback이면 위치가 서버 cwd에 의존하니 경고를 단다.
         if let Some(w) = root_source.warning() {
             if let Some(obj) = out.as_object_mut() {
@@ -794,7 +833,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 // 테스트는 프로세스 전역 env(EMUCAP_TRACK_ROOT)를 직렬화하려 ENV_LOCK 가드를 .await 너머로 든다.
-// tokio::test는 current-thread 런타임이고 추적 도구 future는 yield하지 않아 실제 경합은 없다 — 의도된 lint.
+// Concurrent requests are serialized by the transaction gate; the test environment guard remains process-wide.
 #[allow(clippy::await_holding_lock)]
 #[path = "tests/emucap_track_mcp_tests.rs"]
 mod tests;

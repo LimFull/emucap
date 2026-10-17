@@ -859,20 +859,44 @@ class Bridge:
         directory = str(save_items.get("dir", SAVE_ITEMS_DIR)).strip("/")
         if directory != SAVE_ITEMS_DIR:
             raise BridgeError(f"unsupported PC-98 save item directory: {directory}")
-        names = [name for name in zf.namelist() if name.startswith(f"{SAVE_ITEMS_DIR}/")]
+        members = [info for info in zf.infolist() if info.filename.startswith(f"{SAVE_ITEMS_DIR}/")]
+        if any(info.orig_filename != info.filename for info in members):
+            raise BridgeError("unsafe PC-98 save item member contains a NUL")
+        names = [info.filename for info in members]
         if SAVE_ITEMS_MANIFEST not in names:
             raise BridgeError("PC-98 save item manifest is missing")
         out_dir = os.path.join(target_root, SAVE_ITEMS_DIR)
+        admitted: list[tuple[str, list[str]]] = []
+        targets: dict[str, tuple[str, bool]] = {}
+        # ZIP names are portable paths, not paths in the current host's grammar.
+        # Validate the complete set before creating any output.
         for name in names:
             rel = name[len(SAVE_ITEMS_DIR) + 1 :]
             if not rel:
                 continue
             parts = rel.split("/")
-            if any(part in ("", ".", "..") for part in parts):
-                raise BridgeError(f"unsafe PC-98 save item member: {name}")
+            for index, part in enumerate(parts):
+                stem = part.split(".", 1)[0].upper()
+                if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", part)
+                        or part.startswith(".") or part.endswith(".")
+                        or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"}
+                        or re.fullmatch(r"(?:COM|LPT)[1-9]", stem)):
+                    raise BridgeError(f"unsafe PC-98 save item member: {name}")
+                prefix = "/".join(parts[:index + 1])
+                directory = index < len(parts) - 1
+                previous = targets.get(prefix.lower())
+                if previous is not None and (previous != (prefix, directory) or not directory):
+                    raise BridgeError(f"colliding PC-98 save item member: {name}")
+                targets[prefix.lower()] = (prefix, directory)
+            admitted.append((name, parts))
+        try:
+            os.mkdir(out_dir, 0o700)
+        except FileExistsError as exc:
+            raise BridgeError("PC-98 save item extraction directory already exists") from exc
+        for name, parts in admitted:
             dest = os.path.join(out_dir, *parts)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "wb") as f:
+            with open(dest, "xb") as f:
                 f.write(zf.read(name))
         return out_dir
 

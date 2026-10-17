@@ -70,9 +70,6 @@ impl<G: GdbTransport> Bridge<G> {
         if let Some(name) = &self.env.name {
             obj.insert("name".into(), json!(name));
         }
-        if let Some(token) = &self.env.session_token {
-            obj.insert("session_token".into(), json!(token));
-        }
         if let Some(launch_id) = &self.env.launch_id {
             obj.insert("launch_id".into(), json!(launch_id));
         }
@@ -167,13 +164,13 @@ impl<G: GdbTransport> Bridge<G> {
         let data =
             hex::decode(hexstr).map_err(|_| BridgeError::BadParams("hex decode failed".into()))?;
         let size = data.len();
-        let address = region_address(params, size as u64)?;
-        let resp = self.send_cmd(&format!("M{address:x},{size:x}:{hexstr}"))?;
-        if resp != "OK" {
-            return Err(BridgeError::Emulator(format!(
-                "GDB memory write failed: {resp}"
-            )));
+        if size == 0 {
+            return Err(BridgeError::BadParams(
+                "hex must contain at least one byte".into(),
+            ));
         }
+        let address = region_address(params, size as u64)?;
+        self.write_abs_bytes(address, &data)?;
         Ok(json!({ "written": size }))
     }
 
@@ -279,20 +276,19 @@ impl<G: GdbTransport> Bridge<G> {
         self.stop_for_state_restore()?;
         let regs_hex = self.read_regs_hex()?;
         let save_items_dir = unique_temp_dir("emucap_pc98_saveitems_")?;
-        // Stage the zip to a sibling `.partial` and rename over out_path only once it is fully
-        // written, so a mid-save failure (region read timeout, peer close, ENOSPC, kill) leaves any
-        // pre-existing savestate byte-for-byte intact instead of truncating it. Mirrors the NDS
-        // dump_memory and PPSSPP dump atomic-swap.
-        let partial_path = state_partial_sibling(&out_path)?;
+        // Keep the complete archive inside the private staging root. Publication copies it
+        // into an exclusively created sibling and atomically replaces the destination.
+        let partial_path = save_items_dir.join("state.partial.zip");
         let result = (|| {
             let mut save_items = self.save_lua_save_items(&save_items_dir)?;
             save_items.insert("dir".into(), json!(SAVE_ITEMS_DIR));
             let save_items_members = save_item_members(&save_items_dir)?;
             let framebuffer_path = save_items_dir.join("framebuffer.rgb32");
             let mut framebuffer = self.save_presented_framebuffer(&framebuffer_path)?;
+            crate::private_fs::privatize_file(&framebuffer_path)?;
             framebuffer.insert("file".into(), json!(FRAMEBUFFER_MEMBER));
             framebuffer.insert("encoding".into(), json!("mame_rgb32_native"));
-            let file = File::create(&partial_path)?;
+            let file = crate::private_fs::create_private_file(&partial_path)?;
             let mut zip = ZipWriter::new(file);
             let options =
                 SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -359,30 +355,19 @@ impl<G: GdbTransport> Bridge<G> {
 
     pub(super) fn load_state(&mut self, params: &Value) -> BridgeResult<Value> {
         let path = PathBuf::from(required_str(params, "path")?);
-        if !path.is_file() {
-            return Err(BridgeError::BadParams(format!(
-                "save state not found: {}",
-                path.display()
-            )));
-        }
-        self.stop_for_state_restore()?;
         let load_items_dir = unique_temp_dir("emucap_pc98_loaditems_")?;
         let result = (|| {
-            let media_before = self.media_status()?.mounted;
-            let file = File::open(&path)?;
-            let mut archive = ZipArchive::new(file)?;
+            let mut archive = open_pc98_state_archive(&path)?;
             let manifest = read_state_manifest(&mut archive)?;
             let state_format = state_format(&manifest)?;
+            let regs_hex = state_registers(&manifest, false)?.map(str::to_owned);
             let save_items_dir = extract_save_items(&mut archive, &manifest, &load_items_dir)?;
             let framebuffer_path =
                 extract_presented_framebuffer(&mut archive, &manifest, &load_items_dir)?;
             let regions = read_state_regions(&mut archive, &manifest)?;
-            let regs_hex = manifest
-                .get("registers_hex")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
             drop(archive);
+            self.stop_for_state_restore()?;
+            let media_before = self.media_status()?.mounted;
             let save_items_result = self.restore_state_data(save_items_dir.as_deref(), &regions)?;
             let visual_refresh = match framebuffer_path {
                 Some(path) => self.restore_presented_framebuffer(&path)?,
@@ -395,9 +380,9 @@ impl<G: GdbTransport> Bridge<G> {
             };
             let mut restore_result = serde_json::Map::new();
             restore_result.insert("restore_strategy".into(), json!("memory_only"));
-            restore_result.insert("post_restore_instruction_exact".into(), json!(true));
-            if !regs_hex.is_empty() {
-                restore_result = self.restore_regs_after_state_load(&regs_hex)?;
+            restore_result.insert("post_restore_instruction_exact".into(), json!(false));
+            if let Some(ref regs) = regs_hex {
+                restore_result = self.restore_regs_after_state_load(regs)?;
             }
             let control_health = self.post_load_control_health()?;
             let media_after = self.media_status()?.mounted;
@@ -411,7 +396,10 @@ impl<G: GdbTransport> Bridge<G> {
             out.insert("path".into(), json!(path.display().to_string()));
             out.insert("format".into(), json!(state_format));
             out.insert("regions".into(), json!(regions.len()));
-            out.insert("state_restore".into(), state_restore_info());
+            let mut restore_info = state_restore_info();
+            restore_info["post_restore_instruction_exact"] =
+                restore_result["post_restore_instruction_exact"].clone();
+            out.insert("state_restore".into(), restore_info);
             out.insert("control_health".into(), control_health);
             out.insert(
                 "media_boundary".into(),
@@ -433,42 +421,37 @@ impl<G: GdbTransport> Bridge<G> {
 
     pub(super) fn probe(&mut self, params: &Value) -> BridgeResult<Value> {
         let path = PathBuf::from(required_str(params, "state")?);
-        if !path.is_file() {
-            return Err(BridgeError::BadParams(format!(
-                "save state not found: {}",
-                path.display()
-            )));
-        }
         let frame = match optional_num(params, "frame")? {
             Some(frame) => frame,
             None => optional_num(params, "frames")?.unwrap_or(0),
         };
-        let memory_type = params
-            .get("memory_type")
-            .and_then(Value::as_str)
-            .unwrap_or("physical");
-        let region = memory_region(memory_type).ok_or_else(|| {
-            BridgeError::BadParams(format!("unsupported memory_type: {memory_type}"))
-        })?;
-        let address = region.base as u64 + required_num(params, "address")?;
-        let length = required_num(params, "length")? as usize;
-        self.stop_for_state_restore()?;
+        let max_frames = self.max_sync_frame_count();
+        if frame > max_frames {
+            return Err(BridgeError::BadParams(format!(
+                "probe frame count {frame} exceeds the current synchronous limit {max_frames}"
+            )));
+        }
+        let length = required_num(params, "length")?;
+        if length == 0 || length > MAX_READ_CHUNK as u64 {
+            return Err(BridgeError::BadParams(format!(
+                "probe length must be between 1 and {MAX_READ_CHUNK} bytes"
+            )));
+        }
+        let address = region_address(params, length)?;
+        let length = usize::try_from(length)
+            .map_err(|_| BridgeError::BadParams("probe length does not fit this host".into()))?;
         let load_items_dir = unique_temp_dir("emucap_pc98_probeitems_")?;
         let result = (|| {
-            let file = File::open(&path)?;
-            let mut archive = ZipArchive::new(file)?;
+            let mut archive = open_pc98_state_archive(&path)?;
             let manifest = read_state_manifest(&mut archive)?;
             let _ = state_format(&manifest)?;
+            let regs_hex = state_registers(&manifest, true)?
+                .expect("required registers admitted")
+                .to_owned();
             let save_items_dir = extract_save_items(&mut archive, &manifest, &load_items_dir)?;
             let regions = read_state_regions(&mut archive, &manifest)?;
-            let regs_hex = manifest
-                .get("registers_hex")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    BridgeError::BadParams("PC-98 probe state is missing registers_hex".into())
-                })?
-                .to_string();
             drop(archive);
+            self.stop_for_state_restore()?;
             let save_items_result = self.restore_state_data(save_items_dir.as_deref(), &regions)?;
             let mut result = self.register_probe(&regs_hex, frame, address, length)?;
             if let Some(obj) = result.as_object_mut() {

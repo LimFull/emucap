@@ -38,7 +38,10 @@ pub(super) fn launch_mame_neogeo(
             }),
         };
     };
-    let log = adapter_log_path("mame-neogeo", port, "mame-neogeo.log");
+    let log = match adapter_log_path(port, runtime, "mame-neogeo.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let display = args.display.unwrap_or(false);
     let launch = mame_neogeo_launch::Launch {
         binary: &binary,

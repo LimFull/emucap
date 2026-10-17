@@ -1,6 +1,8 @@
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index 6540b9b0e4..71bcade92e 100644
 --- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-@@ -170,8 +170,8 @@
+@@ -169,8 +169,8 @@ void WebSocketSteppingState::Broadcast(net::WebSocketServer *ws) {
  	if (!frameOperation_.empty())
  		json.writeString("operation_id", frameOperation_);
  	json.writeString("status", result.status == EmucapFrameStepStatus::Completed ? "completed" : "interrupted");

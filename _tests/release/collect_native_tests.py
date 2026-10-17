@@ -15,7 +15,7 @@ class CollectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'every adapter'): validate_selection(selection[:-1])
         with self.assertRaisesRegex(ValueError, 'every adapter'): validate_selection(selection + [selection[0]])
 
-    def test_release_rejects_stale_direct_native_code(self):
+    def test_release_rejects_stale_native_code_recipes_and_shared_inputs(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source, upstream, output = root / 'source', root / 'upstream', root / 'output'
@@ -25,6 +25,11 @@ class CollectionTests(unittest.TestCase):
             native = source / 'adapters/example/emucap.cpp'
             native.parent.mkdir(parents=True)
             native.write_text('native source')
+            inputs = [native, native.with_name('build.sh'), native.with_name('build.ps1'),
+                      source / 'adapters/_common/endpoint.h']
+            for path in inputs[1:]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('original build input')
             subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
             name = 'emucap-1.0.0-example-x86_64-unknown-linux-gnu'
             stage = root / name; stage.mkdir()
@@ -38,9 +43,14 @@ class CollectionTests(unittest.TestCase):
             record['artifacts'] = {p.name: sha(p) for p in (runtime, sources)}
             (output / (name + '.json')).write_text(json.dumps(record))
             validate_package(output, source, 'example', 'linux')
-            native.write_text('changed native source')
-            with self.assertRaisesRegex(ValueError, 'incompatible with release source'):
-                validate_package(output, source, 'example', 'linux')
+            for path in inputs:
+                original = path.read_bytes()
+                path.write_bytes(b'changed build input')
+                with self.subTest(path=path.relative_to(source)), \
+                        self.assertRaisesRegex(ValueError, 'incompatible with release source'):
+                    validate_package(output, source, 'example', 'linux')
+                path.write_bytes(original)
+            validate_package(output, source, 'example', 'linux')
 
     def test_shared_source_must_have_identical_bytes(self):
         with tempfile.TemporaryDirectory() as d:

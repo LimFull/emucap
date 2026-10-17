@@ -59,6 +59,7 @@ namespace PerformanceMetrics {void Reset(){}}
 namespace SPU2 {void SetOutputPaused(bool){}}
 namespace Achievements {void OnVMPaused(bool){}}
 namespace Threading {void Sleep(int ms){assert(ms<=10);ticks+=ms*1000;}}
+namespace FullscreenUI {void OnVMResumed(){}}
 namespace Host {
  void OnVMPaused(){} void OnVMResumed(){}
  void PumpMessagesOnCPUThread(){++pumps;if(interrupt==1)s_state=VMState::Paused;if(interrupt==2)s_limiter_restarted=true;}

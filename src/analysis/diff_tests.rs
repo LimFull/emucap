@@ -144,3 +144,22 @@ fn render_json_is_machine_readable() {
     assert_eq!(v["regions"][0]["differing"], 1);
     assert_eq!(v["regions"][0]["first_divergence"]["offset"], 1);
 }
+
+#[test]
+fn bounded_diff_is_complete_or_fails_without_truncation() {
+    let mut a = RegionSet::new();
+    let mut b = RegionSet::new();
+    a.insert("ram", 0, vec![0, 0, 0]);
+    b.insert("ram", 0, vec![1, 1, 1]);
+    let baseline = Baseline::empty();
+    assert!(diff_bounded(&a, &b, &[], &baseline, 2).is_err());
+    let complete = diff_bounded(&a, &b, &[], &baseline, 3).unwrap();
+    assert_eq!(complete, diff(&a, &b, &[], &baseline));
+    assert_eq!(
+        diff_bounded(&a, &b, &[], &Baseline::from_report(&complete), 0)
+            .unwrap()
+            .regions[0]
+            .differing,
+        0
+    );
+}

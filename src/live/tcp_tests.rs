@@ -3,10 +3,12 @@ use super::link::{
 };
 use super::tcp;
 use crate::test_env::{lock_env, EnvGuard};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::MutexGuard;
 use std::time::Duration;
+
+const TEST_LAUNCH_ID: &str = "launch-01arz3ndektsv4rrffq69g5fav";
 
 const SESSION_ENV_KEYS: [&str; 4] = [
     "EMUCAP_SESSION_ID",
@@ -65,24 +67,81 @@ fn token_anchor(token: &str) -> &str {
     token.split('-').nth(1).expect("session anchor field")
 }
 
-fn hello_parts(line: &str) -> (serde_json::Value, String) {
+fn strong_reclaim_token() -> String {
+    format!(
+        "reclaim-{}{}",
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase()
+    )
+}
+
+fn hello_id(line: &str) -> serde_json::Value {
     let v = serde_json::from_str::<serde_json::Value>(line.trim()).unwrap();
     assert_eq!(
         v.get("method").and_then(|m| m.as_str()),
         Some("hello"),
         "첫 요청은 hello여야 한다: {line}"
     );
-    let token = v
-        .get("params")
-        .and_then(|p| p.get("session_token"))
-        .and_then(|t| t.as_str())
-        .expect("hello params.session_token")
-        .to_string();
-    (v["id"].clone(), token)
+    assert_eq!(
+        v.get("params"),
+        Some(&serde_json::json!({})),
+        "hello must not disclose authentication material: {line}"
+    );
+    v["id"].clone()
+}
+
+fn token_for_peer(stream: &TcpStream) -> String {
+    let port = stream.peer_addr().unwrap().port();
+    std::fs::read_to_string(tcp::session_token_path(port).unwrap())
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn authenticate_peer_as(stream: TcpStream, root: &str, launch_id: &str) -> TcpStream {
+    let port = stream.peer_addr().unwrap().port();
+    let front_key = super::producer_auth::derive_front_key(
+        root,
+        super::producer_auth::Boundary::Direct,
+        port,
+        launch_id,
+    )
+    .unwrap();
+    super::producer_auth::authenticate_producer_stream(
+        stream,
+        &front_key,
+        super::producer_auth::Boundary::Direct,
+        port,
+        launch_id,
+        Duration::from_secs(2),
+    )
+    .unwrap()
+}
+
+fn authenticate_peer_with_root(stream: TcpStream, root: &str) -> TcpStream {
+    authenticate_peer_as(stream, root, TEST_LAUNCH_ID)
+}
+
+fn authenticate_peer(stream: TcpStream) -> TcpStream {
+    let root = token_for_peer(&stream);
+    authenticate_peer_with_root(stream, &root)
+}
+
+fn connect_peer(addr: impl std::net::ToSocketAddrs) -> TcpStream {
+    authenticate_peer(TcpStream::connect(addr).unwrap())
+}
+
+fn connect_peer_after_ready(
+    addr: impl std::net::ToSocketAddrs,
+    ready: std::sync::mpsc::Sender<()>,
+) -> TcpStream {
+    let stream = TcpStream::connect(addr).unwrap();
+    ready.send(()).unwrap();
+    authenticate_peer(stream)
 }
 
 fn write_hello_response(w: &mut TcpStream, line: &str, methods: &[&str]) {
-    let (id, token) = hello_parts(line);
+    let id = hello_id(line);
     writeln!(
         w,
         "{}",
@@ -92,25 +151,6 @@ fn write_hello_response(w: &mut TcpStream, line: &str, methods: &[&str]) {
             "result": {
                 "protocol_version": 1,
                 "methods": methods,
-                "session_token": token,
-            }
-        })
-    )
-    .unwrap();
-}
-
-fn write_hello_response_with_token(w: &mut TcpStream, line: &str, methods: &[&str], token: &str) {
-    let (id, _) = hello_parts(line);
-    writeln!(
-        w,
-        "{}",
-        serde_json::json!({
-            "id": id,
-            "ok": true,
-            "result": {
-                "protocol_version": 1,
-                "methods": methods,
-                "session_token": token,
             }
         })
     )
@@ -118,7 +158,7 @@ fn write_hello_response_with_token(w: &mut TcpStream, line: &str, methods: &[&st
 }
 
 fn write_mesen_hello_response(w: &mut TcpStream, line: &str, host_features: &[&str]) {
-    let (id, token) = hello_parts(line);
+    let id = hello_id(line);
     writeln!(
         w,
         "{}",
@@ -128,7 +168,6 @@ fn write_mesen_hello_response(w: &mut TcpStream, line: &str, host_features: &[&s
             "result": {
                 "protocol_version": 1,
                 "methods": ["status"],
-                "session_token": token,
                 "adapter": "mesen2-live",
                 "mesen_host_api": 1,
                 "host_features": host_features,
@@ -140,10 +179,9 @@ fn write_mesen_hello_response(w: &mut TcpStream, line: &str, host_features: &[&s
 
 /// Lua 역할: 접속해서 hello에 답하고, 이어 read_memory 요청에 응답한다.
 fn fake_lua(addr: String, ready: std::sync::mpsc::Sender<()>) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
 
     // hello 요청 수신 → 응답
     let mut line = String::new();
@@ -185,12 +223,12 @@ fn tcp_link_preserves_contract_advertisement_from_hello() {
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let h = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        let (id, token) = hello_parts(&hello);
+        let id = hello_id(&hello);
         writeln!(
             writer,
             "{}",
@@ -208,7 +246,6 @@ fn tcp_link_preserves_contract_advertisement_from_hello() {
                         "memory_type_used": true,
                         "snapshot": true
                     }],
-                    "session_token": token,
                     "contracts": crate::contracts::advertisement_value(&[
                         "nds.execution.frame-step-vblank",
                         "nds.call-stack.best-effort",
@@ -265,12 +302,12 @@ fn tcp_link_validates_internal_recording_capability_from_hello() {
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let h = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        let (id, token) = hello_parts(&hello);
+        let id = hello_id(&hello);
         writeln!(
             writer,
             "{}",
@@ -280,7 +317,6 @@ fn tcp_link_validates_internal_recording_capability_from_hello() {
                 "result": {
                     "protocol_version": 1,
                     "methods": ["status", "record_window", "abort_recording"],
-                    "session_token": token,
                     "recording": {
                         "revision": super::recording_capability::INITIAL_RECORDING_CAPABILITY_REVISION,
                         "origins": ["next_frame_boundary"],
@@ -328,7 +364,7 @@ fn tcp_link_rejects_mesen_without_native_halt_features() {
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let h = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -345,35 +381,55 @@ fn tcp_link_rejects_mesen_without_native_halt_features() {
 }
 
 #[test]
-fn tcp_link_rejects_wrong_session_token() {
+fn tcp_link_rejects_wrong_front_key() {
     let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
+    let link_port = link.local_addr().port();
+    let expected = link.session_token().unwrap().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     let h = std::thread::spawn(move || {
         let stream = TcpStream::connect(addr).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut w = stream;
         tx.send(()).unwrap();
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap(); // hello
-        write_hello_response_with_token(&mut w, &line, &["status"], "wrong-session-token");
+        assert!(super::producer_auth::authenticate_producer_stream(
+            stream,
+            &super::producer_auth::derive_front_key(
+                "wrong-session-token",
+                super::producer_auth::Boundary::Direct,
+                link_port,
+                TEST_LAUNCH_ID,
+            )
+            .unwrap(),
+            super::producer_auth::Boundary::Direct,
+            link_port,
+            TEST_LAUNCH_ID,
+            Duration::from_secs(2),
+        )
+        .is_err());
     });
     rx.recv().unwrap();
 
     let err = link.call("status", serde_json::json!({})).unwrap_err();
     assert!(
-        matches!(err, LinkError::IdentityMismatch { .. }),
-        "다른 세션 토큰을 echo한 에뮬레이터는 연결로 받아들이면 안 된다: {err:?}"
+        matches!(err, LinkError::NotConnected | LinkError::Protocol(_)),
+        "wrong producer front key must fail before hello: {err:?}"
+    );
+    let debug = format!("{err:?}");
+    assert!(
+        !debug.contains(&expected),
+        "expected secret leaked via Debug"
+    );
+    assert!(
+        !debug.contains("wrong-session-token"),
+        "presented root leaked via Debug"
     );
     h.join().unwrap();
 }
 
 fn fake_lua_with_keepalive(addr: String, ready: std::sync::mpsc::Sender<()>) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // hello
     write_hello_response(&mut w, &line, &["run_frames"]);
@@ -409,10 +465,9 @@ fn tcp_link_waits_through_keepalive() {
 
 /// hello만 답하고 바로 끊는 클라이언트.
 fn fake_lua_hello_then_close(addr: String, ready: std::sync::mpsc::Sender<()>) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     write_hello_response(&mut w, &line, &[]);
@@ -441,7 +496,7 @@ fn tcp_link_reconnects_after_client_disconnect() {
     // client 2: 정상 응답 → 재연결되어 받아야 함
     let (tx2, rx2) = std::sync::mpsc::channel();
     let h2 = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut w = stream;
         tx2.send(()).unwrap();
@@ -475,10 +530,9 @@ fn tcp_link_reconnects_after_client_disconnect() {
 
 /// hello 후 read_memory에 "엉뚱한 id의 늦은 응답 + 올바른 응답" 순으로 답한다.
 fn fake_lua_stale_then_real(addr: String, ready: std::sync::mpsc::Sender<()>) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // hello
     write_hello_response(&mut w, &line, &[]);
@@ -516,10 +570,9 @@ fn fake_lua_hello_then_hang(
     ready: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 ) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // hello
     write_hello_response(&mut w, &line, &[]);
@@ -549,7 +602,7 @@ fn tcp_link_reconnects_after_timeout_on_hung_client() {
     // client 2: 정상 응답 → 재연결되어 받아야 함(타임아웃이 conn을 비웠을 때만 가능)
     let (tx2, rx2) = std::sync::mpsc::channel();
     let h2 = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut w = stream;
         tx2.send(()).unwrap();
@@ -599,10 +652,9 @@ fn tcp_link_adopts_pending_client_while_old_conn_held() {
     let (rel_tx, rel_rx) = std::sync::mpsc::channel();
     let a1 = addr.clone();
     let h1 = std::thread::spawn(move || {
-        let stream = TcpStream::connect(a1).unwrap();
+        let stream = connect_peer_after_ready(a1, tx1);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut w = stream;
-        tx1.send(()).unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).unwrap(); // hello
         write_hello_response(&mut w, &line, &[]);
@@ -623,38 +675,169 @@ fn tcp_link_adopts_pending_client_while_old_conn_held() {
     let (tx2, rx2) = std::sync::mpsc::channel();
     let a2 = addr.clone();
     let h2 = std::thread::spawn(move || {
-        let stream = TcpStream::connect(a2).unwrap();
+        let stream = connect_peer(a2);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut w = stream;
-        tx2.send(()).unwrap();
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).unwrap(); // hello
         write_hello_response(&mut w, &line, &[]);
+        tx2.send(()).unwrap();
         let mut l2 = String::new();
         reader.read_line(&mut l2).unwrap(); // status
         let id2 = serde_json::from_str::<serde_json::Value>(l2.trim()).unwrap()["id"].clone();
         writeln!(w, r#"{{"id":{id2},"ok":true,"result":{{"which":"B"}}}}"#).unwrap();
     });
-    rx2.recv().unwrap();
+    rx2.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !link.preaccept_finished() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     // 다음 status: ensure_connected가 대기 중 client2를 채택해야 한다(client1 timeout 누적을 안 기다리고).
-    let mut adopted = false;
-    for _ in 0..50 {
-        if let Ok(v) = link.call("status", serde_json::json!({})) {
-            if v["which"] == "B" {
-                adopted = true;
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        adopted,
-        "새 client 대기 시 붙들린 dead conn을 즉시 교체·채택해야(ROM 교체 wedge 금지)"
+    let started = std::time::Instant::now();
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["which"],
+        "B"
     );
+    assert!(started.elapsed() < Duration::from_millis(100));
     rel_tx.send(()).ok();
     h1.join().unwrap();
     h2.join().unwrap();
+}
+
+#[test]
+fn tcp_link_rejects_unauthenticated_pending_client_without_replacing_active() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(300)).unwrap();
+    let addr = link.local_addr().to_string();
+
+    let active_addr = addr.clone();
+    let active = std::thread::spawn(move || {
+        let stream = connect_peer(active_addr);
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["status"]);
+        for sequence in 1..=2 {
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({
+                    "id": request["id"],
+                    "ok": true,
+                    "result": {"peer": "active", "sequence": sequence},
+                })
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["sequence"],
+        1
+    );
+
+    let (connected, queued) = std::sync::mpsc::channel();
+    let attacker = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        connected.send(()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut challenge = [0u8; 25];
+        reader.read_exact(&mut challenge).unwrap();
+        assert_eq!(&challenge[..4], b"ECFA");
+        writer.write_all(&[0u8; 88]).unwrap();
+        let mut leaked_request = [0u8; 1];
+        let read = reader.read(&mut leaked_request).unwrap();
+        assert_eq!(
+            read, 0,
+            "unauthenticated pending peer received a control request"
+        );
+    });
+    queued.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let result = link.call("status", serde_json::json!({})).unwrap();
+    assert_eq!(result["peer"], "active");
+    assert_eq!(result["sequence"], 2);
+    active.join().unwrap();
+    attacker.join().unwrap();
+}
+
+#[test]
+fn tcp_pending_authentication_has_an_absolute_deadline() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(250)).unwrap();
+    let addr = link.local_addr().to_string();
+
+    let active_addr = addr.clone();
+    let active = std::thread::spawn(move || {
+        let stream = connect_peer(active_addr);
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["status"]);
+        for sequence in 1..=2 {
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({
+                    "id": request["id"],
+                    "ok": true,
+                    "result": {"sequence": sequence},
+                })
+            )
+            .unwrap();
+        }
+    });
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["sequence"],
+        1
+    );
+
+    let (connected, queued) = std::sync::mpsc::channel();
+    let slow_peer = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        connected.send(()).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut challenge = [0u8; 25];
+        reader.read_exact(&mut challenge).unwrap();
+        // Stay below the per-read timeout while never completing the proof. Only an
+        // absolute admission deadline prevents this peer from holding the call.
+        for _ in 0..12 {
+            if writer.write_all(b"{").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(75));
+        }
+    });
+    queued.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let started = std::time::Instant::now();
+    let result = link.call("status", serde_json::json!({})).unwrap();
+    assert_eq!(result["sequence"], 2);
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "slow-drip candidate delayed an established control call"
+    );
+
+    active.join().unwrap();
+    slow_peer.join().unwrap();
 }
 
 // 포트 0(기준)으로 지연 바인드하면 OS가 임시포트를 배정한다. endpoint_port()는 후보
@@ -664,7 +847,7 @@ fn tcp_link_adopts_pending_client_while_old_conn_held() {
 fn tcp_link_reports_actual_ephemeral_port_when_base_is_zero() {
     use super::link::EmulatorLink;
     let _env = lock_env();
-    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(100));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(100)).unwrap();
     assert_eq!(link.base_port(), Some(0));
     assert_eq!(
         link.endpoint_port(),
@@ -696,7 +879,7 @@ fn dropping_idle_preaccept_releases_its_listener() {
     #[cfg(unix)]
     let before = open_descriptor_count();
     for _ in 0..8 {
-        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(50));
+        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap();
         assert!(matches!(
             link.call("status", serde_json::json!({})),
             Err(LinkError::NotConnected)
@@ -731,12 +914,12 @@ fn open_descriptor_count() -> usize {
 fn dropping_stalled_preaccept_interrupts_the_handshake() {
     let _env = SessionEnv::with(Some("drop-stalled-preaccept"));
     for _ in 0..4 {
-        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(30));
+        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(30)).unwrap();
         assert!(matches!(
             link.call("status", serde_json::json!({})),
             Err(LinkError::NotConnected)
         ));
-        let peer = TcpStream::connect(link.local_addr()).unwrap();
+        let peer = connect_peer(link.local_addr());
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut reader = BufReader::new(peer);
         let mut hello = String::new();
@@ -755,12 +938,12 @@ fn dropping_stalled_preaccept_interrupts_the_handshake() {
 fn dropping_completed_preaccept_releases_the_queued_connection() {
     let _env = SessionEnv::with(Some("drop-queued-preaccept"));
     for _ in 0..8 {
-        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(2));
+        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(2)).unwrap();
         assert!(matches!(
             link.call("status", serde_json::json!({})),
             Err(LinkError::NotConnected)
         ));
-        let peer = TcpStream::connect(link.local_addr()).unwrap();
+        let peer = connect_peer(link.local_addr());
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut reader = BufReader::new(peer);
         let mut hello = String::new();
@@ -783,7 +966,7 @@ fn dropping_completed_preaccept_releases_the_queued_connection() {
 fn tcp_link_preaccepts_after_not_connected_status() {
     use super::link::EmulatorLink;
     let _env = lock_env();
-    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(2));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(2)).unwrap();
 
     let first = link.call("status", serde_json::json!({})).unwrap_err();
     assert!(
@@ -797,7 +980,7 @@ fn tcp_link_preaccepts_after_not_connected_status() {
 
     let (hello_tx, hello_rx) = std::sync::mpsc::channel();
     let h = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -843,7 +1026,7 @@ fn tcp_link_does_not_wrap_past_u16_max() {
         Ok(o) => o,
         Err(_) => return, // 환경상 65535를 못 잡으면 스킵
     };
-    let mut loser = tcp::lazy("127.0.0.1:65535", Duration::from_millis(100));
+    let mut loser = tcp::lazy("127.0.0.1:65535", Duration::from_millis(100)).unwrap();
     let err = loser.call("status", serde_json::json!({})).unwrap_err();
     assert!(
         matches!(err, LinkError::PortBusy { .. }),
@@ -854,10 +1037,9 @@ fn tcp_link_does_not_wrap_past_u16_max() {
 
 // hello 후 올바른 id 응답 없이 불일치 id 프레임만 쏟아붓는 클라이언트(스트림 desync 폭주).
 fn fake_lua_id_mismatch_flood(addr: String, ready: std::sync::mpsc::Sender<()>) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // hello
     write_hello_response(&mut w, &line, &[]);
@@ -912,10 +1094,10 @@ fn tcp_link_prefers_persisted_port_over_lowest_free() {
     }
     // portfile에 preferred 기록 → lazy(base)가 base(최저빈)가 아니라 preferred를 잡아야 한다.
     let pf = tcp::port_persist_path(base).expect("안정 id면 포트 영속화 경로가 있어야");
-    let store = super::runtime::RuntimeStore::discover();
+    let store = super::runtime::RuntimeStore::discover().unwrap();
     tcp::write_persisted_port(&store, base, preferred).unwrap();
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100)).unwrap();
     let _ = link.call("status", serde_json::json!({})); // 바인드 트리거(에뮬레이터 없음 → NotConnected)
     let chosen = link.endpoint_port().expect("바인드된 포트");
     let _ = std::fs::remove_file(&pf); // 정리
@@ -949,10 +1131,10 @@ fn tcp_link_falls_back_to_scan_when_persisted_port_busy() {
         Err(_) => return, // 못 잡으면 스킵
     };
     let pf = tcp::port_persist_path(base).expect("안정 id면 포트 영속화 경로가 있어야");
-    let store = super::runtime::RuntimeStore::discover();
+    let store = super::runtime::RuntimeStore::discover().unwrap();
     tcp::write_persisted_port(&store, base, busy_pref).unwrap();
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100)).unwrap();
     let _ = link.call("status", serde_json::json!({}));
     let chosen = link.endpoint_port().expect("폴백으로라도 바인드돼야");
     let _ = std::fs::remove_file(&pf);
@@ -985,7 +1167,7 @@ fn tcp_link_auto_selects_next_port_when_occupied() {
     let owner = tcp::bind("127.0.0.1:0", Duration::from_millis(100)).unwrap();
     let base_port = owner.local_addr().port();
     let addr = owner.local_addr().to_string();
-    let mut loser = tcp::lazy(&addr, Duration::from_millis(100));
+    let mut loser = tcp::lazy(&addr, Duration::from_millis(100)).unwrap();
     // 기준 포트가 점유 중 → 다음 빈 포트로 자동 이동. 거기엔 에뮬레이터가 없으니 NotConnected.
     let err = loser.call("status", serde_json::json!({})).unwrap_err();
     assert!(
@@ -1024,7 +1206,7 @@ fn session_token_reused_for_own_cwd_on_reconnect() {
 #[test]
 fn session_token_writer_creates_private_runtime_parent() {
     let _env = SessionEnv::with(Some("token-parent"));
-    let path = tcp::session_token_path(59778);
+    let path = tcp::session_token_path(59778).unwrap();
     assert!(path.ends_with("sessions/compatibility/session-token-59778"));
     tcp::write_session_token(59778, "parent-test-token").unwrap();
     assert!(
@@ -1042,7 +1224,7 @@ fn session_token_file_is_private() {
     let _env = SessionEnv::with(Some("private-token"));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     let _ = std::fs::remove_file(&path);
 
     tcp::write_session_token(port, "private-reclaim-token").unwrap();
@@ -1064,7 +1246,7 @@ fn session_token_writer_and_reader_refuse_symlinks() {
     let _env = SessionEnv::with(Some("symlink-token"));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     let _ = std::fs::remove_file(&path);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -1088,7 +1270,7 @@ fn reusable_session_token_reuses_own_mints_for_foreign() {
     // 재사용 경로 통합: own 토큰파일은 재사용(reclaim), foreign은 None(새 토큰 발급→guard가 차단).
     let _env = SessionEnv::with(Some("reuse-own"));
     let port = 59777u16; // 테스트 전용 포트(충돌 회피)
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     let own = tcp::new_session_token();
     tcp::write_session_token(port, &own).unwrap();
     assert_eq!(
@@ -1116,13 +1298,13 @@ fn distinct_sessions_same_cwd_are_not_own() {
     let mut fields = own.split('-');
     let cwd = fields.next().unwrap();
     let anchor = fields.next().unwrap();
-    // 같은 cwd, 다른 session id 앵커(문자열을 확실히 다르게), 다른 pid/nanos.
+    // 같은 cwd, 다른 session id 앵커(문자열을 확실히 다르게), 다른 pid/random.
     let sibling = format!("{cwd}-{anchor}f-1-1");
     assert!(
         !tcp::same_session_identity(&own, &sibling),
         "같은 cwd라도 다른 session id(세션)는 서로 own 아님: own={own} sibling={sibling}"
     );
-    // 같은 세션(같은 cwd+앵커)은 pid/nanos가 달라도(서버 respawn) own.
+    // 같은 세션(같은 cwd+앵커)은 pid/random이 달라도(서버 respawn) own.
     let same_session_restart = format!("{cwd}-{anchor}-99-99");
     assert!(
         tcp::same_session_identity(&own, &same_session_restart),
@@ -1137,11 +1319,12 @@ fn reusable_session_token_reclaims_across_process_respawn() {
     // 오판해 실행 중 에뮬을 strand했다. 앵커는 session id라 respawn(부모 pid 변경)에 불변 → reclaim 유지.
     let _env = SessionEnv::with(Some("respawn-reclaim"));
     let port = 59772u16; // 테스트 전용 포트(충돌 회피)
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     let mine = tcp::new_session_token();
-    // 같은 세션 식별부(cwd+앵커), 다른 pid/nanos = respawn된 프로세스가 남긴 토큰.
+    // 같은 세션 식별부(cwd+앵커), 다른 pid/random = respawn된 프로세스가 남긴 토큰.
     let ident: Vec<&str> = mine.split('-').take(2).collect();
-    let respawned = format!("{}-{}-dead-beef", ident[0], ident[1]);
+    let random = mine.rsplit('-').next().unwrap();
+    let respawned = format!("{}-{}-dead-{random}", ident[0], ident[1]);
     tcp::write_session_token(port, &respawned).unwrap();
     assert_eq!(
         tcp::reusable_session_token(port).unwrap().as_deref(),
@@ -1152,12 +1335,47 @@ fn reusable_session_token_reclaims_across_process_respawn() {
 }
 
 #[test]
+fn reusable_session_token_rotates_legacy_predictable_mint() {
+    let _env = SessionEnv::with(Some("rotate-legacy-token"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let path = tcp::session_token_path(port).unwrap();
+    let current = tcp::new_session_token();
+    let ident: Vec<&str> = current.split('-').take(2).collect();
+    let legacy = format!("{}-{}-dead-beef", ident[0], ident[1]);
+    assert!(
+        tcp::session_token_is_own(&legacy),
+        "legacy token still carries the same non-secret continuity identity"
+    );
+    tcp::write_session_token(port, &legacy).unwrap();
+    assert_eq!(
+        tcp::reusable_session_token(port).unwrap(),
+        None,
+        "a predictable pid/time-era token must rotate instead of becoming an auth capability"
+    );
+    let mut link = tcp::lazy(&format!("127.0.0.1:{port}"), Duration::from_millis(50)).unwrap();
+    let replacement = link.session_token().unwrap().to_string();
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_ne!(replacement, legacy);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        replacement,
+        "binding must replace the legacy token with the current strong mint"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn reusable_session_token_rejects_live_sibling_same_cwd() {
     // (a) 같은 cwd의 형제 세션(다른 session id)이 이 포트에 남긴 *살아있는* 토큰파일을, 이 세션이
     // 포트를 바인드하며 조용히 재사용(=그 에뮬레이터 인계)하면 안 된다. 내 토큰은 재사용, 형제는 None.
     let _env = SessionEnv::with(Some("sibling-reject"));
     let port = 59771u16; // 테스트 전용 포트(충돌 회피)
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     let own = tcp::new_session_token();
     tcp::write_session_token(port, &own).unwrap();
     assert_eq!(
@@ -1193,7 +1411,7 @@ fn no_stable_session_id_fails_closed_no_takeover() {
     );
     // reusable도 재사용 거부(형제 에뮬 조용한 인계 방지).
     let port = 59762u16;
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     tcp::write_session_token(port, &a_token).unwrap();
     assert_eq!(
         tcp::reusable_session_token(port).unwrap(),
@@ -1257,11 +1475,12 @@ fn stable_session_id_reclaims_across_reconnect() {
         tcp::session_token_is_own(&mine),
         "안정 id면 자기 토큰은 own(재연결 reclaim): {mine}"
     );
-    // respawn: 같은 안정 id(같은 식별부), 다른 pid/nanos → 여전히 own.
+    // respawn: 같은 안정 id(같은 식별부), 다른 pid/random → 여전히 own.
     let ident: Vec<&str> = mine.split('-').take(2).collect();
-    let respawned = format!("{}-{}-dead-beef", ident[0], ident[1]);
+    let random = mine.rsplit('-').next().unwrap();
+    let respawned = format!("{}-{}-dead-{random}", ident[0], ident[1]);
     let port = 59763u16;
-    let path = tcp::session_token_path(port);
+    let path = tcp::session_token_path(port).unwrap();
     tcp::write_session_token(port, &respawned).unwrap();
     assert_eq!(
         tcp::reusable_session_token(port).unwrap().as_deref(),
@@ -1297,24 +1516,23 @@ fn port_persist_path_keyed_on_session_identity_not_cwd_alone() {
 #[test]
 fn replacing_reclaim_token_updates_an_already_armed_preaccept() {
     let _env = lock_env();
-    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300)).unwrap();
     assert!(matches!(
         link.call("status", serde_json::json!({})),
         Err(LinkError::NotConnected)
     ));
     let addr = link.local_addr().to_string();
-    let replacement = "reclaim-test-generation";
-    assert!(link.replace_reclaim_token(replacement).unwrap());
+    let replacement = strong_reclaim_token();
+    assert!(link.replace_reclaim_token(&replacement).unwrap());
 
-    let expected = replacement.to_string();
+    let expected = replacement;
     let client = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = authenticate_peer_with_root(TcpStream::connect(addr).unwrap(), &expected);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        let (hello_id, token) = hello_parts(&hello);
-        assert_eq!(token, expected);
+        let hello_id = hello_id(&hello);
         writeln!(
             writer,
             "{}",
@@ -1324,7 +1542,6 @@ fn replacing_reclaim_token_updates_an_already_armed_preaccept() {
                 "result": {
                     "protocol_version": 1,
                     "methods": ["status"],
-                    "session_token": token,
                 }
             })
         )
@@ -1349,7 +1566,7 @@ fn replacing_reclaim_token_updates_an_already_armed_preaccept() {
 #[test]
 fn staged_reclaim_token_is_accepted_but_not_durable_until_commit() {
     let _env = SessionEnv::with(Some("staged-reclaim-commit"));
-    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300)).unwrap();
     assert!(matches!(
         link.call("status", serde_json::json!({})),
         Err(LinkError::NotConnected)
@@ -1357,24 +1574,23 @@ fn staged_reclaim_token_is_accepted_but_not_durable_until_commit() {
     let addr = link.local_addr().to_string();
     let port = link.endpoint_port().unwrap();
     let active = link.session_token().unwrap().to_string();
-    let staged = "reclaim-staged-generation".to_string();
+    let staged = strong_reclaim_token();
     assert!(link.stage_reclaim_token(&staged).unwrap());
     assert_eq!(link.session_token(), Some(active.as_str()));
     assert_eq!(
-        std::fs::read_to_string(tcp::session_token_path(port)).unwrap(),
+        std::fs::read_to_string(tcp::session_token_path(port).unwrap()).unwrap(),
         active,
         "staging must not replace the durable compatibility token"
     );
 
     let expected = staged.clone();
     let client = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = authenticate_peer_with_root(TcpStream::connect(addr).unwrap(), &expected);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        let (hello_id, token) = hello_parts(&hello);
-        assert_eq!(token, expected);
+        let hello_id = hello_id(&hello);
         writeln!(
             writer,
             "{}",
@@ -1384,7 +1600,6 @@ fn staged_reclaim_token_is_accepted_but_not_durable_until_commit() {
                 "result": {
                     "protocol_version": 1,
                     "methods": ["status"],
-                    "session_token": token,
                 }
             })
         )
@@ -1406,7 +1621,7 @@ fn staged_reclaim_token_is_accepted_but_not_durable_until_commit() {
     assert!(link.commit_staged_reclaim_token(&staged).unwrap());
     assert_eq!(link.session_token(), Some(staged.as_str()));
     assert_eq!(
-        std::fs::read_to_string(tcp::session_token_path(port)).unwrap(),
+        std::fs::read_to_string(tcp::session_token_path(port).unwrap()).unwrap(),
         staged
     );
     client.join().unwrap();
@@ -1415,21 +1630,30 @@ fn staged_reclaim_token_is_accepted_but_not_durable_until_commit() {
 #[test]
 fn aborted_staged_reclaim_token_restores_active_acceptance() {
     let _env = SessionEnv::with(Some("staged-reclaim-abort"));
-    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300)).unwrap();
     assert!(matches!(
         link.call("status", serde_json::json!({})),
         Err(LinkError::NotConnected)
     ));
     let port = link.endpoint_port().unwrap();
     let active = link.session_token().unwrap().to_string();
-    let staged = "reclaim-aborted-generation";
-    assert!(link.stage_reclaim_token(staged).unwrap());
-    assert!(link.abort_staged_reclaim_token(staged).unwrap());
+    let staged = strong_reclaim_token();
+    assert!(link.stage_reclaim_token(&staged).unwrap());
+    assert!(link.abort_staged_reclaim_token(&staged).unwrap());
     assert_eq!(link.session_token(), Some(active.as_str()));
     assert_eq!(
-        std::fs::read_to_string(tcp::session_token_path(port)).unwrap(),
+        std::fs::read_to_string(tcp::session_token_path(port).unwrap()).unwrap(),
         active
     );
+}
+
+#[test]
+fn weak_reclaim_tokens_are_rejected_before_acceptance() {
+    let _env = SessionEnv::with(Some("reject-weak-reclaim"));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(100)).unwrap();
+    let error = link.stage_reclaim_token("reclaim-predictable").unwrap_err();
+    assert!(matches!(error, LinkError::Protocol(_)));
+    assert_ne!(link.session_token(), Some("reclaim-predictable"));
 }
 
 #[test]
@@ -1455,7 +1679,7 @@ fn persisted_control_port_does_not_adopt_generation_without_control_identity() {
 
     let persist = tcp::port_persist_path_with_store(&store, port).unwrap();
     tcp::write_persisted_port(&store, port, port).unwrap();
-    let mut link = tcp::lazy(&format!("127.0.0.1:{port}"), Duration::from_millis(50));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{port}"), Duration::from_millis(50)).unwrap();
     link.set_runtime_store(store);
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1465,7 +1689,7 @@ fn persisted_control_port_does_not_adopt_generation_without_control_identity() {
     assert_ne!(link.session_token(), Some(prepared.reclaim_token()));
 
     let _ = std::fs::remove_file(persist);
-    let _ = std::fs::remove_file(tcp::session_token_path(port));
+    let _ = std::fs::remove_file(tcp::session_token_path(port).unwrap());
 }
 
 #[test]
@@ -1498,7 +1722,7 @@ fn fallback_port_skips_runtime_reserved_generation() {
 
     let persist = tcp::port_persist_path_with_store(&store, base).unwrap();
     tcp::write_persisted_port(&store, base, busy_port).unwrap();
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50)).unwrap();
     link.set_runtime_store(store);
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1510,7 +1734,7 @@ fn fallback_port_skips_runtime_reserved_generation() {
 
     drop(busy);
     let _ = std::fs::remove_file(persist);
-    let _ = std::fs::remove_file(tcp::session_token_path(base));
+    let _ = std::fs::remove_file(tcp::session_token_path(base).unwrap());
 }
 
 #[cfg(unix)]
@@ -1577,6 +1801,45 @@ fn range_scan_reattaches_one_generation_with_confirmed_stale_lease() {
 
 #[cfg(unix)]
 #[test]
+fn range_scan_rejects_a_legacy_weak_reclaim_capability() {
+    let _env = SessionEnv::with(Some("runtime-range-weak-reclaim"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mesen2".into(),
+            system: "snes".into(),
+            content: "/games/legacy-reclaim.sfc".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(
+        &store,
+        base,
+        prepared.launch_id(),
+        Some(super::runtime::control_session_key().unwrap()),
+    );
+    std::fs::write(
+        store.auth_path(base, prepared.launch_id()),
+        "reclaim-predictable",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        tcp::select_runtime_generation(&store, base).unwrap(),
+        tcp::RuntimeSelection::Blocked(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn range_scan_does_not_reattach_anonymous_generation_with_confirmed_stale_lease() {
     let _env = SessionEnv::with(None);
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1604,7 +1867,7 @@ fn range_scan_does_not_reattach_anonymous_generation_with_confirmed_stale_lease(
             if reserved_ports == &[base]
     ));
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50)).unwrap();
     link.set_runtime_store(store);
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1638,7 +1901,7 @@ fn anonymous_controller_can_explicitly_reattach_exact_returned_generation() {
         .unwrap();
     install_stale_lease(&store, base, &launch_id, None);
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50)).unwrap();
     link.set_runtime_store(store.clone());
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1717,7 +1980,7 @@ fn explicit_reattach_does_not_take_a_live_foreign_lease() {
         .write_compatibility_token(base, "foreign-generation-token")
         .unwrap();
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50)).unwrap();
     link.set_runtime_store(store.clone());
     assert!(matches!(
         link.reattach_runtime(&launch_id),
@@ -1816,7 +2079,7 @@ fn range_scan_does_not_reattach_generation_from_another_control_session() {
             if reserved_ports == &[base]
     ));
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50)).unwrap();
     link.set_runtime_store(store);
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1854,7 +2117,7 @@ fn selected_reattach_is_not_reported_as_runtime_ambiguity() {
         Some(super::runtime::control_session_key().unwrap()),
     );
 
-    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(250));
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(250)).unwrap();
     link.set_runtime_store(store);
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1862,9 +2125,13 @@ fn selected_reattach_is_not_reported_as_runtime_ambiguity() {
     ));
     assert!(link.runtime_candidates().is_empty());
     assert_eq!(link.endpoint_port(), Some(base));
+    let session_token = link.session_token().unwrap().to_string();
 
     let peer = std::thread::spawn(move || {
-        let stream = TcpStream::connect(("127.0.0.1", base)).unwrap();
+        let stream = authenticate_peer_with_root(
+            TcpStream::connect(("127.0.0.1", base)).unwrap(),
+            &session_token,
+        );
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -1935,10 +2202,9 @@ fn fake_lua_hello_then_never_read(
     ready: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 ) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // hello
     write_hello_response(&mut w, &line, &[]);
@@ -1985,10 +2251,9 @@ fn fake_lua_working_flood(
     ready: std::sync::mpsc::Sender<()>,
     stop: std::sync::mpsc::Receiver<()>,
 ) {
-    let stream = TcpStream::connect(addr).unwrap();
+    let stream = connect_peer_after_ready(addr, ready);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
-    ready.send(()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // hello
     write_hello_response(&mut w, &line, &["run_frames"]);
@@ -2052,8 +2317,7 @@ fn tcp_progress_is_typed_and_cancellation_sends_one_exact_abort() {
     let addr = link.local_addr().to_string();
     let (ready, connected) = std::sync::mpsc::channel();
     let h = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
-        ready.send(()).unwrap();
+        let stream = connect_peer_after_ready(addr, ready);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -2148,7 +2412,7 @@ fn tcp_progress_call_clamps_socket_io_to_the_active_recording_deadline() {
     let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let peer = std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_peer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -2196,7 +2460,7 @@ fn tcp_temporal_cancellation_drains_terminal_before_next_call() {
     let control = super::temporal::wire::tests::control();
     let trigger = control.cancellation.clone();
     let worker = std::thread::spawn(move || {
-        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut writer = connect_peer(addr);
         let mut reader = BufReader::new(writer.try_clone().unwrap());
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
@@ -2235,7 +2499,7 @@ fn tcp_parent_deadline_closes_a_partial_reply_without_reconnecting() {
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let worker = std::thread::spawn(move || {
-        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut writer = connect_peer(addr);
         let mut reader = BufReader::new(writer.try_clone().unwrap());
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
@@ -2299,7 +2563,7 @@ fn tcp_temporal_rejection_preserves_attachment_for_cleanup() {
     let addr = link.local_addr().to_string();
     let control = super::temporal::wire::tests::control();
     let worker = std::thread::spawn(move || {
-        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut writer = connect_peer(addr);
         let mut reader = BufReader::new(writer.try_clone().unwrap());
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
@@ -2337,4 +2601,135 @@ fn tcp_temporal_rejection_preserves_attachment_for_cleanup() {
         "frozen"
     );
     worker.join().unwrap();
+}
+
+#[test]
+fn tcp_initial_admission_accepts_valid_peer_alongside_stalled_candidate() {
+    let _env = lock_env();
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(3)).unwrap();
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let addr = link.local_addr().to_string();
+    let silent = connect_peer(&addr);
+    silent
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut silent_reader = BufReader::new(silent);
+    let mut hello = String::new();
+    silent_reader.read_line(&mut hello).unwrap();
+    assert!(hello.contains("hello"));
+    let peer = std::thread::spawn(move || {
+        let stream = connect_peer(addr);
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        write_hello_response(&mut writer, &line, &["status"]);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": request["id"], "ok": true, "result": {"ready":true}})
+        )
+        .unwrap();
+    });
+    let started = std::time::Instant::now();
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["ready"],
+        true
+    );
+    assert!(started.elapsed() < Duration::from_millis(600));
+    peer.join().unwrap();
+    assert_eq!(silent_reader.read_line(&mut String::new()).unwrap(), 0);
+}
+
+#[test]
+fn tcp_rejects_oversized_admission_then_keeps_listening() {
+    let _env = lock_env();
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(3)).unwrap();
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let stream = connect_peer(link.local_addr());
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = stream;
+    reader.read_line(&mut String::new()).unwrap();
+    writer.write_all(&vec![b'x'; 64 * 1024 + 1]).unwrap();
+    assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    // The diagnostic is observable but the admission worker remains live.
+    assert!(link.call("status", serde_json::json!({})).is_err());
+    assert!(!link.preaccept_finished());
+}
+
+#[cfg(unix)]
+#[test]
+fn same_listener_reattach_retires_all_previous_token_candidates() {
+    let _env = SessionEnv::with(None);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let mut link = tcp::bind(&addr.to_string(), Duration::from_secs(3)).unwrap();
+    let port = link.endpoint_port().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    link.set_runtime_store(store.clone());
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let initial_root = link.session_token().unwrap().to_string();
+    let mut peers = Vec::new();
+    for _ in 0..4 {
+        let stream = authenticate_peer_with_root(
+            TcpStream::connect(link.local_addr()).unwrap(),
+            &initial_root,
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        reader.read_line(&mut String::new()).unwrap();
+        peers.push(reader);
+    }
+    let prepared = store.prepare(port).unwrap();
+    let launch_id = prepared.launch_id().to_string();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mednafen".into(),
+            system: "wswan".into(),
+            content: "/games/returned.ws".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(&store, port, &launch_id, None);
+    let started = std::time::Instant::now();
+    link.reattach_runtime(&launch_id).unwrap();
+    for mut reader in peers {
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    }
+    let reattached_root = link.session_token().unwrap().to_string();
+    let stream = authenticate_peer_as(
+        TcpStream::connect(link.local_addr()).unwrap(),
+        &reattached_root,
+        &launch_id,
+    );
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello).unwrap();
+    assert!(hello.contains("hello"));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }

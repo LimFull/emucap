@@ -27,8 +27,12 @@ def main():
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 enum { CORE_RUNNING_CPU, CORE_STEPPING_CPU, CORE_STEPPING_GE };
 static int coreState, resumes, operations;
+static bool parked = true;
+static int parkChecks = 0;
+static bool Core_EmucapMemoryParked() { ++parkChecks; return parked && coreState == CORE_STEPPING_CPU; }
 enum class BreakReason { SavestateLoad, SavestateSave };
 enum class BootState { Complete };
 static BootState PSP_GetBootState() { return BootState::Complete; }
@@ -56,6 +60,10 @@ static void Load(const Path &, int, Callback callback) { ++operations; callback(
 '''
     checks = r'''
 int main() {
+  coreState = CORE_STEPPING_CPU; parked = false;
+  assert(!WaitForLoadedMemoryPark(std::chrono::steady_clock::now()));
+  parked = true;
+  assert(WaitForLoadedMemoryPark(std::chrono::steady_clock::now()));
   for (int initial : {CORE_RUNNING_CPU, CORE_STEPPING_CPU}) {
     coreState = initial; resumes = 0;
     DebuggerRequest request;
@@ -68,6 +76,10 @@ int main() {
   DebuggerRequest save;
   RunSaveStateOperation(save, true, BreakReason::SavestateSave);
   assert(save.responded && coreState == CORE_RUNNING_CPU && resumes == 1);
+  coreState = CORE_STEPPING_CPU; resumes = 0; parkChecks = 0;
+  DebuggerRequest frozenSave;
+  RunSaveStateOperation(frozenSave, true, BreakReason::SavestateSave);
+  assert(frozenSave.responded && coreState == CORE_STEPPING_CPU && resumes == 0 && parkChecks > 0);
   SaveState::result = SaveState::Status::FAILURE;
   coreState = CORE_RUNNING_CPU; resumes = 0;
   DebuggerRequest failure;

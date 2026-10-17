@@ -1,9 +1,11 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6ac1125113..7ecb98f9c1 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -1513,7 +1513,7 @@
- elseif(LOONGARCH64_DEVICE)
- 	# Cross-compiling for loongarch64 currently only builds PPSSPPHeadless, and there's
- 	# no SDL3 available for that target, so skip the desktop SDL frontend entirely.
+@@ -998,7 +998,7 @@ elseif(HEADLESS_CROSS)
+ 	# Headless.cpp keys its no-window path off this too, so the same option serves for
+ 	# any headless-only build without SDL (an x86_64 build on an arm64 Mac, say).
+ 	add_definitions(-DHEADLESS_NO_SDL)
 -else()
 +elseif(SDL_LIB_TARGET)
  	if(GOLD)

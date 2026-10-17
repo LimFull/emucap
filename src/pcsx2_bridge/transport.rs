@@ -1,5 +1,59 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use std::time::Instant;
+
+const AUTH_CHALLENGE_COMMAND: u8 = 0xA0;
+const AUTH_PROOF_COMMAND: u8 = 0xA1;
+const AUTH_NONCE_SIZE: usize = 16;
+const AUTH_PROOF_SIZE: usize = 32;
+const AUTH_TOKEN_MAX: usize = 256;
+const AUTH_DOMAIN: &[u8] = b"emucap-pcsx2-pine-auth-v1";
+
+fn auth_hash_field(hash: &mut Sha256, field: &[u8]) {
+    hash.update((field.len() as u64).to_be_bytes());
+    hash.update(field);
+}
+
+fn auth_hmac(
+    token: &[u8],
+    direction: &[u8],
+    client_nonce: &[u8; AUTH_NONCE_SIZE],
+    server_nonce: &[u8; AUTH_NONCE_SIZE],
+) -> [u8; AUTH_PROOF_SIZE] {
+    let mut key = [0u8; 64];
+    if token.len() > key.len() {
+        key[..AUTH_PROOF_SIZE].copy_from_slice(&Sha256::digest(token));
+    } else {
+        key[..token.len()].copy_from_slice(token);
+    }
+    let mut inner_pad = [0u8; 64];
+    let mut outer_pad = [0u8; 64];
+    for index in 0..key.len() {
+        inner_pad[index] = key[index] ^ 0x36;
+        outer_pad[index] = key[index] ^ 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    auth_hash_field(&mut inner, AUTH_DOMAIN);
+    auth_hash_field(&mut inner, direction);
+    auth_hash_field(&mut inner, client_nonce);
+    auth_hash_field(&mut inner, server_nonce);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
 
 pub trait PineTransport {
     fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>>;
@@ -72,6 +126,9 @@ impl PineSocket {
                 &std::net::SocketAddr::from(([127, 0, 0, 1], slot)),
                 timeout,
             )?;
+            // Receipt exchanges have a short, fixed deadline. Do not let small
+            // control packets wait for TCP's acknowledgement batching.
+            stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
             PineStream::Tcp(stream)
@@ -97,6 +154,67 @@ impl PineSocket {
             io_deadline: None,
         })
     }
+
+    pub fn authenticate_mutual(&mut self, token: &str) -> BridgeResult<()> {
+        if token.is_empty() || token.len() > AUTH_TOKEN_MAX {
+            return Err(Pcsx2BridgeError::BadParams(
+                "EMUCAP_NATIVE_DEBUG_TOKEN must contain 1..=256 bytes".into(),
+            ));
+        }
+        if self.terminal {
+            return Err(Pcsx2BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "PINE transport is terminal",
+            )));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let previous = self.stream.timeouts()?;
+        self.io_deadline = Some(deadline);
+        let outcome = (|| {
+            let client_nonce = ulid::Ulid::generate().to_bytes();
+            let mut challenge = Vec::with_capacity(1 + AUTH_NONCE_SIZE);
+            challenge.push(AUTH_CHALLENGE_COMMAND);
+            challenge.extend_from_slice(&client_nonce);
+            let reply = self.transact(&challenge)?;
+            if reply.len() != AUTH_NONCE_SIZE + AUTH_PROOF_SIZE {
+                return Err(Pcsx2BridgeError::Protocol(format!(
+                    "PINE authentication challenge returned {} bytes",
+                    reply.len()
+                )));
+            }
+            let server_nonce: [u8; AUTH_NONCE_SIZE] = reply[..AUTH_NONCE_SIZE]
+                .try_into()
+                .expect("checked nonce length");
+            let expected = auth_hmac(token.as_bytes(), b"server", &client_nonce, &server_nonce);
+            if !constant_time_equal(&expected, &reply[AUTH_NONCE_SIZE..]) {
+                return Err(Pcsx2BridgeError::Protocol(
+                    "PINE producer authentication failed".into(),
+                ));
+            }
+
+            let proof = auth_hmac(token.as_bytes(), b"client", &client_nonce, &server_nonce);
+            let mut response = Vec::with_capacity(1 + AUTH_PROOF_SIZE);
+            response.push(AUTH_PROOF_COMMAND);
+            response.extend_from_slice(&proof);
+            let acknowledgement = self.transact(&response)?;
+            if !acknowledgement.is_empty() {
+                return Err(Pcsx2BridgeError::Protocol(
+                    "PINE authentication acknowledgement was not empty".into(),
+                ));
+            }
+            Ok(())
+        })();
+        let within_deadline = self.remaining_budget();
+        self.io_deadline = None;
+        let restored = self.stream.set_timeouts(previous.0, previous.1);
+        if outcome.is_err() || within_deadline.is_err() || restored.is_err() {
+            self.terminal = true;
+        }
+        restored?;
+        within_deadline?;
+        outcome
+    }
 }
 
 impl PineTransport for PineSocket {
@@ -113,8 +231,10 @@ impl PineTransport for PineSocket {
                 .checked_add(4)
                 .and_then(|length| u32::try_from(length).ok())
                 .ok_or_else(|| Pcsx2BridgeError::BadParams("PINE request is too large".into()))?;
-            self.write_packet_bytes(&packet_len.to_le_bytes())?;
-            self.write_packet_bytes(request)?;
+            let mut packet = Vec::with_capacity(packet_len as usize);
+            packet.extend_from_slice(&packet_len.to_le_bytes());
+            packet.extend_from_slice(request);
+            self.write_packet_bytes(&packet)?;
             self.stream.flush()?;
 
             let mut header = [0u8; 5];
@@ -194,6 +314,14 @@ impl PineStream {
         r?;
         w
     }
+    #[cfg(windows)]
+    fn wait_readable(&self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => {
+                crate::windows_socket::wait_readable(stream, timeout, "PCSX2 PINE")
+            }
+        }
+    }
 }
 impl PineSocket {
     fn remaining_budget(&self) -> std::io::Result<Option<Duration>> {
@@ -218,6 +346,19 @@ impl PineSocket {
     }
     fn read_packet_bytes(&mut self, mut bytes: &mut [u8]) -> std::io::Result<()> {
         while !bytes.is_empty() {
+            #[cfg(windows)]
+            {
+                let timeout = self
+                    .remaining_budget()?
+                    .or(self.stream.timeouts()?.0)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "PINE read has no finite timeout",
+                        )
+                    })?;
+                self.stream.wait_readable(timeout)?;
+            }
             self.prepare_io()?;
             match self.stream.read(bytes) {
                 Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
@@ -242,6 +383,6 @@ impl PineSocket {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "transport_tests.rs"]
 mod tests;

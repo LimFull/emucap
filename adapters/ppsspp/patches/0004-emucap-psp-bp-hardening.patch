@@ -1,10 +1,10 @@
-diff --git c/Core/Debugger/WebSocket/GameSubscriber.cpp w/Core/Debugger/WebSocket/GameSubscriber.cpp
-index 7fc0261efb..84b6b11a0e 100644
---- c/Core/Debugger/WebSocket/GameSubscriber.cpp
-+++ w/Core/Debugger/WebSocket/GameSubscriber.cpp
-@@ -50,27 +50,34 @@ void WebSocketGameReset(DebuggerRequest &req) {
- 	if (needBreak)
- 		PSP_CoreParameter().startBreak = true;
+diff --git a/Core/Debugger/WebSocket/GameSubscriber.cpp b/Core/Debugger/WebSocket/GameSubscriber.cpp
+index 3f38b8d0fe..c77146cd5b 100644
+--- a/Core/Debugger/WebSocket/GameSubscriber.cpp
++++ b/Core/Debugger/WebSocket/GameSubscriber.cpp
+@@ -90,19 +90,32 @@ void WebSocketGameReset(DebuggerRequest &req) {
+ 	if (!running)
+ 		return req.Fail("Game not running");
  
 -	// emucap: snapshot the completed-reset generation *before* requesting, so a reset that finishes
 -	// between here and the wait below is still observed (the wait predicate is already satisfied).
@@ -21,22 +21,18 @@ index 7fc0261efb..84b6b11a0e 100644
  	// and we are not on it here.
  	System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
  
--	// emucap: in headless the reset runs on the emu-thread run loop (there is no UI message pump).
--	// Block until that reboot actually completes so the client's ack means "rebooted", not merely
--	// "reset queued" — otherwise game.reset would look successful while nothing happened. The reboot's
+-	// Wait outside the CPU queue so the run loop can perform and acknowledge reboot.
 +	// emucap: block until this ticket's reboot actually completes so the client's ack means "rebooted"
 +	// (and reflects whether it succeeded), not merely "reset queued" — otherwise game.reset would look
 +	// successful while nothing happened or while the reboot failed and the core stopped. The reboot's
- 	// PSP_Shutdown takes the WS lifecycle lock (its STOPPING notification), which the dispatch is
- 	// holding for us right now, so we drop it for the wait and reacquire before returning (else the
- 	// blocked handler would deadlock the reboot). No-op in GUI builds — the mode is never enabled and
- 	// the UI pump handles the reset itself.
++	// PSP_Shutdown takes the WS lifecycle lock (its STOPPING notification), which the dispatch is
++	// holding for us right now, so we drop it for the wait and reacquire before returning (else the
++	// blocked handler would deadlock the reboot). No-op in GUI builds — the mode is never enabled and
++	// the UI pump handles the reset itself.
  	if (Core_HeadlessResetMode()) {
- 		WebSocketReleaseLifecycleLock();
 -		bool completed = Core_WaitHeadlessReset(resetGen, 30.0);
 +		bool rebooted = false;
 +		bool completed = Core_WaitHeadlessReset(resetTicket, 30.0, &rebooted);
- 		WebSocketReacquireLifecycleLock();
  		if (!completed)
  			return req.Fail("Reset timed out waiting for the headless reboot to complete");
 +		if (!rebooted)
@@ -44,11 +40,11 @@ index 7fc0261efb..84b6b11a0e 100644
  	}
  
  	req.Respond();
-diff --git c/Core/System.cpp w/Core/System.cpp
-index 4333b8e9fb..8374f11325 100644
---- c/Core/System.cpp
-+++ w/Core/System.cpp
-@@ -31,6 +31,8 @@
+diff --git a/Core/System.cpp b/Core/System.cpp
+index a4a93ad5af..da569bfbf2 100644
+--- a/Core/System.cpp
++++ b/Core/System.cpp
+@@ -32,6 +32,8 @@
  #include <condition_variable>
  #include <chrono>
  #include <cstdint>
@@ -57,7 +53,7 @@ index 4333b8e9fb..8374f11325 100644
  
  #include "ext/lua/lapi.h"
  
-@@ -789,15 +791,20 @@ void PSP_Shutdown(bool success) {
+@@ -944,15 +946,20 @@ void PSP_Shutdown(bool success) {
  	IncrementDebugCounter(DebugCounter::GAME_SHUTDOWN);
  }
  
@@ -83,7 +79,7 @@ index 4333b8e9fb..8374f11325 100644
  }  // namespace
  
  void Core_EnableHeadlessResetMode() {
-@@ -810,40 +817,47 @@ bool Core_HeadlessResetMode() {
+@@ -965,40 +972,47 @@ bool Core_HeadlessResetMode() {
  	return g_headlessResetMode;
  }
  
@@ -148,10 +144,10 @@ index 4333b8e9fb..8374f11325 100644
  }
  
  void PSP_RunLoopWhileState() {
-diff --git c/Core/System.h w/Core/System.h
-index d6e08dde6c..d4dfe6c2c0 100644
---- c/Core/System.h
-+++ w/Core/System.h
+diff --git a/Core/System.h b/Core/System.h
+index ec0fa56ec6..4a0c9117a1 100644
+--- a/Core/System.h
++++ b/Core/System.h
 @@ -82,17 +82,19 @@ void PSP_Shutdown(bool success);
  
  // emucap headless reset coordination. A host with no UI message pump (the headless run loop)
@@ -181,19 +177,14 @@ index d6e08dde6c..d4dfe6c2c0 100644
  
  FileLoader *PSP_LoadedFile();
  
-diff --git c/Core/WebServer.cpp w/Core/WebServer.cpp
-index a44f64db4d..31b9e7423f 100644
---- c/Core/WebServer.cpp
-+++ w/Core/WebServer.cpp
-@@ -767,12 +767,16 @@ static void WebServerThread() {
+diff --git a/Core/WebServer.cpp b/Core/WebServer.cpp
+index 9eea648b86..03a068285f 100644
+--- a/Core/WebServer.cpp
++++ b/Core/WebServer.cpp
+@@ -828,7 +828,16 @@ static void WebServerThread() {
  	http->RegisterHandler("/debugger", &ForwardDebuggerRequest);
  	http->RegisterHandler("/upload_file", &HandleUploadPost);
  
--	// emucap: when this web server exists only to serve the debugger control channel (no LAN disc
--	// sharing requested), bind loopback only. Otherwise the debugger — which can memory.read/write
--	// and, via the fork's savestate.save with a host path, write arbitrary files — is reachable
--	// unauthenticated from any host on the network. Disc sharing (DISCS) legitimately needs the LAN,
--	// so it keeps the all-interfaces bind.
 -	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) && !(serverFlags & WebServerFlags::DISCS);
 +	// emucap: whenever the debugger control channel is served, bind this shared HTTP server loopback
 +	// only. The debugger can memory.read/write and, via the fork's savestate.save with a host path,
@@ -206,13 +197,13 @@ index a44f64db4d..31b9e7423f 100644
 +	// only ever enables DEBUGGER (headless main), so disc sharing is moot here; this is defense in depth.
 +	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) != 0;
  	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
- 		if (!http->Listen(0, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
- 			ERROR_LOG(Log::FileSystem, "Unable to listen on any port (debugger - webserver)");
-diff --git c/headless/Headless.cpp w/headless/Headless.cpp
-index 44e996f6a1..304b2b4b1e 100644
---- c/headless/Headless.cpp
-+++ w/headless/Headless.cpp
-@@ -98,11 +98,9 @@ bool System_GetPropertyBool(SystemProperty prop) {
+ 		if (serverRequireExactPort) {
+ 			// Someone asked for this specific port (--debugger=PORT) - see
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+index 6a7cd3eead..27f6ceeecf 100644
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -148,11 +148,9 @@ bool System_GetPropertyBool(SystemProperty prop) {
  void System_Notify(SystemNotification notification) {}
  void System_PostUIMessage(UIMessage message, std::string_view param) {
  	// emucap: headless has no UI message pump, so the GUI's REQUEST_GAME_RESET path never runs and
@@ -226,8 +217,8 @@ index 44e996f6a1..304b2b4b1e 100644
 +	// nothing (enqueuing here too would double-run the reset for one request).
  }
  void System_RunOnMainThread(std::function<void()>) {}
- bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
-@@ -258,7 +256,8 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+ std::vector<std::string> System_GetCameraDeviceList() { return std::vector<std::string>(); }
+@@ -545,7 +543,8 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
  		// the reboot here on the emu thread — the same PSP_Shutdown + re-init the GUI does — then
  		// signal the waiting game.reset ack. Breakpoints live in g_breakpoints (WS-side) and survive
  		// the reset; the next g_breakpoints.Frame() re-arms them against the freshly booted code.
@@ -237,7 +228,7 @@ index 44e996f6a1..304b2b4b1e 100644
  			// End the current host frame on the old GPU before PSP_Shutdown destroys it.
  			if (gpu) {
  				gpu->EndHostFrame();
-@@ -287,9 +286,10 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+@@ -576,9 +575,10 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
  				fprintf(stderr, "headless reset failed to reboot: %s\n", reset_error.c_str());
  				Core_Stop();
  			}

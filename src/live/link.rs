@@ -197,6 +197,26 @@ impl FeatureCapabilities {
                 "flycast-patch-required: hello lacks native_renderer_fence; rebuild the maintained Flycast adapter".into(),
             ));
         }
+        let scoped_input = hello
+            .get("host_features")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|v| v == "scoped_controller_input"));
+        let scoped_input_ready = ["set_input", "cancel_operation"]
+            .iter()
+            .all(|required| methods.iter().any(|m| m == required))
+            && methods
+                .iter()
+                .any(|m| m == "step" || m == "step_input_polls")
+            && hello
+                .pointer("/input_axes/semantics")
+                .and_then(Value::as_str)
+                == Some("complete_persistent_controller_state");
+        if scoped_input && !scoped_input_ready {
+            return Err(LinkError::Protocol(
+                "scoped_controller_input requires controller axes and owned advance cancellation"
+                    .into(),
+            ));
+        }
         let advertised = |method: &str| methods.iter().any(|name| name == method);
         let paired = |method: &str, field: &str| match (advertised(method), hello.get(field)) {
             (true, Some(value)) => Ok(Some(value)),
@@ -458,7 +478,7 @@ pub trait EmulatorLink {
     fn endpoint_port(&self) -> Option<u16> {
         None
     }
-    /// 이 MCP 세션의 direct-mode guard token. status가 launcher env로 안내한다.
+    /// Producer-facing capability for launcher environments; never a broker controller secret.
     fn session_token(&self) -> Option<&str> {
         None
     }

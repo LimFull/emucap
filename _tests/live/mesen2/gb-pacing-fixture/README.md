@@ -9,7 +9,7 @@ The cartridge clears VRAM with LCD disabled, enables a blank tile background,
 and busy-polls LY. At each VBlank it increments the u16 field counter at `0xc100`
 and, when A is held, the u16 input counter at `0xc102`. It alternates the background
 color every two fields. Interrupts stay disabled and the loop never uses HALT.
-The expected tap deltas are `(press_frames + 1 + after_frames, press_frames)`,
+The expected tap deltas are `(press_frames + after_frames, press_frames)`,
 modulo 65536. No-input control leaves the input counter unchanged.
 
 ```sh

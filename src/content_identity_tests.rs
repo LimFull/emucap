@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn content_path_binding_uses_the_existing_filesystem_referent() {
+    let directory = tempfile::tempdir().unwrap();
+    let content = directory.path().join("game.rom");
+    let other = directory.path().join("other.rom");
+    std::fs::write(&content, b"game").unwrap();
+    std::fs::write(&other, b"other").unwrap();
+    let alternate = directory.path().join(".").join("game.rom");
+
+    assert!(same_content_path(
+        content.to_str().unwrap(),
+        alternate.to_str().unwrap()
+    ));
+    assert!(!same_content_path(
+        content.to_str().unwrap(),
+        other.to_str().unwrap()
+    ));
+    assert!(!same_content_path(
+        content.to_str().unwrap(),
+        directory.path().join("missing.rom").to_str().unwrap()
+    ));
+}
+
+#[test]
 fn cue_identity_changes_when_a_referenced_track_changes() {
     let directory = tempfile::tempdir().unwrap();
     let cue = directory.path().join("disc.cue");
@@ -226,6 +249,51 @@ fn approved_cue_can_establish_its_exact_identity() {
             .unwrap()
             .unwrap();
     assert_eq!(identity.members.len(), 2);
+}
+
+#[test]
+fn approved_graph_is_staged_with_the_same_identity_and_independent_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let cue = directory.path().join("disc.cue");
+    let track = directory.path().join("track.bin");
+    std::fs::write(&track, b"track bytes").unwrap();
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
+    let identity = identify_composite_content_for_adapter(&cue, Some("flycast"))
+        .unwrap()
+        .unwrap();
+    let staged_root = directory.path().join("generation-media");
+
+    let staged =
+        stage_verified_composite_content(&cue, "flycast", &identity, &staged_root).unwrap();
+
+    assert_eq!(
+        identify_composite_content_for_adapter(&staged, Some("flycast"))
+            .unwrap()
+            .as_ref(),
+        Some(&identity)
+    );
+    std::fs::write(&track, b"source changed later").unwrap();
+    assert_eq!(
+        std::fs::read(staged_root.join("track.bin")).unwrap(),
+        b"track bytes"
+    );
+}
+
+#[test]
+fn staging_rejects_a_graph_changed_after_identity_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let cue = directory.path().join("disc.cue");
+    let track = directory.path().join("track.bin");
+    std::fs::write(&track, b"first").unwrap();
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
+    let identity = identify_composite_content_for_adapter(&cue, Some("flycast"))
+        .unwrap()
+        .unwrap();
+    std::fs::write(&track, b"second").unwrap();
+    let staged_root = directory.path().join("generation-media");
+
+    assert!(stage_verified_composite_content(&cue, "flycast", &identity, &staged_root).is_err());
+    assert!(!staged_root.exists());
 }
 
 #[test]

@@ -85,9 +85,6 @@ impl Np2kaiHost {
         if let Some(name) = &self.name {
             object.insert("name".into(), json!(name));
         }
-        if let Some(token) = &self.session_token {
-            object.insert("session_token".into(), json!(token));
-        }
         if let Some(launch_id) = &self.launch_id {
             object.insert("launch_id".into(), json!(launch_id));
         }
@@ -311,11 +308,7 @@ impl Np2kaiHost {
         self.ensure_initialized()?;
         let path = absolute_path_param(params, "path")?;
         let size = unsafe { (self.api.serialize_size)() };
-        if size == 0 {
-            return Err(Np2kaiError::Core(
-                "NP2kai reported a zero serialization size".into(),
-            ));
-        }
+        validate_serialization_size(size)?;
         let mut data = vec![0_u8; size];
         if !unsafe { (self.api.serialize)(data.as_mut_ptr().cast(), data.len()) } {
             return Err(Np2kaiError::Core("retro_serialize failed".into()));
@@ -338,11 +331,9 @@ impl Np2kaiHost {
         self.require_frozen("load_state")?;
         self.ensure_initialized()?;
         let path = absolute_path_param(params, "path")?;
-        let data = fs::read(&path)?;
-        if data.is_empty() {
-            return Err(Np2kaiError::BadParams("state file is empty".into()));
-        }
-        let identity: StateIdentity = serde_json::from_slice(&fs::read(state_sidecar(&path))?)?;
+        // Native state size varies with device state. Admission is bounded by the
+        // format limit and exact saved-byte identity, not a new save of the live guest.
+        let (data, identity) = read_state_artifacts(&path, MAX_STATE_BYTES)?;
         let expected = self.state_identity(hex::encode(Sha256::digest(&data)));
         if identity != expected {
             return Err(Np2kaiError::BadParams("save state identity does not match this exact PC-98 media, firmware, core, patch, profile, frontend build, OS, and architecture".into()));
@@ -459,4 +450,45 @@ impl Np2kaiHost {
             state_sha256,
         }
     }
+}
+
+fn validate_serialization_size(size: usize) -> Np2kaiResult<u64> {
+    let size = size as u64;
+    if size == 0 {
+        return Err(Np2kaiError::Core(
+            "NP2kai reported a zero serialization size".into(),
+        ));
+    }
+    if size > MAX_STATE_BYTES {
+        return Err(Np2kaiError::Core(format!(
+            "NP2kai serialization size exceeds {MAX_STATE_BYTES} bytes"
+        )));
+    }
+    Ok(size)
+}
+
+pub(super) fn read_state_artifacts(
+    path: &Path,
+    max_size: u64,
+) -> Np2kaiResult<(Vec<u8>, StateIdentity)> {
+    if max_size == 0 || max_size > MAX_STATE_BYTES {
+        return Err(Np2kaiError::BadParams(
+            "invalid NP2kai state size limit".into(),
+        ));
+    }
+    let data = crate::path_safety::read_bounded_regular_file_no_follow(path, max_size)
+        .map_err(|error| Np2kaiError::BadParams(format!("invalid NP2kai state file: {error}")))?;
+    if data.is_empty() {
+        return Err(Np2kaiError::BadParams("empty NP2kai state file".into()));
+    }
+    let sidecar_path = state_sidecar(path);
+    let sidecar = crate::path_safety::read_bounded_regular_file_no_follow(
+        &sidecar_path,
+        MAX_STATE_SIDECAR_BYTES,
+    )
+    .map_err(|error| Np2kaiError::BadParams(format!("invalid NP2kai state sidecar: {error}")))?;
+    let identity = serde_json::from_slice(&sidecar).map_err(|error| {
+        Np2kaiError::BadParams(format!("invalid NP2kai state sidecar: {error}"))
+    })?;
+    Ok((data, identity))
 }

@@ -78,7 +78,7 @@ fn cancellation_preserves_partial_progress_and_waits_for_finish() {
         token.cancelled_at().map(|t| t + STOP_BUDGET)
     );
     assert!(b.pine.replies.is_empty() && !b.backend_terminal());
-    assert!(b.pine.budgets.iter().all(|n| *n <= FRAME_EXCHANGE));
+    assert!(b.pine.budgets.iter().all(|n| *n <= PINE_EXCHANGE));
 }
 #[test]
 fn completion_wins_cancellation_and_does_not_drain_breakpoint_events() {
@@ -100,6 +100,17 @@ fn completion_wins_cancellation_and_does_not_drain_breakpoint_events() {
         "external_pause_or_debugger_stop"
     );
     assert!(b.pine.replies.is_empty());
+}
+#[test]
+fn host_scheduling_delay_within_the_exchange_budget_keeps_control_verified() {
+    let mut b = bridge(vec![
+        (BEGIN, receipt(1, 3, 2, 2, 0)),
+        (FINISH, receipt(1, 5, 2, 2, 0)),
+    ]);
+    b.pine.delay = Duration::from_millis(80);
+    assert_eq!(b.owned_frame_step(2).unwrap()["status"], "completed");
+    assert!(b.pine.replies.is_empty() && !b.backend_terminal());
+    assert!(b.pine.budgets.iter().all(|n| *n <= PINE_EXCHANGE));
 }
 #[test]
 fn stale_identity_counter_and_terminal_rewrites_retire_without_finishing_foreign_work() {
@@ -149,16 +160,25 @@ fn pause_proves_unwind_without_a_frame_begin() {
     assert!(b.pine.replies.is_empty() && !b.backend_terminal());
 }
 #[test]
-fn expired_cleanup_and_late_receipt_cannot_renew_control() {
+fn expired_cleanup_and_late_exchange_cannot_renew_control() {
     let mut b = bridge(vec![]);
     assert!(
         b.verify_owned_pause(Instant::now() - Duration::from_millis(1))
             .is_err()
             && b.backend_terminal()
     );
-    let mut b = bridge(vec![(BEGIN, receipt(1, 3, 2, 2, 0))]);
-    b.pine.delay = FRAME_EXCHANGE + Duration::from_millis(10);
-    assert!(b.owned_frame_step(2).is_err() && b.backend_terminal());
+    let mut b = bridge(vec![(PROTOCOL, vec![])]);
+    b.pine.delay = Duration::from_millis(30);
+    let error = b
+        .bounded_command(
+            PROTOCOL,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("PINE opcode 0x98 exchange"));
+    assert!(b.backend_terminal());
     assert!(b.pine.replies.is_empty());
 }
 #[test]
@@ -245,5 +265,43 @@ fn unscoped_commands_keep_normal_transport_budget_and_cleanup_can_run_after_canc
         b.native_stop_deadline,
         token.cancelled_at().map(|t| t + STOP_BUDGET)
     );
+    assert!(!b.backend_terminal());
+}
+
+#[test]
+fn parent_scoped_cpu_thread_command_uses_the_transport_exchange_budget() {
+    use crate::live::control_session::{Attachment, EventKind, SessionEvent};
+    use crate::live::reconnect::cancellation::OperationKey;
+
+    let mut b = bridge(vec![(MSG_EMUCAP_SET_INPUT, vec![])]);
+    b.launch_id = Some("runtime".into());
+    let attachment = Attachment {
+        broker_instance: "broker".into(),
+        registration: 1,
+        session: 1,
+    };
+    b.apply_control_session(SessionEvent {
+        runtime: "runtime".into(),
+        attachment: attachment.clone(),
+        kind: EventKind::Attach,
+    })
+    .unwrap();
+    b.begin_temporal_operation(
+        &attachment,
+        OperationKey {
+            runtime: "runtime".into(),
+            owner_id: "owner".into(),
+            operation_id: "parent".into(),
+        },
+    )
+    .unwrap();
+    b.pine.delay = Duration::from_millis(600);
+
+    b.command(MSG_EMUCAP_SET_INPUT, &0u32.to_le_bytes())
+        .unwrap();
+
+    assert_eq!(b.pine.budgets.len(), 1);
+    assert!(b.pine.budgets[0] > Duration::from_millis(500));
+    assert!(b.pine.budgets[0] <= PINE_EXCHANGE);
     assert!(!b.backend_terminal());
 }

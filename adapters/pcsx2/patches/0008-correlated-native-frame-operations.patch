@@ -1,313 +1,8 @@
---- a/pcsx2/PINE.cpp
-+++ b/pcsx2/PINE.cpp
-@@ -15,6 +15,7 @@
- #include "SIO/Pad/Pad.h"
- #include "SIO/Sio.h"
- #include "PINE.h"
-+#include "EmuCapFrameOperation.h"
- #include "VMManager.h"
- #include "Counters.h"
- #include "common/Error.h"
-@@ -211,6 +212,12 @@
- 		MsgEmuCapPacing = 0x95, /**< Returns the agent pacing readback and the frame counter. */
- 		MsgEmuCapSetPacing = 0x96, /**< Sets a percent of the guest rate, or 0 for unlimited. */
- 		MsgEmuCapMemoryBatch = 0x97, /**< One frozen EE RAM acquisition. */
-+		MsgEmuCapFrameProtocol = 0x98,
-+		MsgEmuCapFrameBegin = 0x99,
-+		MsgEmuCapFramePoll = 0x9A,
-+		MsgEmuCapFrameCancel = 0x9B,
-+		MsgEmuCapFrameFinish = 0x9C,
-+		MsgEmuCapOwnedPause = 0x9D,
- 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
- 	};
- 
-@@ -298,7 +305,9 @@
- 	template <typename T>
- 	static T FromSpan(std::span<u8> span, int i)
- 	{
--		return *(T*)(&span[i]);
-+		T value;
-+		std::memcpy(&value, &span[i], sizeof(value));
-+		return value;
- 	}
- 
- 	/**
-@@ -311,14 +320,70 @@
- 				 (reply_len + reply_size) >= MAX_IPC_RETURN_SIZE);
- 	}
- 
-+	static EmuCap::FrameOperations s_frame_operations;
-+	struct EmuCapFrameHost
-+	{
-+		EmuCap::FrameOperations::Clock::time_point Now() const { return EmuCap::FrameOperations::Clock::now(); }
-+		bool Valid() const { return VMManager::HasValidVM(); }
-+		bool Paused() const { return VMManager::GetState() == VMState::Paused; }
-+		bool Running() const { return VMManager::GetState() == VMState::Running; }
-+		bool Parked() const { return VMManager::IsEmucapExecutionParkedOnCPUThread(); }
-+		u64 Frame() const { return VMManager::GetEmucapFrameBoundaryCount(); }
-+		u64 Epoch() const { return VMManager::GetEmucapMemoryEpoch(); }
-+		u32 Remaining() const { return VMManager::GetEmucapFrameAdvanceRemaining(); }
-+		void ClearTarget() { VMManager::CancelFrameAdvance(); }
-+		void Start(u32 count) { VMManager::FrameAdvance(count); }
-+		void Pause() { VMManager::SetPaused(true); }
-+	};
-+
-+	static void ServiceEmuCapFrame(const EmuCap::FrameOperations::Ticket& ticket)
-+	{
-+		EmuCapFrameHost host;
-+		s_frame_operations.Service(host, ticket);
-+	}
-+
-+	void ServiceEmuCapFrameOnCPUThread()
-+	{
-+		ServiceEmuCapFrame({});
-+	}
-+
-+	void InvalidateEmuCapFrameOnCPUThread()
-+	{
-+		s_frame_operations.Invalidate();
-+	}
-+
-+	static void QueueEmuCapFrameService(const EmuCap::FrameOperations::Ticket& ticket)
-+	{
-+		Host::RunOnCPUThread([ticket]() { ServiceEmuCapFrame(ticket); }, false);
-+	}
-+
-+	static bool WriteEmuCapFrameReceipt(const EmuCap::FrameOperations::Ticket& ticket,
-+		std::vector<u8>& buffer, u32& offset)
-+	{
-+		EmuCap::FrameReceipt receipt;
-+		if (!s_frame_operations.Read(ticket, receipt)) return false;
-+		ToResultVector(buffer, receipt.id, offset);
-+		ToResultVector(buffer, receipt.generation, offset + 8);
-+		ToResultVector(buffer, receipt.start, offset + 16);
-+		ToResultVector(buffer, receipt.end, offset + 24);
-+		ToResultVector(buffer, receipt.requested, offset + 32);
-+		ToResultVector(buffer, receipt.count, offset + 36);
-+		ToResultVector(buffer, static_cast<u32>(receipt.phase), offset + 40);
-+		ToResultVector(buffer, static_cast<u32>(receipt.reason), offset + 44);
-+		offset += 48;
-+		return true;
-+	}
-+
- 	static void ClearEmuCapState()
- 	{
-+		const auto ticket = s_frame_operations.Detach();
- 		if (!VMManager::HasValidVM())
- 		{
- 			s_emucap_breakpoints.clear();
- 			return;
- 		}
--		Host::RunOnCPUThread([]() {
-+		Host::RunOnCPUThread([ticket]() {
-+			ServiceEmuCapFrame(ticket);
- 			for (const EmuCapBreakpoint& breakpoint : s_emucap_breakpoints)
- 			{
- 				if (breakpoint.kind == 0)
-@@ -738,7 +803,15 @@
- 		//        |  return value (VLE)
- 		//        |  |
- 		// reply: XX ZZ ZZ ZZ ZZ
--		switch ((IPCCommand)buf[buf_cnt - 1])
-+		const auto command = static_cast<IPCCommand>(buf[buf_cnt - 1]);
-+		// The socket remains responsive, but legacy mutations/CPU dispatch cannot
-+		// interleave with an owned frame operation or consume its breakpoint hits.
-+		if (s_frame_operations.OwnsExecution() && command != MsgEmuCapVersion &&
-+			command != MsgStatus && command != MsgEmuCapFrameProtocol &&
-+			command != MsgEmuCapFramePoll && command != MsgEmuCapFrameCancel &&
-+			command != MsgEmuCapFrameFinish)
-+			goto error;
-+		switch (command)
- 		{
- 			case MsgRead8:
- 			{
-@@ -963,6 +1036,54 @@
- 					goto error;
- 				ToResultVector(ret_buffer, static_cast<u32>(EMUCAP_HOST_API), ret_cnt);
- 				ret_cnt += 4;
-+				break;
-+			}
-+			case MsgEmuCapFrameProtocol:
-+			{
-+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16, buf_size)) goto error;
-+				ToResultVector(ret_buffer, 1u, ret_cnt); // extension revision
-+				ToResultVector(ret_buffer, 1u, ret_cnt + 4); // CPU VSync-start domain
-+				ToResultVector(ret_buffer, 5000u, ret_cnt + 8);
-+				ToResultVector(ret_buffer, 250000u, ret_cnt + 12);
-+				ret_cnt += 16;
-+				break;
-+			}
-+			case MsgEmuCapOwnedPause:
-+			{
-+				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 48, buf_size)) goto error;
-+				const auto ticket = s_frame_operations.BeginPause(FromSpan<u32>(buf, buf_cnt),
-+					EmuCap::FrameOperations::Clock::now());
-+				buf_cnt += 4;
-+				if (!ticket) goto error;
-+				QueueEmuCapFrameService(ticket);
-+				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
-+				break;
-+			}
-+			case MsgEmuCapFrameBegin:
-+			{
-+				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 48, buf_size)) goto error;
-+				const auto ticket = s_frame_operations.Begin(FromSpan<u32>(buf, buf_cnt),
-+					FromSpan<u32>(buf, buf_cnt + 4), EmuCap::FrameOperations::Clock::now());
-+				buf_cnt += 8;
-+				if (!ticket) goto error;
-+				QueueEmuCapFrameService(ticket);
-+				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
-+				break;
-+			}
-+			case MsgEmuCapFramePoll:
-+			case MsgEmuCapFrameCancel:
-+			case MsgEmuCapFrameFinish:
-+			{
-+				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 48, buf_size)) goto error;
-+				const auto ticket = s_frame_operations.Find(FromSpan<u64>(buf, buf_cnt));
-+				buf_cnt += 8;
-+				if (!ticket) goto error;
-+				if (command == MsgEmuCapFrameCancel && !s_frame_operations.Cancel(ticket)) goto error;
-+				if (command == MsgEmuCapFrameFinish && !s_frame_operations.Finish(ticket)) goto error;
-+				// Polling is read-only. Native scheduler ticks settle progress/deadlines
-+				// even when the client stops sending queries.
-+				if (command != MsgEmuCapFramePoll) QueueEmuCapFrameService(ticket);
-+				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
- 				break;
- 			}
- 			case MsgEmuCapPause:
---- a/pcsx2/PINE.h
-+++ b/pcsx2/PINE.h
-@@ -14,6 +14,9 @@
- 
- namespace PINEServer
- {
-+	void ServiceEmuCapFrameOnCPUThread();
-+	void InvalidateEmuCapFrameOnCPUThread();
-+
- 	bool IsInitialized();
- 	int GetSlot();
- 
---- a/pcsx2/VMManager.cpp
-+++ b/pcsx2/VMManager.cpp
-@@ -181,6 +181,7 @@
- static std::string s_elf_override;
- static std::string s_input_profile_name;
- static u32 s_frame_advance_count = 0;
-+static u64 s_emucap_frame_boundary_count = 0;
- static bool s_fast_boot_requested = false;
- static bool s_gs_open_on_initialize = false;
- static bool s_thread_affinities_set = false;
-@@ -1335,6 +1336,7 @@
- 	// (or make it thread-local, but that seems silly.)
- 	Host::CancelGameListRefresh();
- 
-+	PINEServer::InvalidateEmuCapFrameOnCPUThread();
- 	s_state.store(VMState::Initializing, std::memory_order_release);
- 	s_vm_thread_handle = Threading::ThreadHandle::GetForCallingThread();
- 	Host::OnVMStarting();
-@@ -1625,6 +1627,7 @@
- 
- void VMManager::Shutdown(bool save_resume_state)
- {
-+	PINEServer::InvalidateEmuCapFrameOnCPUThread();
- 	// we'll probably already be stopping (this is how Qt calls shutdown),
- 	// but just in case, so any of the stuff we call here knows we don't have a valid VM.
- 	s_state.store(VMState::Stopping, std::memory_order_release);
-@@ -1722,6 +1725,7 @@
- 
- void VMManager::Reset(bool force)
- {
-+	PINEServer::InvalidateEmuCapFrameOnCPUThread();
- 	++s_emucap_memory_epoch;
- 	pxAssert(HasValidVM());
- 
-@@ -1855,6 +1859,7 @@
- 
- bool VMManager::DoLoadState(const char* filename, Error* error)
- {
-+	PINEServer::InvalidateEmuCapFrameOnCPUThread();
- 	++s_emucap_memory_epoch;
- 	if (GSDumpReplayer::IsReplayingDump())
- 	{
-@@ -2284,6 +2289,7 @@
- 			break;
- 		Threading::Sleep(static_cast<int>(std::min<s64>(msec - 1, 10)));
- 		Host::PumpMessagesOnCPUThread();
-+		PINEServer::ServiceEmuCapFrameOnCPUThread();
- 		if (IsExecutionInterrupted() || s_limiter_restarted)
- 			return;
- 	}
-@@ -2302,6 +2308,9 @@
- {
- 	UpdateTargetSpeed();
- }
-+
-+u64 VMManager::GetEmucapFrameBoundaryCount() { return s_emucap_frame_boundary_count; }
-+u32 VMManager::GetEmucapFrameAdvanceRemaining() { return s_frame_advance_count; }
- 
- u32 VMManager::CancelFrameAdvance()
- {
-@@ -2754,6 +2763,10 @@
- 
- void VMManager::Execute()
- {
-+	// Qt processes queued CPU commands after selecting its Running branch.
-+	// A command may have parked the VM before this stale branch reaches Execute.
-+	if (GetState() != VMState::Running)
-+		return;
- 	++s_emucap_execution_depth;
- 	ScopedGuard emucap_execution = [] { --s_emucap_execution_depth; };
- 	// Check for interpreter<->recompiler switches.
-@@ -2765,12 +2778,16 @@
- 		vtlb_ResetFastmem();
- 	}
- 
--	// Execute until we're asked to stop.
--	Cpu->Execute();
-+	// Execute until we're asked to stop; setup callbacks may also have paused.
-+	if (GetState() == VMState::Running)
-+		Cpu->Execute();
-+	emucap_execution.Run();
-+	PINEServer::ServiceEmuCapFrameOnCPUThread();
- }
- 
- void VMManager::IdlePollUpdate()
- {
-+	PINEServer::ServiceEmuCapFrameOnCPUThread();
- 	Achievements::IdleUpdate();
- 
- 	PollDiscordPresence();
-@@ -2909,6 +2926,7 @@
- 
- void VMManager::Internal::VSyncOnCPUThread()
- {
-+	++s_emucap_frame_boundary_count;
- 	Pad::UpdateMacroButtons();
- 
- 	Patch::ApplyVsyncPatches();
-@@ -2932,6 +2950,7 @@
- 
- void VMManager::Internal::PollInputOnCPUThread()
- {
-+	PINEServer::ServiceEmuCapFrameOnCPUThread();
- 	Host::PumpMessagesOnCPUThread();
- 	InputManager::PollSources();
- 
---- a/pcsx2/VMManager.h
-+++ b/pcsx2/VMManager.h
-@@ -216,6 +216,9 @@
- 
- 	/// Runs the virtual machine for the specified number of video frames, and then automatically pauses.
- 	// CPU-thread only. Discard pending advance so later resume cannot consume stale work.
-+	// CPU-thread-only VSync-start clock and active target progress.
-+	u64 GetEmucapFrameBoundaryCount();
-+	u32 GetEmucapFrameAdvanceRemaining();
- 	u32 CancelFrameAdvance();
- 	void FrameAdvance(u32 num_frames = 1);
- 
+diff --git c/pcsx2/EmuCapFrameOperation.h i/pcsx2/EmuCapFrameOperation.h
+new file mode 100644
+index 0000000..f3b5ed4
 --- /dev/null
-+++ b/pcsx2/EmuCapFrameOperation.h
++++ i/pcsx2/EmuCapFrameOperation.h
 @@ -0,0 +1,256 @@
 +// SPDX-License-Identifier: GPL-3.0+
 +#pragma once
@@ -565,3 +260,319 @@
 +	bool m_servicing = false; // CPU thread only.
 +};
 +} // namespace EmuCap
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index 40f3b8d..f3db4c7 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
+@@ -14,6 +14,7 @@
+ #include "SIO/Pad/Pad.h"
+ #include "SIO/Sio.h"
+ #include "PINE.h"
++#include "EmuCapFrameOperation.h"
+ #include "VMManager.h"
+ #include "vtlb.h"
+ #include "Counters.h"
+@@ -211,6 +212,12 @@ namespace PINEServer
+ 		MsgEmuCapPacing = 0x95, /**< Returns the agent pacing readback and the frame counter. */
+ 		MsgEmuCapSetPacing = 0x96, /**< Sets a percent of the guest rate, or 0 for unlimited. */
+ 		MsgEmuCapMemoryBatch = 0x97, /**< One frozen EE RAM acquisition. */
++		MsgEmuCapFrameProtocol = 0x98,
++		MsgEmuCapFrameBegin = 0x99,
++		MsgEmuCapFramePoll = 0x9A,
++		MsgEmuCapFrameCancel = 0x9B,
++		MsgEmuCapFrameFinish = 0x9C,
++		MsgEmuCapOwnedPause = 0x9D,
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -298,7 +305,9 @@ namespace PINEServer
+ 	template <typename T>
+ 	static T FromSpan(std::span<u8> span, int i)
+ 	{
+-		return *(T*)(&span[i]);
++		T value;
++		std::memcpy(&value, &span[i], sizeof(value));
++		return value;
+ 	}
+ 
+ 	/**
+@@ -311,14 +320,70 @@ namespace PINEServer
+ 				 (reply_len + reply_size) >= MAX_IPC_RETURN_SIZE);
+ 	}
+ 
++	static EmuCap::FrameOperations s_frame_operations;
++	struct EmuCapFrameHost
++	{
++		EmuCap::FrameOperations::Clock::time_point Now() const { return EmuCap::FrameOperations::Clock::now(); }
++		bool Valid() const { return VMManager::HasValidVM(); }
++		bool Paused() const { return VMManager::GetState() == VMState::Paused; }
++		bool Running() const { return VMManager::GetState() == VMState::Running; }
++		bool Parked() const { return VMManager::IsEmucapExecutionParkedOnCPUThread(); }
++		u64 Frame() const { return VMManager::GetEmucapFrameBoundaryCount(); }
++		u64 Epoch() const { return VMManager::GetEmucapMemoryEpoch(); }
++		u32 Remaining() const { return VMManager::GetEmucapFrameAdvanceRemaining(); }
++		void ClearTarget() { VMManager::CancelFrameAdvance(); }
++		void Start(u32 count) { VMManager::FrameAdvance(count); }
++		void Pause() { VMManager::SetPaused(true); }
++	};
++
++	static void ServiceEmuCapFrame(const EmuCap::FrameOperations::Ticket& ticket)
++	{
++		EmuCapFrameHost host;
++		s_frame_operations.Service(host, ticket);
++	}
++
++	void ServiceEmuCapFrameOnCPUThread()
++	{
++		ServiceEmuCapFrame({});
++	}
++
++	void InvalidateEmuCapFrameOnCPUThread()
++	{
++		s_frame_operations.Invalidate();
++	}
++
++	static void QueueEmuCapFrameService(const EmuCap::FrameOperations::Ticket& ticket)
++	{
++		Host::RunOnCPUThread([ticket]() { ServiceEmuCapFrame(ticket); }, false);
++	}
++
++	static bool WriteEmuCapFrameReceipt(const EmuCap::FrameOperations::Ticket& ticket,
++		std::vector<u8>& buffer, u32& offset)
++	{
++		EmuCap::FrameReceipt receipt;
++		if (!s_frame_operations.Read(ticket, receipt)) return false;
++		ToResultVector(buffer, receipt.id, offset);
++		ToResultVector(buffer, receipt.generation, offset + 8);
++		ToResultVector(buffer, receipt.start, offset + 16);
++		ToResultVector(buffer, receipt.end, offset + 24);
++		ToResultVector(buffer, receipt.requested, offset + 32);
++		ToResultVector(buffer, receipt.count, offset + 36);
++		ToResultVector(buffer, static_cast<u32>(receipt.phase), offset + 40);
++		ToResultVector(buffer, static_cast<u32>(receipt.reason), offset + 44);
++		offset += 48;
++		return true;
++	}
++
+ 	static void ClearEmuCapState()
+ 	{
++		const auto ticket = s_frame_operations.Detach();
+ 		if (!VMManager::HasValidVM())
+ 		{
+ 			s_emucap_breakpoints.clear();
+ 			return;
+ 		}
+-		Host::RunOnCPUThread([]() {
++		Host::RunOnCPUThread([ticket]() {
++			ServiceEmuCapFrame(ticket);
+ 			for (const EmuCapBreakpoint& breakpoint : s_emucap_breakpoints)
+ 			{
+ 				if (breakpoint.kind == 0)
+@@ -738,7 +803,15 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 		//        |  return value (VLE)
+ 		//        |  |
+ 		// reply: XX ZZ ZZ ZZ ZZ
+-		switch ((IPCCommand)buf[buf_cnt - 1])
++		const auto command = static_cast<IPCCommand>(buf[buf_cnt - 1]);
++		// The socket remains responsive, but legacy mutations/CPU dispatch cannot
++		// interleave with an owned frame operation or consume its breakpoint hits.
++		if (s_frame_operations.OwnsExecution() && command != MsgEmuCapVersion &&
++			command != MsgStatus && command != MsgEmuCapFrameProtocol &&
++			command != MsgEmuCapFramePoll && command != MsgEmuCapFrameCancel &&
++			command != MsgEmuCapFrameFinish)
++			goto error;
++		switch (command)
+ 		{
+ 			case MsgRead8:
+ 			{
+@@ -963,6 +1036,54 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				ret_cnt += 4;
+ 				break;
+ 			}
++			case MsgEmuCapFrameProtocol:
++			{
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16, buf_size)) goto error;
++				ToResultVector(ret_buffer, 1u, ret_cnt); // extension revision
++				ToResultVector(ret_buffer, 1u, ret_cnt + 4); // CPU VSync-start domain
++				ToResultVector(ret_buffer, 5000u, ret_cnt + 8);
++				ToResultVector(ret_buffer, 250000u, ret_cnt + 12);
++				ret_cnt += 16;
++				break;
++			}
++			case MsgEmuCapOwnedPause:
++			{
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 48, buf_size)) goto error;
++				const auto ticket = s_frame_operations.BeginPause(FromSpan<u32>(buf, buf_cnt),
++					EmuCap::FrameOperations::Clock::now());
++				buf_cnt += 4;
++				if (!ticket) goto error;
++				QueueEmuCapFrameService(ticket);
++				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
++				break;
++			}
++			case MsgEmuCapFrameBegin:
++			{
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 48, buf_size)) goto error;
++				const auto ticket = s_frame_operations.Begin(FromSpan<u32>(buf, buf_cnt),
++					FromSpan<u32>(buf, buf_cnt + 4), EmuCap::FrameOperations::Clock::now());
++				buf_cnt += 8;
++				if (!ticket) goto error;
++				QueueEmuCapFrameService(ticket);
++				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
++				break;
++			}
++			case MsgEmuCapFramePoll:
++			case MsgEmuCapFrameCancel:
++			case MsgEmuCapFrameFinish:
++			{
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 48, buf_size)) goto error;
++				const auto ticket = s_frame_operations.Find(FromSpan<u64>(buf, buf_cnt));
++				buf_cnt += 8;
++				if (!ticket) goto error;
++				if (command == MsgEmuCapFrameCancel && !s_frame_operations.Cancel(ticket)) goto error;
++				if (command == MsgEmuCapFrameFinish && !s_frame_operations.Finish(ticket)) goto error;
++				// Polling is read-only. Native scheduler ticks settle progress/deadlines
++				// even when the client stops sending queries.
++				if (command != MsgEmuCapFramePoll) QueueEmuCapFrameService(ticket);
++				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
++				break;
++			}
+ 			case MsgEmuCapPause:
+ 			{
+ 				if (!VMManager::HasValidVM())
+diff --git c/pcsx2/PINE.h i/pcsx2/PINE.h
+index 95de658..094b467 100644
+--- c/pcsx2/PINE.h
++++ i/pcsx2/PINE.h
+@@ -14,6 +14,9 @@
+ 
+ namespace PINEServer
+ {
++	void ServiceEmuCapFrameOnCPUThread();
++	void InvalidateEmuCapFrameOnCPUThread();
++
+ 	bool IsInitialized();
+ 	int GetSlot();
+ 
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index 317f304..4933b26 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -184,6 +184,7 @@ static bool s_elf_executed = false;
+ static std::string s_elf_override;
+ static std::string s_input_profile_name;
+ static u32 s_frame_advance_count = 0;
++static u64 s_emucap_frame_boundary_count = 0;
+ static bool s_fast_boot_requested = false;
+ static bool s_gs_open_on_initialize = false;
+ static bool s_thread_affinities_set = false;
+@@ -1375,6 +1376,7 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
+ 	// (or make it thread-local, but that seems silly.)
+ 	Host::CancelGameListRefresh();
+ 
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	s_state.store(VMState::Initializing, std::memory_order_release);
+ 	s_vm_thread_handle = Threading::ThreadHandle::GetForCallingThread();
+ 	Host::OnVMStarting();
+@@ -1672,6 +1674,7 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
+ 
+ void VMManager::Shutdown(bool save_resume_state)
+ {
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	// we'll probably already be stopping (this is how Qt calls shutdown),
+ 	// but just in case, so any of the stuff we call here knows we don't have a valid VM.
+ 	s_state.store(VMState::Stopping, std::memory_order_release);
+@@ -1785,6 +1788,7 @@ bool VMManager::RequestReset()
+ 
+ void VMManager::Reset(bool force)
+ {
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	++s_emucap_memory_epoch;
+ 	pxAssert(HasValidVM());
+ 
+@@ -1918,6 +1922,7 @@ std::string VMManager::GetCurrentSaveStateFileName(s32 slot, bool backup)
+ 
+ bool VMManager::DoLoadState(const char* filename, Error* error)
+ {
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	++s_emucap_memory_epoch;
+ 	if (GSDumpReplayer::IsReplayingDump())
+ 	{
+@@ -2347,6 +2352,7 @@ void VMManager::Internal::Throttle()
+ 			break;
+ 		Threading::Sleep(static_cast<int>(std::min<s64>(msec - 1, 10)));
+ 		Host::PumpMessagesOnCPUThread();
++		PINEServer::ServiceEmuCapFrameOnCPUThread();
+ 		if (IsExecutionInterrupted() || s_limiter_restarted)
+ 			return;
+ 	}
+@@ -2366,6 +2372,9 @@ void VMManager::Internal::FrameRateChanged()
+ 	UpdateTargetSpeed();
+ }
+ 
++u64 VMManager::GetEmucapFrameBoundaryCount() { return s_emucap_frame_boundary_count; }
++u32 VMManager::GetEmucapFrameAdvanceRemaining() { return s_frame_advance_count; }
++
+ u32 VMManager::CancelFrameAdvance()
+ {
+ 	const u32 remaining = s_frame_advance_count;
+@@ -2808,6 +2817,10 @@ void VMManager::Internal::ClearCPUExecutionCaches()
+ 
+ void VMManager::Execute()
+ {
++	// Qt processes queued CPU commands after selecting its Running branch.
++	// A command may have parked the VM before this stale branch reaches Execute.
++	if (GetState() != VMState::Running)
++		return;
+ 	++s_emucap_execution_depth;
+ 	ScopedGuard emucap_execution = [] { --s_emucap_execution_depth; };
+ 	// Check for interpreter<->recompiler switches.
+@@ -2819,12 +2832,16 @@ void VMManager::Execute()
+ 		vtlb_ResetFastmem();
+ 	}
+ 
+-	// Execute until we're asked to stop.
+-	Cpu->Execute();
++	// Execute until we're asked to stop; setup callbacks may also have paused.
++	if (GetState() == VMState::Running)
++		Cpu->Execute();
++	emucap_execution.Run();
++	PINEServer::ServiceEmuCapFrameOnCPUThread();
+ }
+ 
+ void VMManager::IdlePollUpdate()
+ {
++	PINEServer::ServiceEmuCapFrameOnCPUThread();
+ 	Achievements::IdleUpdate();
+ 
+ 	PollDiscordPresence();
+@@ -2963,6 +2980,7 @@ void VMManager::Internal::EntryPointCompilingOnCPUThread()
+ 
+ void VMManager::Internal::VSyncOnCPUThread()
+ {
++	++s_emucap_frame_boundary_count;
+ 	Pad::UpdateMacroButtons();
+ 
+ 	Patch::ApplyVsyncPatches();
+@@ -2986,6 +3004,7 @@ void VMManager::Internal::VSyncOnCPUThread()
+ 
+ void VMManager::Internal::PollInputOnCPUThread()
+ {
++	PINEServer::ServiceEmuCapFrameOnCPUThread();
+ 	Host::PumpMessagesOnCPUThread();
+ 	InputManager::PollSources();
+ 
+diff --git c/pcsx2/VMManager.h i/pcsx2/VMManager.h
+index 18b0ac0..a2102d2 100644
+--- c/pcsx2/VMManager.h
++++ i/pcsx2/VMManager.h
+@@ -222,6 +222,9 @@ namespace VMManager
+ 
+ 	/// Runs the virtual machine for the specified number of video frames, and then automatically pauses.
+ 	// CPU-thread only. Discard pending advance so later resume cannot consume stale work.
++	// CPU-thread-only VSync-start clock and active target progress.
++	u64 GetEmucapFrameBoundaryCount();
++	u32 GetEmucapFrameAdvanceRemaining();
+ 	u32 CancelFrameAdvance();
+ 	void FrameAdvance(u32 num_frames = 1);
+ 

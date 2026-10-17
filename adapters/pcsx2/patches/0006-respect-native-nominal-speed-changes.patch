@@ -1,6 +1,8 @@
---- a/pcsx2/VMManager.cpp
-+++ b/pcsx2/VMManager.cpp
-@@ -2994,6 +2994,10 @@
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index 564f31e..de50e4d 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -3048,6 +3048,10 @@ void VMManager::CheckForEmulationSpeedConfigChanges(const Pcsx2Config& old_confi
  	if (EmuConfig.EmulationSpeed == old_config.EmulationSpeed)
  		return;
  

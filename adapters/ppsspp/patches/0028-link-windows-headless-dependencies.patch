@@ -1,7 +1,10 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ec5f6ef2e1..6ac1125113 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -2965,6 +2965,6 @@
- 	target_link_libraries(PPSSPPHeadless ${COCOA_LIBRARY} ${QUARTZ_CORE_LIBRARY} ${IOKIT_LIBRARY} ${LinkCommon})
+@@ -1347,7 +1347,7 @@ if(HEADLESS)
+ 		target_link_libraries(PPSSPPHeadless ${FONTCONFIG_LIB_TARGET})
+ 	endif()
  	if(WIN32)
 -		target_link_libraries(PPSSPPHeadless d2d1 dwrite d3d11)
 +		target_link_libraries(PPSSPPHeadless d2d1 dwrite d3d11 comctl32 mfuuid)

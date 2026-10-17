@@ -29,3 +29,17 @@ fn recording_movie_requires_one_row_per_admitted_frame() {
     assert!(canonical_recording_movie("", 1, 4).is_err());
     assert!(canonical_recording_movie("0:\n1:\n", 1, 4).is_err());
 }
+
+#[test]
+fn controller_movie_keeps_axes_and_does_not_silently_enter_button_only_recording() {
+    let movie =
+        parse_movie("0:{\"buttons\":[\"a\"],\"axes\":{\"stick_x\":37,\"stick_y\":-90}}\n1:b\n")
+            .unwrap();
+    assert_eq!(movie.frames[0].axes["stick_x"], 37);
+    assert_eq!(movie.frames[0].axes["stick_y"], -90);
+    assert!(movie.frames[1].axes.is_empty());
+    assert!(
+        canonical_recording_movie("0:{\"buttons\":[],\"axes\":{\"stick_x\":37}}", 1, 16).is_err()
+    );
+    assert!(parse_movie("0:{\"buttons\":[],\"axes\":{\"stick_x\":0.5}}").is_err());
+}

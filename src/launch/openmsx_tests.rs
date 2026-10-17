@@ -261,6 +261,27 @@ fn mutable_media_is_copied_and_source_identity_is_preserved() {
 }
 
 #[test]
+fn cartridge_media_is_staged_read_only_before_native_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.rom");
+    let staged = temp.path().join("session/media/game.rom");
+    std::fs::write(&source, b"cartridge-source").unwrap();
+
+    let prepared = prepare_media(MediaKind::Cartridge, &source, &staged).unwrap();
+
+    assert_ne!(prepared.source_path, prepared.mounted_path);
+    assert_eq!(prepared.source_sha1, prepared.mounted_sha1);
+    assert_eq!(
+        std::fs::read(&prepared.mounted_path).unwrap(),
+        b"cartridge-source"
+    );
+    assert!(std::fs::metadata(&prepared.mounted_path)
+        .unwrap()
+        .permissions()
+        .readonly());
+}
+
+#[test]
 fn firmware_root_must_be_absolute_before_inventory() {
     let error = validate_firmware_root(Path::new("relative/firmware")).unwrap_err();
     assert!(error.to_string().contains("absolute"));

@@ -28,6 +28,11 @@ if [ "$#" -lt 2 ]; then
 fi
 
 ROM="$1"; PORT="$2"; NAME="${3:-}"; SYSTEM="${4:-}"
+case "$(printf '%s' "${ROM##*.}" | tr '[:upper:]' '[:lower:]')" in
+  lua) echo "ERROR: Mesen content must be game media, not a Lua script" >&2; exit 2 ;;
+esac
+# Keep relative media names out of Mesen's command-line option namespace.
+ROM="$(cd -- "$(dirname -- "$ROM")" && pwd -P)/$(basename -- "$ROM")"
 case "$PORT" in
   ''|*[!0-9]*)
     echo "ERROR: EMUCAP_PORT must be a decimal TCP port: $PORT" >&2
@@ -92,7 +97,7 @@ EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo u
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   if [ -n "$(git -C "$HERE" status --porcelain -- \
-    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua \
+    emucap-core.lua emucap_auth.lua emucap_front_auth.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua \
     emucap_step.lua emucap_json.lua emucap_input.lua emucap_owner.lua emucap_control_wire.lua emucap_rx.lua \
     emucap_control.lua emucap_control_advance.lua \
     emucap_tx.lua emucap_state_io.lua emucap_snapshot.lua emucap_recording.lua \
@@ -104,35 +109,6 @@ else
 fi
 export EMUCAP_BUILD_HASH
 
-default_emu_home_base() {
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin)
-      echo "${HOME:-/tmp}/Library/Application Support/emucap"
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      if [ -n "${LOCALAPPDATA:-}" ]; then
-        echo "$LOCALAPPDATA/emucap"
-      elif [ -n "${APPDATA:-}" ]; then
-        echo "$APPDATA/emucap"
-      elif [ -n "${USERPROFILE:-}" ]; then
-        echo "$USERPROFILE/AppData/Local/emucap"
-      elif [ -n "${HOME:-}" ]; then
-        echo "$HOME/AppData/Local/emucap"
-      else
-        echo "/tmp/emucap"
-      fi
-      ;;
-    *)
-      if [ -n "${XDG_DATA_HOME:-}" ]; then
-        echo "$XDG_DATA_HOME/emucap"
-      elif [ -n "${HOME:-}" ]; then
-        echo "$HOME/.local/share/emucap"
-      else
-        echo "/tmp/emucap"
-      fi
-      ;;
-  esac
-}
 
 resolve_default_mesen() {
   local candidates=()
@@ -183,7 +159,7 @@ resolve_default_mesen() {
   return 1
 }
 
-EMUCAP_MESEN_BASE="${EMUCAP_EMU_HOME:-$(default_emu_home_base)}"
+EMUCAP_MESEN_BASE="$(emucap_runtime_base)"
 RUN_DIR="$EMUCAP_MESEN_BASE/mesen2/$PORT"
 PORTABLE_SAFE_ROOT="$RUN_DIR"
 PIDFILE="$RUN_DIR/mesen.pid"
@@ -195,12 +171,9 @@ case "$MESEN_BIN" in
   *.app) MESEN_BIN="$MESEN_BIN/Contents/MacOS/Mesen" ;;
 esac
 OLD="$(head -n 1 "$PIDFILE" 2>/dev/null | tr -d '\r\n' || true)"
-TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
-if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SESSION_TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
-fi
-[ -n "$SESSION_TOKEN" ] && export EMUCAP_SESSION_TOKEN="$SESSION_TOKEN"
+emucap_require_front_identity "$SESSION_TOKEN" "${EMUCAP_LAUNCH_ID:-}" || exit 2
+export EMUCAP_SESSION_TOKEN="$SESSION_TOKEN"
 
 [ -f "$ROM" ] || { echo "ERROR: ROM 없음: $ROM" >&2; exit 1; }
 [ -f "$LUA" ] || { echo "ERROR: Lua 어댑터 없음: $LUA" >&2; exit 1; }
@@ -609,8 +582,7 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
   echo "  rom=$ROM"
   echo "  port=$PORT"
   echo "  name=${NAME:-<none>}"
-  echo "  session_token=${SESSION_TOKEN:+present}"
-  echo "  token_file=$TOKEN_FILE"
+  echo "  front_key=${SESSION_TOKEN:+present}"
   echo "  lua=$LUA"
   echo "  wait=${WAIT}s"
   echo "  post_connect_grace=${POST_CONNECT_GRACE}s"
@@ -665,7 +637,15 @@ if [ "$LAUNCH_MODE" = "open" ]; then
   OPEN_ENV=(--env "EMUCAP_PORT=$PORT" --env "EMUCAP_BUILD_HASH=$EMUCAP_BUILD_HASH" --env "EMUCAP_ADAPTER_DIR=$HERE")
   OPEN_ENV+=(--env "EMUCAP_MESEN_UPSTREAM_COMMIT=$MESEN_UPSTREAM_COMMIT" --env "EMUCAP_MESEN_PATCHSET_SHA256=$MESEN_PATCHSET_SHA256" --env "EMUCAP_MESEN_BINARY_SHA256=$MESEN_BINARY_SHA256")
   [ -n "$NAME" ] && OPEN_ENV+=(--env "EMUCAP_NAME=$NAME")
-  [ -n "$SESSION_TOKEN" ] && OPEN_ENV+=(--env "EMUCAP_SESSION_TOKEN=$SESSION_TOKEN")
+  if [ -n "$SESSION_TOKEN" ]; then
+    # LaunchServices needs explicit transport; expose only a private file path in argv.
+    SESSION_TOKEN_PATH="$(umask 077; mktemp "$RUN_DIR/session-token.XXXXXX")" || exit 1
+    if ! printf '%s' "$SESSION_TOKEN" > "$SESSION_TOKEN_PATH"; then
+      rm -f "$SESSION_TOKEN_PATH"
+      exit 1
+    fi
+    OPEN_ENV+=(--env "EMUCAP_SESSION_TOKEN_FILE=$SESSION_TOKEN_PATH")
+  fi
   OPEN_ENV+=(--env "EMUCAP_CONTENT=$ROM")
   [ -n "${EMUCAP_PREARM:-}" ] && OPEN_ENV+=(--env "EMUCAP_PREARM=$EMUCAP_PREARM")
   [ -n "${EMUCAP_FREEZE_KEY:-}" ] && OPEN_ENV+=(--env "EMUCAP_FREEZE_KEY=$EMUCAP_FREEZE_KEY")
@@ -718,7 +698,7 @@ PY
   else
     {
       trap '' HUP
-      env EMUCAP_PORT="$PORT" EMUCAP_CONTENT="$ROM" ${NAME:+EMUCAP_NAME="$NAME"} ${SESSION_TOKEN:+EMUCAP_SESSION_TOKEN="$SESSION_TOKEN"} ${EMUCAP_PREARM:+EMUCAP_PREARM="$EMUCAP_PREARM"} \
+      env EMUCAP_PORT="$PORT" EMUCAP_CONTENT="$ROM" ${NAME:+EMUCAP_NAME="$NAME"} ${EMUCAP_PREARM:+EMUCAP_PREARM="$EMUCAP_PREARM"} \
         ${EMUCAP_FREEZE_KEY:+EMUCAP_FREEZE_KEY="$EMUCAP_FREEZE_KEY"} \
         nohup "$MESEN_BIN" "$ROM" "$LUA" "${MESEN_CLI_ARGS[@]}" >>"$LOG" 2>&1 &
       echo "$!" > "$PIDFILE"

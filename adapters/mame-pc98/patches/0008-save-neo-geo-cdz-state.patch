@@ -1,5 +1,5 @@
---- a/src/mame/neogeo/neogeo.cpp
-+++ b/src/mame/neogeo/neogeo.cpp
+--- a/src/mame/snk/neogeo.cpp
++++ b/src/mame/snk/neogeo.cpp
 @@ -1639,7 +1639,9 @@
  
  void neogeo_base_state::device_post_load()
@@ -11,8 +11,8 @@
  	set_pens();
  }
  
---- a/src/mame/neogeo/neogeocd.cpp
-+++ b/src/mame/neogeo/neogeocd.cpp
+--- a/src/mame/snk/neogeocd.cpp
++++ b/src/mame/snk/neogeocd.cpp
 @@ -1169,8 +1169,8 @@
  
  

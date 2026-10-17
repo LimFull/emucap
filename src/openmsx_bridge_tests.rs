@@ -476,6 +476,21 @@ fn fixture(display: bool) -> (OpenMsxBridge<FakeControl>, Arc<Mutex<Vec<String>>
     fixture_with_failure(display, None)
 }
 
+fn reinterpret_fixture_as_writable_disk(bridge: &mut OpenMsxBridge<FakeControl>) {
+    bridge.session.media.kind = MediaKind::Disk;
+    let mut permissions = fs::metadata(&bridge.session.media.mounted_path)
+        .unwrap()
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o600);
+    }
+    #[cfg(windows)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&bridge.session.media.mounted_path, permissions).unwrap();
+}
+
 fn fixture_with_failure(
     display: bool,
     fail_once: Option<&str>,
@@ -1386,7 +1401,7 @@ fn reset_and_machine_restore_allocate_distinct_raster_epochs() {
 #[test]
 fn disk_swap_preserves_writes_imports_exact_bytes_and_never_advances() {
     let (mut bridge, commands, temp) = fixture(false);
-    bridge.session.media.kind = MediaKind::Disk;
+    reinterpret_fixture_as_writable_disk(&mut bridge);
     let original = bridge.session.media.mounted_path.clone();
     fs::write(&original, [0x5a; 512]).unwrap();
     let source = temp.path().join("data.dsk");
@@ -1430,7 +1445,7 @@ fn disk_swap_preserves_writes_imports_exact_bytes_and_never_advances() {
 #[test]
 fn disk_swap_preflight_and_native_rejection_keep_current_disk() {
     let (mut bridge, commands, temp) = fixture(false);
-    bridge.session.media.kind = MediaKind::Disk;
+    reinterpret_fixture_as_writable_disk(&mut bridge);
     fs::write(&bridge.session.media.mounted_path, [0x55; 512]).unwrap();
     let original = bridge.session.media.mounted_path.clone();
     let source = temp.path().join("disk.dsk");
@@ -1464,7 +1479,7 @@ fn disk_swap_preflight_and_native_rejection_keep_current_disk() {
 #[test]
 fn disk_change_with_unverified_effect_is_terminal_and_preserves_recovery_bytes() {
     let (mut bridge, _, _temp) = fixture(false);
-    bridge.session.media.kind = MediaKind::Disk;
+    reinterpret_fixture_as_writable_disk(&mut bridge);
     fs::write(&bridge.session.media.mounted_path, [0x7b; 512]).unwrap();
     bridge.control.disk_change_failure = true;
     let error = bridge
@@ -1473,8 +1488,8 @@ fn disk_change_with_unverified_effect_is_terminal_and_preserves_recovery_bytes()
     assert!(bridge.backend_terminal());
     assert!(error.to_string().contains("current_media=unverified"));
     assert!(error.to_string().contains("previous="));
-    let generation = bridge.session.user_data.parent().unwrap();
-    let exported: Vec<_> = fs::read_dir(generation)
+    let scratch = bridge.runtime_home.join("state");
+    let exported: Vec<_> = fs::read_dir(scratch)
         .unwrap()
         .filter_map(|entry| {
             let path = entry.unwrap().path().join("disk.dsk");

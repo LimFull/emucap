@@ -62,9 +62,14 @@ def warmup(w, status, frames):
     # Split at the live synchronous bound instead of assuming one adapter's cap.
     chunk = status.get('execution_limits', {}).get('frame', {}).get('max_count') or frames
     while frames > 0:
-        step = w.call('step', {'unit': 'frames', 'count': min(chunk, frames)})
-        assert step['status'] == 'completed', step
-        frames -= min(chunk, frames)
+        requested = min(chunk, frames)
+        step = w.call('step', {'unit': 'frames', 'count': requested})
+        completed = step.get('completed', requested if step.get('status') == 'completed' else 0)
+        assert isinstance(completed, int) and not isinstance(completed, bool), step
+        assert 0 < completed <= requested, step
+        if step.get('status') != 'completed':
+            assert step.get('status') == 'interrupted' and step.get('reason') == 'host_deadline', step
+        frames -= completed
 
 
 def derive_ranges(capability):

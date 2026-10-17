@@ -1,0 +1,57 @@
+--- a/Core/Debugger/WebSocket/BreakpointSubscriber.cpp
++++ b/Core/Debugger/WebSocket/BreakpointSubscriber.cpp
+@@ -14,6 +14,8 @@
+ 
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
++
++#include <algorithm>
+ 
+ #include "Common/StringUtils.h"
+ #include "Core/Core.h"
+@@ -24,6 +26,19 @@
+ #include "Core/Debugger/WebSocket/BreakpointSubscriber.h"
+ #include "Core/Debugger/WebSocket/WebSocketUtils.h"
+ #include "Core/MIPS/MIPSDebugInterface.h"
++
++// Called only in the CPU-thread mutation transaction. Temporary stepping and
++// the fixed register set have independent bounds; existing points may be updated.
++static bool AdmitRemoteBreakpoint(bool replacing, std::string *error) {
++	constexpr size_t limit = 128;
++	const size_t exec = g_breakpoints.GetBreakpointRefs().size();
++	const size_t memory = g_breakpoints.GetMemCheckRefs().size();
++	if (!replacing && (exec >= limit || memory >= limit - exec)) {
++		*error = "Breakpoint limit exceeded (128 CPU/memory registrations)";
++		return false;
++	}
++	return true;
++}
+ 
+ static const char *BreakpointKindToString(BreakpointKind kind) {
+ 	switch (kind) {
+@@ -251,6 +266,12 @@
+ 	// from this WebSocket handler thread - see Core_RunOnCPUThread() in Core.h.
+ 	std::string error;
+ 	Core_RunOnCPUThread([&] {
++		const auto &entries = g_breakpoints.GetBreakpointRefs();
++		const bool replacing = std::any_of(entries.begin(), entries.end(), [&](const BreakPoint &bp) {
++			return bp.addr == params.address;
++		});
++		if (!AdmitRemoteBreakpoint(replacing, &error))
++			return;
+ 		if (!params.CompileCondition(&error))
+ 			return;
+ 		g_breakpoints.AddBreakPoint(params.address);
+@@ -515,6 +536,12 @@
+ 	// from this WebSocket handler thread - see Core_RunOnCPUThread() in Core.h.
+ 	std::string error;
+ 	Core_RunOnCPUThread([&] {
++		const auto &entries = g_breakpoints.GetMemCheckRefs();
++		const bool replacing = std::any_of(entries.begin(), entries.end(), [&](const MemCheck &bp) {
++			return bp.start == params.address && bp.end == params.end;
++		});
++		if (!AdmitRemoteBreakpoint(replacing, &error))
++			return;
+ 		if (!params.CompileCondition(&error))
+ 			return;
+ 		g_breakpoints.AddMemCheck(params.address, params.end, params.cond, params.Action(true));

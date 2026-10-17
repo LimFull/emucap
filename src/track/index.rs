@@ -66,9 +66,17 @@ pub fn open_index(path: &Path) -> Result<Connection, IndexError> {
 /// DELETE-all + 재삽입 전체를 단일 트랜잭션으로 감싸 중단 시 부분 빈 상태가
 /// 노출되지 않도록 한다(WAL + 단일-작성자 직렬화 요건).
 pub fn reindex(root: &Path, conn: &Connection) -> Result<usize, IndexError> {
-    let runs = store::walk_runs(root)?;
-    let roms = store::walk_roms(root)?;
-    let findings = store::walk_findings(root)?;
+    reindex_budgeted(root, conn, &mut super::budget::ScanBudget::default())
+}
+
+pub(super) fn reindex_budgeted(
+    root: &Path,
+    conn: &Connection,
+    budget: &mut super::budget::ScanBudget,
+) -> Result<usize, IndexError> {
+    let runs = store::walk_runs_budgeted(root, budget)?;
+    let roms = store::walk_roms_budgeted(root, budget)?;
+    let findings = store::walk_findings_budgeted(root, budget)?;
     reindex_from(conn, &roms, &runs, &findings)
 }
 
@@ -78,9 +86,17 @@ pub fn reindex_lenient(
     root: &Path,
     conn: &Connection,
 ) -> Result<(usize, Vec<std::path::PathBuf>), IndexError> {
-    let (runs, s_runs) = store::walk_runs_lenient(root)?;
-    let (roms, s_roms) = store::walk_roms_lenient(root)?;
-    let (findings, s_find) = store::walk_findings_lenient(root)?;
+    reindex_lenient_budgeted(root, conn, &mut super::budget::ScanBudget::default())
+}
+
+pub(super) fn reindex_lenient_budgeted(
+    root: &Path,
+    conn: &Connection,
+    budget: &mut super::budget::ScanBudget,
+) -> Result<(usize, Vec<std::path::PathBuf>), IndexError> {
+    let (runs, s_runs) = store::walk_runs_lenient_budgeted(root, budget)?;
+    let (roms, s_roms) = store::walk_roms_lenient_budgeted(root, budget)?;
+    let (findings, s_find) = store::walk_findings_lenient_budgeted(root, budget)?;
     let mut skipped = s_runs;
     skipped.extend(s_roms);
     skipped.extend(s_find);

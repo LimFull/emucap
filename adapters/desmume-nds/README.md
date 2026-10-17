@@ -1,6 +1,6 @@
 # emucap — DeSmuME (Nintendo DS) adapter
 
-The adapter that gives emucap Nintendo DS support. It **forks and builds DeSmuME headless**, and the
+The adapter that gives emucap Nintendo DS support. It **patches pinned upstream DeSmuME and builds its headless frontend**, and the
 emucap **NDS bridge** attaches to the **ARM9/ARM7 GDB stubs** DeSmuME exposes to drive memory,
 registers, stepping, and breakpoints over GDB-RSP. Same GDB-bridge shape as the PC-98 adapter.
 
@@ -19,7 +19,7 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-desmume-nds-bridge ─�
 - Upstream `desmume-cli` unconditionally creates an X11 (`XInitThreads`) and OpenGL SDL window, so it
   won't start without a display. `patches/0001-headless-cli.patch` removes the X11/window/renderer
   setup and leaves only the emulate loop and the GDB stubs (gated on `#define HEADLESS_SPIKE`, the
-  original preserved under `#else`). The adapter owns this fork (like Mednafen / Flycast).
+  original preserved under `#else`). The adapter maintains these changes as an ordered source patch stack.
 
 ## Build
 
@@ -28,15 +28,12 @@ adapters/desmume-nds/build.sh
 ```
 
 Clones TASEmulators/desmume into an emucap-owned work tree (`adapters/desmume-nds/work`) pinned to a
-known-good commit, applies the patch stack in order (`0001` headless → `0002` screenshot/input →
-`0003` savestate/disasm → `0004` reset → `0005` touch → `0006` GDB buffers → `0007` input status →
-`0008` GDB I/O deadlines → `0009` SIGPIPE suppression → `0010` shared-scheduler GDB state →
-`0011` exact VBlank frame step → `0012` pacing → `0013` memory batch →
-`0014` resume pacing anchor → `0015` shared-scheduler halt proof),
-and builds `desmume-cli` with meson
+commit from `upstream.lock`, applies the ordered files in `patches/`, and builds
+`desmume-cli` with meson
 (`-Dfrontend-cli -Dgdb-stub`; the gdb-stub build disables the JIT and runs the interpreter). Because
 later patches extend the same `gdbstub.cpp` regions, build.sh resets the tree and re-applies the whole
-stack every build. Point it at a read-only upstream checkout with `EMUCAP_DESMUME_SRC=/path/to/desmume`.
+stack every build. A reused work tree switches to the locked revision while preserving build
+outputs; the caller-supplied source stays unchanged. Point it at a read-only upstream checkout with `EMUCAP_DESMUME_SRC=/path/to/desmume`.
 
 - Dependencies: `meson`, `ninja`, `sdl2`, `glib` (+ the system `libpcap` on macOS), and `git`.
 - On macOS it builds with Apple clang (`/usr/bin/clang`) — build.sh normalizes a homebrew-LLVM environment.
@@ -57,6 +54,12 @@ Each accepted GDB connection has bounded send/receive waits. Packet transmission
 share a two-second total deadline and at most three attempts; a timeout closes only that GDB
 connection and resets the packet reader so a replacement bridge can attach without restarting
 DeSmuME. Socket sends suppress `SIGPIPE`, so a peer reset also closes only the failed GDB connection.
+
+Each ARM listener authenticates up to eight nonblocking candidates while continuing to service its
+control channel. An unauthenticated arrival may replace the oldest unauthenticated candidate. A
+candidate that has proved the launch token keeps its remaining two-second ACK flight; when all
+slots are in that state, the listener rejects the new arrival. Only the final ACK installs one
+debugger owner, and installation closes every other candidate.
 
 ## System and content
 

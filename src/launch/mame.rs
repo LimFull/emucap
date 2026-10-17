@@ -7,8 +7,8 @@
 
 use super::spec::{mame_spec, MameOpts};
 use super::{
-    emu_home_base, emu_home_dir, find_on_path, first_existing_file, spawn_detached,
-    terminate_detached, LaunchSpec,
+    emu_home_base, find_on_path, first_existing_file, spawn_detached, terminate_detached,
+    LaunchSpec,
 };
 use std::path::{Path, PathBuf};
 
@@ -73,7 +73,7 @@ fn repo_local_binary(repo_root: &Path) -> Option<PathBuf> {
         .find(|p| super::is_runnable_file(p))
 }
 
-fn default_rompath() -> PathBuf {
+fn default_rompath() -> std::io::Result<PathBuf> {
     for base in [
         std::env::var_os("HOME").map(PathBuf::from),
         std::env::var_os("USERPROFILE").map(PathBuf::from),
@@ -83,10 +83,10 @@ fn default_rompath() -> PathBuf {
     {
         let candidate = base.join("mame/roms");
         if candidate.is_dir() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    emu_home_base().join("mame-pc98").join("roms")
+    Ok(emu_home_base()?.join("mame-pc98").join("roms"))
 }
 
 pub struct Launch<'a> {
@@ -213,14 +213,19 @@ struct BridgeLaunch {
     spec: LaunchSpec,
 }
 
-fn resolve_bridge_launch(l: &Launch, gdb_port: u16) -> std::io::Result<BridgeLaunch> {
+fn resolve_bridge_launch(
+    l: &Launch,
+    gdb_port: u16,
+    native_debug_token: &str,
+) -> std::io::Result<BridgeLaunch> {
     let endpoint = format!("127.0.0.1:{gdb_port}");
     let runtime = resolve_bridge_runtime(l.repo_root)?;
     let mut spec = LaunchSpec::new(runtime.program.clone(), l.log_path);
     spec = spec
         .arg(l.port.to_string())
         .arg(endpoint)
-        .env("EMUCAP_CONTENT", l.content);
+        .env("EMUCAP_CONTENT", l.content)
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_debug_token);
     if let Some(name) = l.name {
         spec = spec.env("EMUCAP_NAME", name);
     }
@@ -239,16 +244,16 @@ fn resolve_bridge_launch(l: &Launch, gdb_port: u16) -> std::io::Result<BridgeLau
 /// generation ends, including while the front connection is idle.
 pub fn launch(l: &Launch) -> std::io::Result<Launched> {
     let gdb_port = gdb_port_for_emucap_port(l.port)?;
+    let native_debug_token = super::new_native_debug_token();
     let BridgeLaunch {
         kind: bridge_kind,
         spec: bridge_spec,
-    } = resolve_bridge_launch(l, gdb_port)?;
-    let mame_home = emu_home_dir("mame-pc98", l.port);
-    std::fs::create_dir_all(&mame_home)?;
+    } = resolve_bridge_launch(l, gdb_port, &native_debug_token)?;
+    let mame_home = super::emu_generation_dir("mame-pc98", l.port, l.runtime)?;
     let rompath = if let Some(explicit) = std::env::var_os("MAME_ROMPATH") {
         PathBuf::from(explicit)
     } else {
-        let path = default_rompath();
+        let path = default_rompath()?;
         std::fs::create_dir_all(&path)?;
         path
     };
@@ -276,7 +281,9 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
         name: l.name,
         session_token: l.session_token,
     };
-    let mame = mame_spec(l.binary, l.log_path, &opts).env("MAME_GDB_PORT", gdb_port.to_string());
+    let mame = mame_spec(l.binary, l.log_path, &opts)
+        .env("MAME_GDB_PORT", gdb_port.to_string())
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_debug_token);
     let mame_pid = spawn_detached(&mame)?;
     let bridge_spec = match bridge_spec.emulator_dependency(mame_pid) {
         Ok(spec) => spec,

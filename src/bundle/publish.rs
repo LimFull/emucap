@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::{PublishError, PublishedBundleError};
 use super::manifest::{parse_manifest, BundleManifest};
+use super::publish_movie::validate_input_movie_member;
 use super::recording::{
     validate_recording, ProducerTerminalReport, RecordingValidationInput, ValidatedRecording,
 };
@@ -19,7 +20,6 @@ use super::recording_manifest::{
     RECORDING_FORMAT_VERSION,
 };
 use crate::event_contracts::EventContractRegistry;
-use crate::input_movie::canonical_recording_movie;
 
 const EVENTS_DIR: &str = "events";
 const EVENTS_MEMBER: &str = "events/segment-000.ndjson";
@@ -95,6 +95,8 @@ fn valid_capture_id(value: &str) -> bool {
 }
 
 fn ensure_identity(input: &RecordingBundleInput) -> Result<(), PublishError> {
+    crate::live::recording_capability::validate_recording_limits(&input.validation.request.limits)
+        .map_err(|error| PublishError::InvalidIdentity(error.to_string()))?;
     if !valid_capture_id(&input.capture_id) {
         return Err(PublishError::InvalidCaptureId(input.capture_id.clone()));
     }
@@ -156,13 +158,18 @@ fn ensure_identity(input: &RecordingBundleInput) -> Result<(), PublishError> {
 }
 
 fn create_private_dir(path: &Path) -> Result<(), std::io::Error> {
-    fs::create_dir(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    crate::private_fs::create_private_dir(path)
+}
+
+fn write_private_readonly(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = crate::private_fs::create_private_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)?;
+    crate::private_fs::verify_private_file(path)
 }
 
 pub(super) fn regular_owned_member(path: &Path) -> Result<(), PublishError> {
@@ -176,6 +183,8 @@ pub(super) fn regular_owned_member(path: &Path) -> Result<(), PublishError> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(PublishError::UnsafeMember(path.to_path_buf()));
     }
+    crate::private_fs::verify_private_file(path)
+        .map_err(|_| PublishError::UnsafeMember(path.to_path_buf()))?;
     Ok(())
 }
 
@@ -207,10 +216,7 @@ impl RecordingStaging {
         create_private_dir(&staging_path)?;
         let prepared = (|| -> Result<(), std::io::Error> {
             create_private_dir(&staging_path.join(EVENTS_DIR))?;
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(staging_path.join(EVENTS_MEMBER))?;
+            crate::private_fs::create_private_file(&staging_path.join(EVENTS_MEMBER))?;
             Ok(())
         })();
         if let Err(error) = prepared {
@@ -257,20 +263,7 @@ impl RecordingStaging {
             ));
         }
         let path = self.staging_path.join(INPUT_MOVIE_MEMBER);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o400);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions)?;
+        write_private_readonly(&path, bytes)?;
         self.input_movie_written = true;
         Ok(path)
     }
@@ -332,27 +325,11 @@ impl RecordingStaging {
         let directory = self.staging_path.join(SNAPSHOTS_DIR);
         if self.snapshot_labels_written.len() == 1 {
             create_private_dir(&directory)?;
-        } else if fs::symlink_metadata(&directory)
-            .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
-            .unwrap_or(true)
-        {
+        } else if crate::private_fs::verify_private_dir(&directory).is_err() {
             return Err(PublishError::UnsafeMember(directory));
         }
         let path = terminal_snapshot_path(&self.staging_path, &request.label);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o400);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions)?;
+        write_private_readonly(&path, bytes)?;
         Ok(path)
     }
 
@@ -374,27 +351,11 @@ impl RecordingStaging {
         let directory = self.staging_path.join(INITIAL_SNAPSHOTS_DIR);
         if self.initial_snapshot_labels_written.len() == 1 {
             create_private_dir(&directory)?;
-        } else if fs::symlink_metadata(&directory)
-            .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
-            .unwrap_or(true)
-        {
+        } else if crate::private_fs::verify_private_dir(&directory).is_err() {
             return Err(PublishError::UnsafeMember(directory));
         }
         let path = initial_snapshot_path(&self.staging_path, &request.label);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o400);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions)?;
+        write_private_readonly(&path, bytes)?;
         Ok(path)
     }
 
@@ -416,21 +377,14 @@ impl RecordingStaging {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(PublishError::UnsafeMember(directory));
             }
-            Ok(_) => {}
+            Ok(_) => crate::private_fs::verify_private_dir(&directory)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 create_private_dir(&directory)?;
             }
             Err(error) => return Err(PublishError::Io(error)),
         }
         let path = directory.join(format!("{}.partial.bin", request.label));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o400);
-        }
-        let mut file = options.open(&path)?;
+        let mut file = crate::private_fs::create_private_file(&path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(path)
@@ -459,20 +413,7 @@ impl RecordingStaging {
             ));
         }
         let path = self.staging_path.join(TERMINAL_STATE_MEMBER);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o400);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions)?;
+        write_private_readonly(&path, bytes)?;
         self.terminal_state_written = true;
         Ok(path)
     }
@@ -566,11 +507,7 @@ impl RecordingStaging {
         manifest_bytes.push(b'\n');
         let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
         let manifest_path = self.staging_path.join(MANIFEST_MEMBER);
-        let mut manifest_file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&manifest_path)
-        {
+        let mut manifest_file = match crate::private_fs::create_private_file(&manifest_path) {
             Ok(value) => value,
             Err(error) => return Err(PublishError::Io(error)),
         };
@@ -596,6 +533,10 @@ impl RecordingStaging {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(PublishError::Io(error)),
         }
+        super::publish_layout::validate_final_layout(
+            &self.staging_path,
+            &input.validation.request,
+        )?;
         if let Err(error) = crate::path_safety::sync_directory(&self.staging_path) {
             return Err(PublishError::Io(error));
         }
@@ -775,9 +716,11 @@ fn validate_initial_snapshot_members(
         }
         let file_name = format!("{}.bin", snapshot.label);
         expected_names.insert(file_name.clone());
-        let path = initial_snapshot_path(bundle_path, &snapshot.label);
-        regular_owned_member(&path)?;
-        let bytes = fs::read(&path)?;
+        let bytes = crate::path_safety::read_bounded_regular_member(
+            bundle_path,
+            &format!("{INITIAL_SNAPSHOTS_DIR}/{file_name}"),
+            snapshot.length,
+        )?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != snapshot.length {
             return Err(PublishError::InvalidIdentity(format!(
                 "initial snapshot {} size mismatch",
@@ -856,9 +799,11 @@ fn validate_terminal_snapshot_members(
         }
         let file_name = format!("{}.bin", snapshot.label);
         expected_names.insert(file_name.clone());
-        let path = terminal_snapshot_path(bundle_path, &snapshot.label);
-        regular_owned_member(&path)?;
-        let bytes = fs::read(&path)?;
+        let bytes = crate::path_safety::read_bounded_regular_member(
+            bundle_path,
+            &format!("{SNAPSHOTS_DIR}/{file_name}"),
+            snapshot.length,
+        )?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != snapshot.length {
             return Err(PublishError::InvalidIdentity(format!(
                 "terminal snapshot {} size mismatch",
@@ -902,8 +847,11 @@ fn validate_terminal_state_member(
             "terminal state request identity is invalid".into(),
         ));
     }
-    regular_owned_member(&path)?;
-    let bytes = fs::read(&path)?;
+    let bytes = crate::path_safety::read_bounded_regular_member(
+        bundle_path,
+        TERMINAL_STATE_MEMBER,
+        crate::live::recording_capability::CORE_MAX_TERMINAL_STATE_BYTES,
+    )?;
     if bytes.is_empty()
         || u64::try_from(bytes.len()).unwrap_or(u64::MAX)
             > crate::live::recording_capability::CORE_MAX_TERMINAL_STATE_BYTES
@@ -928,61 +876,17 @@ fn validate_terminal_state_member(
     }))
 }
 
-fn validate_input_movie_member(
-    bundle_path: &Path,
-    request: &super::recording_manifest::RecordingRequest,
-) -> Result<(), PublishError> {
-    let path = bundle_path.join(INPUT_MOVIE_MEMBER);
-    let Some(identity) = &request.input_movie else {
-        if fs::symlink_metadata(&path).is_ok() {
-            return Err(PublishError::InvalidIdentity(
-                "unexpected input movie member".into(),
-            ));
-        }
-        return Ok(());
-    };
-    if identity.format != crate::input_movie::INPUT_MOVIE_FORMAT
-        || identity.port != 0
-        || identity.frames != request.frames.saturating_add(request.warmup_frames)
-        || !valid_hex_digest(&identity.sha256, 32)
-    {
-        return Err(PublishError::InvalidIdentity(
-            "input movie request identity is invalid".into(),
-        ));
-    }
-    regular_owned_member(&path)?;
-    let metadata = fs::metadata(&path)?;
-    if metadata.len() != identity.bytes {
-        return Err(PublishError::InvalidIdentity(
-            "input movie member size mismatch".into(),
-        ));
-    }
-    let bytes = fs::read(&path)?;
-    if identity.sha256 != hex::encode(Sha256::digest(&bytes)) {
-        return Err(PublishError::InvalidIdentity(
-            "input movie member digest mismatch".into(),
-        ));
-    }
-    let text = std::str::from_utf8(&bytes).map_err(|error| {
-        PublishError::InvalidIdentity(format!("input movie member is not UTF-8: {error}"))
-    })?;
-    let canonical = canonical_recording_movie(
-        text,
-        request.frames.saturating_add(request.warmup_frames),
-        u64::MAX,
-    )
-    .map_err(PublishError::InvalidIdentity)?;
-    if canonical.bytes != bytes {
-        return Err(PublishError::InvalidIdentity(
-            "input movie member is not canonical".into(),
-        ));
-    }
-    Ok(())
-}
-
 pub fn verify_published_recording(
     bundle_path: &Path,
     registry: &EventContractRegistry,
+) -> Result<VerifiedPublishedRecording, PublishedBundleError> {
+    verify_published_recording_checked(bundle_path, registry, |_, _| Ok(()))
+}
+
+pub(crate) fn verify_published_recording_checked(
+    bundle_path: &Path,
+    registry: &EventContractRegistry,
+    check: impl FnOnce(&Path, &RecordingManifest) -> Result<(), PublishedBundleError>,
 ) -> Result<VerifiedPublishedRecording, PublishedBundleError> {
     const MAX_MANIFEST_BYTES: u64 = 128 * 1024;
     let metadata = fs::symlink_metadata(bundle_path)?;
@@ -1001,13 +905,18 @@ pub fn verify_published_recording(
     if manifest_metadata.len() > MAX_MANIFEST_BYTES {
         return Err(PublishedBundleError::ManifestTooLarge);
     }
-    let manifest_bytes = fs::read(&manifest_path)?;
+    let manifest_bytes = crate::path_safety::read_bounded_regular_member(
+        &bundle_path,
+        MANIFEST_MEMBER,
+        MAX_MANIFEST_BYTES,
+    )?;
     let manifest = match parse_manifest(std::str::from_utf8(&manifest_bytes).map_err(|error| {
         PublishedBundleError::Invalid(format!("manifest is not UTF-8: {error}"))
     })?)? {
         BundleManifest::Legacy(_) => return Err(PublishedBundleError::LegacyFormat),
         BundleManifest::Recording(manifest) => *manifest,
     };
+    check(&bundle_path, &manifest)?;
     if manifest.format_version != RECORDING_FORMAT_VERSION
         || manifest.capture_kind != super::recording_manifest::CaptureKind::RecordWindow
         || manifest.terminal.publication != PublicationOutcome::Published
@@ -1051,6 +960,8 @@ pub fn verify_published_recording(
         },
     })
     .map_err(|error| PublishedBundleError::Invalid(error.to_string()))?;
+    super::publish_layout::validate_final_layout(&bundle_path, &manifest.request)
+        .map_err(|error| PublishedBundleError::Invalid(error.to_string()))?;
     let event_members: Vec<_> = manifest
         .members
         .iter()
@@ -1139,8 +1050,8 @@ pub fn verify_published_recording(
     let events_path = bundle_path.join(EVENTS_MEMBER);
     regular_owned_member(&events_path)
         .map_err(|error| PublishedBundleError::Invalid(error.to_string()))?;
-    let validated = validate_recording(
-        &events_path,
+    let validated = super::recording::validate_recording_file(
+        crate::path_safety::open_regular_member_no_follow(&bundle_path, EVENTS_MEMBER)?,
         registry,
         RecordingValidationInput {
             request: manifest.request.clone(),

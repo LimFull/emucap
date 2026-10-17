@@ -1,8 +1,9 @@
 # emucap — PCSX2 (PlayStation 2) adapter
 
-The PlayStation 2 adapter uses a pinned PCSX2 fork and a separate Rust bridge. The fork extends
-PCSX2's local PINE protocol with bounded, terminally acknowledged control operations; the bridge
-translates those operations to the emucap protocol.
+The PlayStation 2 adapter patches a pinned PCSX2 revision and uses a separate Rust bridge.
+The patches extend PCSX2's local PINE protocol with launch-bound mutual authentication and bounded,
+terminally acknowledged control operations; the bridge translates those operations to the emucap
+protocol.
 
 `status.methods`, `status.memory_types`, and `status.contracts` are authoritative for a live
 session. Stock PCSX2 is rejected because its PINE surface does not provide the host-control
@@ -32,8 +33,9 @@ The Ninja build does not apply Xcode target-signing attributes by itself. The bu
 ad-hoc-signs the local app with PCSX2's JIT entitlements and verifies the result. Without that step,
 the process starts but fails while mapping EE and recompiler memory.
 
-The current Windows and Linux source paths share the Rust launcher and bridge, but have not received
-the same live runtime verification as the macOS x86_64 build.
+Windows builds use MSVC, preferring Visual Studio 2022, and target x64 on both Intel/AMD and
+ARM Windows hosts. The dependency build uses the same target toolchain as PCSX2 and requires native
+Python. Set `EMUCAP_PCSX2_PYTHON` to `python.exe` when it is not on `PATH`.
 
 ## BIOS and media
 
@@ -63,6 +65,12 @@ Each port gets an emucap-owned PCSX2 data root, settings, memory cards, logs, ca
 endpoint. The configured BIOS is referenced from its original location. The session UI language is
 fixed to English so a fresh headless profile cannot open a missing-font download dialog, and audio
 is muted. The operator's normal PCSX2 profile is neither read nor modified.
+
+The launcher also creates a distinct native credential for the PCSX2 process and bridge. PINE
+accepts no memory, execution, input, state or path-bearing command until both processes prove that
+credential. Authentication candidates and their work are bounded, so a silent or malformed local
+peer cannot indefinitely prevent the managed bridge from connecting. The credential is internal to
+managed launch; users do not configure it.
 
 There is no legacy shell launcher for this adapter. `bootstrap` and `launch_plan` report the Rust
 MCP `launch` tool as the only supported launch path.
@@ -123,6 +131,10 @@ rejected before a breakpoint is armed. Read or write ranges of the same kind mus
 addresses apart so one maximum-width EE access cannot match both; an ambiguous registration is
 rejected before the native breakpoint set changes.
 
+The bridge and native PINE owner each admit at most 128 retained registrations across exec/read/write.
+Capacity returns after owned entries are cleared. Rejected additions preserve existing breakpoints;
+GUI-owned breakpoints and internal stepping retain their separate ownership.
+
 `poll_events` drains a bounded native queue. Each hit includes its kind, accessing PC, exact access
 address and width, and the low 64-bit EE register snapshot captured at the hit. The queue retains up
 to 256 hits and reports how many older entries were dropped. Breakpoints created through this
@@ -181,7 +193,7 @@ with the actual `advanced` count, and discards remaining native frame work befor
 `probe` accepts 0–5,000 frames and does not read memory after an interrupted advance.
 Instruction-unit stepping is not supported. Split requests larger than 5,000 frames and wait for each
 terminal response before issuing the next dependent request. Rebuild the maintained host: host API 5
-adds frame-counted terminal replies, and older hosts are rejected.
+introduced frame-counted terminal replies; the current host API is 9, and older hosts are rejected.
 
 `save_state` and `load_state` require frozen state and preserve it on return. Their paths must be
 absolute. A running-state call fails before starting a save or load.
@@ -210,7 +222,7 @@ that guest progress was undone.
 
 `read_memory_batch` reads up to 64 ranges (64 KiB) of `ee` at the paused CPU thread.
 `debug.execution_speed` sets the nominal speed to an integer 1–10000 percent or selects the
-unlimited limiter (host API 8); turbo, slow motion and a fast-boot override read back as
+unlimited limiter (introduced in host API 8; current host API 9); turbo, slow motion and a fast-boot override read back as
 `custom`. A set returns native previous/final policies captured in one CPU-thread operation.
 The policy revision advances at native changes, including changes between queries.
 The agent speed survives the settings reload a reset performs. The frame limiter sleeps

@@ -52,6 +52,8 @@ pub struct ValidatedRecording {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordingValidationError {
+    #[error("recording limits are invalid: {0}")]
+    InvalidLimits(String),
     #[error("recording event stream is invalid: {0}")]
     Event(#[from] EventValidationError),
     #[error("recording event contract is invalid: {0}")]
@@ -90,6 +92,18 @@ pub fn validate_recording(
     registry: &EventContractRegistry,
     input: RecordingValidationInput,
 ) -> Result<ValidatedRecording, RecordingValidationError> {
+    let file = crate::path_safety::open_regular_file_no_follow(events_path)
+        .map_err(EventValidationError::from)?;
+    validate_recording_file(file, registry, input)
+}
+
+pub(crate) fn validate_recording_file(
+    file: std::fs::File,
+    registry: &EventContractRegistry,
+    input: RecordingValidationInput,
+) -> Result<ValidatedRecording, RecordingValidationError> {
+    crate::live::recording_capability::validate_recording_limits(&input.request.limits)
+        .map_err(|error| RecordingValidationError::InvalidLimits(error.to_string()))?;
     let total_frames = input
         .request
         .warmup_frames
@@ -188,7 +202,7 @@ pub fn validate_recording(
         .map(|(id, _)| (*id).to_string())
         .collect();
     let stream = validate_event_stream_at_start(
-        events_path,
+        file,
         registry,
         &EventValidationSpec {
             f_start: f_origin,

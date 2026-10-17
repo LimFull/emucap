@@ -27,6 +27,18 @@ pub mod ppsspp;
 pub mod spec;
 pub mod xemu;
 
+pub(crate) fn new_native_debug_token() -> String {
+    format!(
+        "native-{}{}{}{}",
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase()
+    )
+}
+
+#[cfg(test)]
+mod home_tests;
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
@@ -51,38 +63,162 @@ pub(crate) fn native_build_metadata_path(binary: &Path, filename: &str) -> PathB
 }
 
 /// Base directory for emucap-owned emulator data, per OS. `EMUCAP_EMU_HOME` overrides it.
-pub(crate) fn emu_home_base() -> PathBuf {
-    if let Some(base) = std::env::var_os("EMUCAP_EMU_HOME") {
-        return PathBuf::from(base);
+/// Discovery never falls back to a shared temporary directory. Unix uses the OS account home
+/// when HOME is missing; unavailable or non-absolute roots are explicit setup errors.
+pub(crate) fn emu_home_base() -> std::io::Result<PathBuf> {
+    resolve_emu_home_base(std::env::var_os("EMUCAP_EMU_HOME"), platform_data_home())
+}
+
+fn resolve_emu_home_base(
+    explicit: Option<std::ffi::OsString>,
+    platform: std::io::Result<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    let path = explicit.map(PathBuf::from).map_or(platform, Ok)?;
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "emucap data directory must be absolute; set EMUCAP_EMU_HOME",
+        ));
     }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return Path::new(&home).join("Library/Application Support/emucap");
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return Path::new(&local).join("emucap");
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
+    Ok(path)
+}
+
+fn platform_data_home() -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(|home| PathBuf::from(home).join("emucap"));
+    #[cfg(unix)]
+    let base = {
+        #[cfg(not(target_os = "macos"))]
         if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            return Path::new(&xdg).join("emucap");
+            return resolve_emu_home_base(None, Ok(PathBuf::from(xdg).join("emucap")));
         }
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(".local/share/emucap");
-        }
-    }
-    std::env::temp_dir().join("emucap")
+        std::env::home_dir()
+            .filter(|home| home.is_absolute())
+            .map(|home| {
+                #[cfg(target_os = "macos")]
+                let suffix = "Library/Application Support/emucap";
+                #[cfg(not(target_os = "macos"))]
+                let suffix = ".local/share/emucap";
+                home.join(suffix)
+            })
+    };
+    base.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound,
+        "user data directory is unavailable; set EMUCAP_EMU_HOME to an absolute private directory")
+    })
 }
 
 fn join_emu_home(base: &Path, emu: &str, port: u16) -> PathBuf {
     base.join(emu).join(port.to_string())
 }
 
-/// The emucap-owned directory for one emulator + port. The emulator runs against this so
-/// its config and saves stay out of the user's real emulator directory.
-pub fn emu_home_dir(emu: &str, port: u16) -> PathBuf {
-    join_emu_home(&emu_home_base(), emu, port)
+/// The emucap-owned namespace for one emulator + Control port.
+///
+/// This is suitable for bounded transport rendezvous and compatibility data. Managed mutable
+/// emulator state belongs under [`emu_generation_dir`], not directly in this directory.
+pub fn emu_home_dir(emu: &str, port: u16) -> std::io::Result<PathBuf> {
+    Ok(join_emu_home(&emu_home_base()?, emu, port))
+}
+
+fn validate_emulator_component(value: &str) -> std::io::Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "emulator profile component must be a bounded portable identifier",
+        ));
+    }
+    Ok(())
+}
+
+/// The already prepared private capsule for one managed launch generation.
+pub fn runtime_generation_dir(port: u16, runtime: RuntimeEnv<'_>) -> std::io::Result<PathBuf> {
+    if !crate::path_safety::is_hyphenated_ascii_id(runtime.launch_id, 96)
+        || !runtime.adapter_failure_path.is_absolute()
+        || runtime
+            .adapter_failure_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some("adapter-failure.json")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime generation identity or failure path is invalid",
+        ));
+    }
+    let generation = runtime.adapter_failure_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime failure path has no generation directory",
+        )
+    })?;
+    if generation.file_name().and_then(|value| value.to_str()) != Some(runtime.launch_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime failure path does not belong to the declared launch generation",
+        ));
+    }
+    let generations = generation.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime generation path has no generations directory",
+        )
+    })?;
+    let port_component = port.to_string();
+    if generations.file_name().and_then(|value| value.to_str()) != Some("generations")
+        || generations
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            != Some(port_component.as_str())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime generation path does not belong to the declared Control port",
+        ));
+    }
+    let expected = emu_home_base()?
+        .join("sessions")
+        .join(port_component)
+        .join("generations")
+        .join(runtime.launch_id);
+    if generation != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime generation path is outside the managed runtime store",
+        ));
+    }
+    crate::private_fs::verify_private_dir(generation)?;
+    Ok(generation.to_path_buf())
+}
+
+/// Create or verify an emulator's mutable workspace for exactly one launch generation.
+pub fn emu_generation_dir(
+    emu: &str,
+    port: u16,
+    runtime: Option<RuntimeEnv<'_>>,
+) -> std::io::Result<PathBuf> {
+    validate_emulator_component(emu)?;
+    if let Some(runtime) = runtime {
+        let generation = runtime_generation_dir(port, runtime)?;
+        let profile = generation.join("emulators").join(emu);
+        crate::private_fs::ensure_private_dir_tree(&generation, &profile)?;
+        return Ok(profile);
+    }
+
+    let base = emu_home_base()?;
+    let manual_root = join_emu_home(&base, emu, port).join("manual");
+    crate::private_fs::ensure_private_dir_tree(&base, &manual_root)?;
+    let profile = manual_root.join(format!(
+        "manual-{}",
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    ));
+    crate::private_fs::create_private_dir(&profile)?;
+    Ok(profile)
 }
 
 /// OS-agnostic description of how to start one emulator process.
@@ -177,10 +313,7 @@ impl LaunchSpec {
         if let Some(parent) = self.log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let out = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let out = crate::private_fs::open_private_append(&self.log_path)?;
         let err = out.try_clone()?;
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args)
@@ -209,9 +342,11 @@ pub fn spawn_detached(spec: &LaunchSpec) -> std::io::Result<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: setsid() is async-signal-safe and is the only action before exec.
+        // SAFETY: umask() and setsid() are async-signal-safe. The managed child must not create
+        // firmware, guest data, screenshots, memory cards or logs with ambient group/other access.
         unsafe {
             cmd.pre_exec(|| {
+                libc::umask(0o077);
                 libc::setsid();
                 Ok(())
             });

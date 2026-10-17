@@ -122,6 +122,7 @@ PATCHES=(
   "$HERE/patches/0024-preserve-gba-input-observation.patch"
   "$HERE/patches/0025-fix-windows-native-build.patch"
   "$HERE/patches/0026-publish-windows-input-devices-before-use.patch"
+  "$HERE/patches/0027-safe-callback-removal-during-dispatch.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

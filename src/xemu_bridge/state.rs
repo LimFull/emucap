@@ -21,7 +21,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         let layout = self.block_layout()?;
         let media = self.current_media_identity()?;
         let eeprom = self.read_eeprom()?;
-        let previous = self.read_replaced_container(&path, &layout)?;
+        let _ = self.read_replaced_container(&path, &layout)?;
         let snapshot_tag = self.next_snapshot_tag();
 
         self.run_snapshot_job("snapshot-save", &snapshot_tag, &layout.hdd_node)?;
@@ -49,24 +49,9 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             )));
         }
 
-        if let Some((old, old_bytes)) = previous {
-            if old.launch_id == container.launch_id
-                && old.storage.hdd_path == container.storage.hdd_path
-                && old.storage.hdd_node == container.storage.hdd_node
-            {
-                if let Err(cleanup_error) =
-                    self.delete_snapshot(&old.storage.snapshot_tag, &layout.hdd_node)
-                {
-                    let restore = crate::path_safety::atomic_write_file(&path, &old_bytes);
-                    let discard = self.delete_snapshot(&snapshot_tag, &layout.hdd_node);
-                    return Err(XemuBridgeError::Emulator(format!(
-                        "failed to replace the prior Xbox internal snapshot: {cleanup_error}; previous container restore={} new snapshot cleanup={}",
-                        outcome_label(restore),
-                        outcome_label(discard)
-                    )));
-                }
-            }
-        }
+        // Container files can be copied. Replacing one pathname does not grant
+        // authority to delete a backing snapshot referenced by another copy.
+        // Published snapshots live until this generation's managed disk is disposed.
 
         Ok(json!({
             "status":"completed",
@@ -262,12 +247,5 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         self.debug_stop_observed = previous_debug_stop;
         self.state_integrity_error = None;
         Ok(())
-    }
-}
-
-fn outcome_label<T, E: std::fmt::Display>(outcome: Result<T, E>) -> String {
-    match outcome {
-        Ok(_) => "completed".into(),
-        Err(error) => format!("failed ({error})"),
     }
 }

@@ -25,7 +25,7 @@ pub use session::{
 };
 
 use super::{
-    emu_home_base, emu_home_dir, find_on_path, is_runnable_file, process_alive, spawn_detached,
+    emu_home_base, find_on_path, is_runnable_file, process_alive, spawn_detached,
     terminate_detached, LaunchSpec, RuntimeEnv,
 };
 
@@ -216,8 +216,8 @@ pub fn resolve_firmware_root(profile: OpenMsxProfile) -> io::Result<Option<PathB
         return Ok(None);
     }
     let root = std::env::var_os("EMUCAP_OPENMSX_FIRMWARE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| emu_home_base().join("firmware/openmsx"));
+        .map(|path| Ok(PathBuf::from(path)))
+        .unwrap_or_else(|| emu_home_base().map(|base| base.join("firmware/openmsx")))?;
     session::validate_firmware_root(&root)?;
     Ok(Some(root))
 }
@@ -304,8 +304,7 @@ pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
     })?;
     validate_content_for_profile(profile, launch.content)?;
     require_compatible_build(launch.repo_root, launch.binary)?;
-    let runtime_home = emu_home_dir("openmsx", launch.port);
-    std::fs::create_dir_all(&runtime_home)?;
+    let runtime_home = super::emu_generation_dir("openmsx", launch.port, launch.runtime)?;
     let generation_key = launch
         .runtime
         .map(|runtime| runtime.launch_id.to_owned())

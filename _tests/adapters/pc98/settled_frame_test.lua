@@ -31,6 +31,8 @@ emu = { file = function() return socket end,
 for _, name in ipairs({"reset", "stop", "pre_save", "post_load", "frame"}) do
   emu["add_machine_" .. name .. "_notifier"] = function(f) callbacks[name] = f; return f end
 end
+local fixture = dofile(root .. "/_tests/adapters/pc98/control_io_fixture.lua")
+fixture.install(emu, socket)
 dofile(root .. "/adapters/mame-pc98/plugins/emucap_gdbstub/init.lua").startplugin()
 local function upvalue(f, name, value, write)
   for i = 1, 100 do
@@ -59,7 +61,7 @@ emu.osd_ticks_per_second = function() return 1000 end
 local function request(name, argument)
   writes = {}
   local encoded = argument and ("," .. argument:gsub(".", function(c) return string.format("%02x", c:byte()) end)) or ""
-  handle("qEmucap," .. name .. encoded)
+  fixture.call(handle, "qEmucap," .. name .. encoded)
   local reply = writes[#writes]
   assert(reply and reply:match("^%$"), name .. " did not reply")
   return reply:match("^%$(.*)#%x%x$")
@@ -102,7 +104,7 @@ assert(request("framefinish", "done") == "FRAME|done|completed|2|2|none")
 -- Raw interrupt preserves its own reply and the correlated child terminal.
 assert(request("framebegin", "interrupt:120:1000") == "FRAME|interrupt|running|0|120|none")
 machine.paused, machine.state_io_boundary = false, false
-writes = {}; handle("\x03")
+writes = {}; fixture.call(handle, "\x03")
 assert(machine.paused and #writes == 0)
 assert(request("framepoll", "interrupt") == "FRAME|interrupt|stopping|0|120|cancelled")
 machine.state_io_boundary = true

@@ -1,7 +1,187 @@
 use super::broker;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+
+const TEST_SESSION_TOKEN: &str = "broker-test-session-token";
+const TEST_PRODUCER_LAUNCH: &str = "launch-01arz3ndektsv4rrffq69g5fav";
+
+fn test_launch_id(label: &str) -> String {
+    let mut suffix: String = label
+        .bytes()
+        .map(|byte| match byte.to_ascii_lowercase() {
+            byte @ (b'0'..=b'9'
+            | b'a'..=b'h'
+            | b'j'
+            | b'k'
+            | b'm'
+            | b'n'
+            | b'p'..=b't'
+            | b'v'..=b'z') => char::from(byte),
+            _ => '0',
+        })
+        .take(26)
+        .collect();
+    suffix.extend(std::iter::repeat_n('0', 26 - suffix.len()));
+    format!("launch-{suffix}")
+}
+
+fn connect_producer_as(addr: impl std::net::ToSocketAddrs, launch_id: &str) -> TcpStream {
+    let stream = TcpStream::connect(addr).unwrap();
+    let port = stream.peer_addr().unwrap().port();
+    let root = broker::producer_token_from_controller(TEST_SESSION_TOKEN);
+    let front_key = super::producer_auth::derive_front_key(
+        &root,
+        super::producer_auth::Boundary::BrokerProducer,
+        port,
+        launch_id,
+    )
+    .unwrap();
+    super::producer_auth::authenticate_producer_stream(
+        stream,
+        &front_key,
+        super::producer_auth::Boundary::BrokerProducer,
+        port,
+        launch_id,
+        Duration::from_secs(2),
+    )
+    .unwrap()
+}
+
+fn connect_producer(addr: impl std::net::ToSocketAddrs) -> TcpStream {
+    connect_producer_as(addr, TEST_PRODUCER_LAUNCH)
+}
+
+#[test]
+fn broker_readiness_preserves_an_attached_controller() {
+    use super::link::EmulatorLink;
+    let (ea, sa) = start_broker();
+    let emulator = fake_emu(ea, Some("ready-owner".into()));
+    std::thread::sleep(Duration::from_millis(100));
+    let mut owner = super::broker_link::connect_with_token(
+        &sa,
+        Some("ready-owner".into()),
+        TEST_SESSION_TOKEN,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    super::broker_link::probe_session_with_token(&sa, TEST_SESSION_TOKEN, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        owner.call("status", serde_json::json!({})).unwrap()["connected"],
+        true
+    );
+    emulator.join().unwrap();
+}
+
+#[test]
+fn producer_proofs_cannot_enumerate_attach_or_replace_controller() {
+    let (ea, sa) = start_broker();
+    let mut producer = controlled_producer(&ea, Some("role-target"), "role-generation");
+    producer
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let token = broker::producer_token_from_controller(TEST_SESSION_TOKEN);
+    assert_ne!(token, TEST_SESSION_TOKEN);
+    assert!(!broker::generated_session_token_is_current(&token));
+    for mut params in [
+        serde_json::json!({}),
+        serde_json::json!({"name":"role-target"}),
+        serde_json::json!({"name":"role-target","expected_registration_id":1,"expected_launch_id":"role-generation"}),
+    ] {
+        let mut writer = TcpStream::connect(&sa).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let (client, server, proof) = begin_session_auth(&mut writer, &mut reader);
+        assert!(!broker::auth_proof_matches(
+            &broker::session_server_proof(&token, &client, &server),
+            &proof
+        ));
+        let binding = broker::session_attach_binding(params.as_object().unwrap());
+        params["auth_proof"] =
+            broker::session_client_proof(&token, &client, &server, &binding).into();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"v":1,"id":1,"method":"attach","params":params})
+        )
+        .unwrap();
+        let mut reply = String::new();
+        reader.read_line(&mut reply).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["error"]["kind"], "identity_mismatch");
+        assert!(reply.get("result").is_none());
+    }
+    let mut byte = [0];
+    assert!(
+        matches!(producer.read(&mut byte), Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+    );
+}
+
+#[test]
+fn controller_secret_is_not_a_producer_bearer() {
+    let (ea, sa) = start_broker();
+    let mut rejected = submit_producer_hello(
+        &ea,
+        serde_json::json!({
+            "id":0,"ok":true,"result":{
+                "protocol_version":1,"session_token":TEST_SESSION_TOKEN,
+                "name":"wrong-role","methods":["status"]
+            }
+        }),
+    );
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(rejected.read(&mut [0]).unwrap(), 0);
+    let (_, reply) = attach(&sa, Some("wrong-role"));
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["error"]["kind"], "no_such_emulator");
+}
+
+#[test]
+fn producer_visible_credential_cannot_attach_to_another_emulator() {
+    use super::link::{EmulatorLink, LinkError};
+    let (ea, sa) = start_broker();
+    let _source = controlled_producer(&ea, Some("role-source"), "source-generation");
+    let _target = controlled_producer(&ea, Some("role-target"), "target-generation");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let source_controller = loop {
+        match super::broker_link::connect_with_token(
+            &sa,
+            Some("role-source".into()),
+            TEST_SESSION_TOKEN,
+            Duration::from_secs(1),
+        ) {
+            Ok(link) => break link,
+            Err(LinkError::NoSuchEmulator { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => panic!("source controller failed: {result:?}"),
+        }
+    };
+    let exposed = source_controller.session_token().unwrap();
+    let attack = super::broker_link::connect_with_token(
+        &sa,
+        Some("role-target".into()),
+        exposed,
+        Duration::from_secs(1),
+    );
+    assert!(
+        matches!(attack, Err(LinkError::IdentityMismatch { .. })),
+        "producer role escalated or returned an unexpected error: {attack:?}"
+    );
+    let target = super::broker_link::connect_with_token(
+        &sa,
+        Some("role-target".into()),
+        TEST_SESSION_TOKEN,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(target.has_exclusive_control());
+}
 
 // Start the broker on two ephemeral ports and return (emulator_addr, session_addr).
 fn start_broker() -> (String, String) {
@@ -9,14 +189,78 @@ fn start_broker() -> (String, String) {
     let sess = TcpListener::bind("127.0.0.1:0").unwrap();
     let ea = emu.local_addr().unwrap().to_string();
     let sa = sess.local_addr().unwrap().to_string();
-    std::thread::spawn(move || broker::serve(emu, sess));
+    std::thread::spawn(move || broker::serve(emu, sess, TEST_SESSION_TOKEN.to_string()));
     (ea, sa)
+}
+
+fn begin_session_auth(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+) -> (String, String, String) {
+    let client_nonce = broker::new_auth_nonce();
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({
+            "v": 1,
+            "id": 0,
+            "method": "broker_authenticate",
+            "params": {"protocol_version": 1, "client_nonce": client_nonce.clone()},
+        })
+    )
+    .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(response["id"], 0);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["protocol_version"], 1);
+    let server_nonce = response["result"]["server_nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let server_proof = response["result"]["server_proof"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (client_nonce, server_nonce, server_proof)
+}
+
+fn authenticated_attach(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    mut params: serde_json::Value,
+) -> String {
+    let (client_nonce, server_nonce, server_proof) = begin_session_auth(writer, reader);
+    let expected_server =
+        broker::session_server_proof(TEST_SESSION_TOKEN, &client_nonce, &server_nonce);
+    assert!(broker::auth_proof_matches(&expected_server, &server_proof));
+    let params = params.as_object_mut().expect("broker attach params object");
+    let binding = broker::session_attach_binding(params);
+    params.insert(
+        "auth_proof".into(),
+        serde_json::Value::String(broker::session_client_proof(
+            TEST_SESSION_TOKEN,
+            &client_nonce,
+            &server_nonce,
+            &binding,
+        )),
+    );
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({"v": 1, "id": 1, "method": "attach", "params": params})
+    )
+    .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    response
 }
 
 // 가짜 에뮬레이터: 접속→hello 응답(name, methods)→이후 명령 echo 응답.
 fn fake_emu(addr: String, name: Option<String>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let s = TcpStream::connect(addr).unwrap();
+        let s = connect_producer(addr);
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
         let mut hello = String::new();
@@ -60,7 +304,7 @@ fn fake_mesen_emu(
         .map(|value| value.to_string())
         .collect();
     std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_producer(addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -128,9 +372,7 @@ fn broker_routes_and_pumps_keepalive() {
     let s = TcpStream::connect(sa).unwrap();
     let mut r = BufReader::new(s.try_clone().unwrap());
     let mut w = s;
-    writeln!(w, r#"{{"v":1,"id":1,"method":"attach","params":{{}}}}"#).unwrap();
-    let mut ar = String::new();
-    r.read_line(&mut ar).unwrap();
+    let ar = authenticated_attach(&mut w, &mut r, serde_json::json!({}));
     assert!(ar.contains("attached_name"), "attach 응답: {ar}");
 
     writeln!(w, r#"{{"v":1,"id":2,"method":"status","params":{{}}}}"#).unwrap();
@@ -148,7 +390,7 @@ fn broker_routes_and_pumps_keepalive() {
 fn broker_attach_preserves_contract_advertisement() {
     let (emulator_addr, session_addr) = start_broker();
     let emulator = std::thread::spawn(move || {
-        let stream = TcpStream::connect(emulator_addr).unwrap();
+        let stream = connect_producer(emulator_addr);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -184,19 +426,11 @@ fn broker_attach_preserves_contract_advertisement() {
     let stream = TcpStream::connect(session_addr).unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = stream;
-    writeln!(
-        writer,
-        "{}",
-        serde_json::json!({
-            "v": 1,
-            "id": 1,
-            "method": "attach",
-            "params": {"name": "nds-contracts"},
-        })
-    )
-    .unwrap();
-    let mut response = String::new();
-    reader.read_line(&mut response).unwrap();
+    let response = authenticated_attach(
+        &mut writer,
+        &mut reader,
+        serde_json::json!({"name": "nds-contracts"}),
+    );
     let value: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(
         value["result"]["contracts"]["catalog"],
@@ -219,6 +453,7 @@ fn broker_attach_preserves_contract_advertisement() {
     );
     assert_eq!(value["result"]["attached_name"], "nds-contracts");
     assert_ne!(value["result"]["broker_registration_id"], 999999);
+    assert!(value["result"].get("session_token").is_none());
     emulator.join().unwrap();
 }
 
@@ -304,15 +539,541 @@ fn attach_with_params(sa: &str, params: serde_json::Value) -> (TcpStream, String
     let s = TcpStream::connect(sa).unwrap();
     let mut r = BufReader::new(s.try_clone().unwrap());
     let mut w = s.try_clone().unwrap();
+    let ar = authenticated_attach(&mut w, &mut r, params);
+    (s, ar)
+}
+
+fn submit_producer_hello(ea: &str, response: serde_json::Value) -> TcpStream {
+    let advertised_launch = response
+        .get("result")
+        .and_then(|result| result.get("launch_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|launch_id| {
+            super::producer_auth::derive_front_key(
+                "test",
+                super::producer_auth::Boundary::BrokerProducer,
+                1,
+                launch_id,
+            )
+            .is_ok()
+        })
+        .unwrap_or(TEST_PRODUCER_LAUNCH);
+    let mut stream = connect_producer_as(ea, advertised_launch);
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut hello = String::new();
+    reader.read_line(&mut hello).unwrap();
+    let hello: serde_json::Value = serde_json::from_str(hello.trim()).unwrap();
+    assert_eq!(hello["id"], 0);
+    assert_eq!(hello["method"], "hello");
+    assert_eq!(hello["params"], serde_json::json!({}));
+    writeln!(stream, "{response}").unwrap();
+    stream
+}
+
+fn controlled_producer(ea: &str, name: Option<&str>, launch_id: &str) -> TcpStream {
+    let launch_id = test_launch_id(launch_id);
+    let mut result = serde_json::json!({
+        "protocol_version": 1,
+        "methods": ["status"], "launch_id": launch_id,
+    });
+    if let Some(name) = name {
+        result["name"] = serde_json::json!(name);
+    }
+    submit_producer_hello(ea, serde_json::json!({"id":0,"ok":true,"result":result}))
+}
+
+fn disconnect_producer(producer: &TcpStream, session: &TcpStream) {
+    session
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    producer.shutdown(std::net::Shutdown::Both).unwrap();
+    let mut notice = String::new();
+    BufReader::new(session.try_clone().unwrap())
+        .read_line(&mut notice)
+        .unwrap();
+    assert!(
+        notice.contains("emulator gone"),
+        "EOF cleanup must finish: {notice}"
+    );
+}
+
+#[test]
+fn broker_authenticated_duplicate_cannot_evict_owner() {
+    let (ea, sa) = start_broker();
+    let mut original = controlled_producer(&ea, Some("g"), "launch-original");
+    std::thread::sleep(Duration::from_millis(100));
+    let (mut session, first) = attach(&sa, Some("g"));
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    for launch in ["launch-attacker", "launch-original"] {
+        let mut candidate = controlled_producer(&ea, Some("g"), launch);
+        candidate
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut byte = [0];
+        match candidate.read(&mut byte) {
+            Ok(0) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+            other => panic!("duplicate must close without replacing owner: {other:?}"),
+        }
+    }
+    session
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    original
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     writeln!(
-        w,
+        session,
         "{}",
-        serde_json::json!({"v": 1, "id": 1, "method": "attach", "params": params})
+        serde_json::json!({"v":1,"id":42,"method":"status","params":{}})
     )
     .unwrap();
-    let mut ar = String::new();
-    r.read_line(&mut ar).unwrap();
-    (s, ar)
+    let mut command = String::new();
+    BufReader::new(original.try_clone().unwrap())
+        .read_line(&mut command)
+        .unwrap();
+    let command: serde_json::Value = serde_json::from_str(&command).unwrap();
+    writeln!(
+        original,
+        "{}",
+        serde_json::json!({"id":command["id"],"ok":true,"result":{"owner":true}})
+    )
+    .unwrap();
+    let mut reply = String::new();
+    BufReader::new(session.try_clone().unwrap())
+        .read_line(&mut reply)
+        .unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["id"], 42);
+    assert_eq!(reply["result"]["owner"], true);
+    let (_, resumed) = attach_with_params(
+        &sa,
+        serde_json::json!({"name":"g", "expected_registration_id":first["result"]["broker_registration_id"]}),
+    );
+    let resumed: serde_json::Value = serde_json::from_str(&resumed).unwrap();
+    assert_eq!(
+        resumed["result"]["broker_registration_id"],
+        first["result"]["broker_registration_id"]
+    );
+}
+
+#[test]
+fn broker_anonymous_registration_skips_named_slots() {
+    let (ea, sa) = start_broker();
+    let _named = controlled_producer(&ea, Some("emu1"), "named");
+    std::thread::sleep(Duration::from_millis(100));
+    let (_owner, first) = attach(&sa, Some("emu1"));
+    let _anonymous = controlled_producer(&ea, None, "anonymous");
+    std::thread::sleep(Duration::from_millis(100));
+    let (_, second) = attach(&sa, Some("emu2"));
+    let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(second["result"]["launch_id"], test_launch_id("anonymous"));
+    assert!(first.contains("named"));
+    let (_, busy) = attach(&sa, Some("emu1"));
+    assert!(busy.contains("busy"));
+}
+
+#[test]
+fn broker_concurrent_duplicate_admission_has_one_owner() {
+    let (ea, sa) = start_broker();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let attempts: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|launch| {
+            let ea = ea.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                (launch, controlled_producer(&ea, Some("g"), launch))
+            })
+        })
+        .collect();
+    let candidates: Vec<_> = attempts
+        .into_iter()
+        .map(|attempt| attempt.join().unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    let (_session, response) = attach(&sa, Some("g"));
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["ok"], true);
+    let winner = response["result"]["launch_id"].as_str().unwrap();
+    assert!([test_launch_id("first"), test_launch_id("second")]
+        .iter()
+        .any(|launch_id| launch_id == winner));
+    for (launch, mut socket) in candidates {
+        if test_launch_id(launch) != winner {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            match socket.read(&mut [0]) {
+                Ok(0) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+                other => panic!("losing registration stayed open: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn broker_rejects_unauthenticated_same_name_producer_without_replacement() {
+    let (ea, sa) = start_broker();
+    let _legitimate = fake_emu_alive(ea.clone(), "g", 3000);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let attacker = TcpStream::connect(&ea).unwrap();
+    let port = attacker.peer_addr().unwrap().port();
+    let wrong_front = super::producer_auth::derive_front_key(
+        "wrong-producer-root",
+        super::producer_auth::Boundary::BrokerProducer,
+        port,
+        TEST_PRODUCER_LAUNCH,
+    )
+    .unwrap();
+    assert!(super::producer_auth::authenticate_producer_stream(
+        attacker,
+        &wrong_front,
+        super::producer_auth::Boundary::BrokerProducer,
+        port,
+        TEST_PRODUCER_LAUNCH,
+        Duration::from_secs(1),
+    )
+    .is_err());
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (_session, response) = attach(&sa, Some("g"));
+    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["methods"], serde_json::json!(["status"]));
+}
+
+#[test]
+fn broker_rejects_malformed_producer_envelopes_before_registration() {
+    let (ea, sa) = start_broker();
+    let _legitimate = fake_emu_alive(ea.clone(), "g", 3000);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let malformed = [
+        serde_json::json!({
+            "id": 1,
+            "ok": true,
+            "result": {"protocol_version": 1, "session_token": broker::producer_token_from_controller(TEST_SESSION_TOKEN), "name": "g", "methods": ["wrong_id"]},
+        }),
+        serde_json::json!({
+            "id": 0,
+            "ok": false,
+            "result": {"protocol_version": 1, "session_token": broker::producer_token_from_controller(TEST_SESSION_TOKEN), "name": "g", "methods": ["not_ok"]},
+        }),
+        serde_json::json!({"id": 0, "ok": true, "result": [TEST_SESSION_TOKEN]}),
+        serde_json::json!({
+            "id": 0,
+            "ok": true,
+            "result": {"protocol_version": 2, "session_token": broker::producer_token_from_controller(TEST_SESSION_TOKEN), "name": "g", "methods": ["wrong_protocol"]},
+        }),
+    ];
+    let _invalid_connections: Vec<_> = malformed
+        .into_iter()
+        .map(|response| submit_producer_hello(&ea, response))
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (_session, response) = attach(&sa, Some("g"));
+    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["methods"], serde_json::json!(["status"]));
+}
+
+#[test]
+fn broker_rejects_unauthenticated_registration_takeover_without_name_disclosure() {
+    let (ea, sa) = start_broker();
+    let _emulator = fake_emu_alive(ea, "g", 3000);
+    std::thread::sleep(Duration::from_millis(100));
+    let (mut legitimate, attached) = attach(&sa, Some("g"));
+    let attached: serde_json::Value = serde_json::from_str(attached.trim()).unwrap();
+    let registration = attached["result"]["broker_registration_id"]
+        .as_u64()
+        .unwrap();
+
+    let mut attacker = TcpStream::connect(sa).unwrap();
+    let mut attacker_reader = BufReader::new(attacker.try_clone().unwrap());
+    let (_client_nonce, _server_nonce, _server_proof) =
+        begin_session_auth(&mut attacker, &mut attacker_reader);
+    writeln!(
+        attacker,
+        "{}",
+        serde_json::json!({
+            "v": 1,
+            "id": 1,
+            "method": "attach",
+            "params": {
+                "name": "g",
+                "expected_registration_id": registration,
+                "auth_proof": "wrong-proof",
+            },
+        })
+    )
+    .unwrap();
+    let mut rejected = String::new();
+    attacker_reader.read_line(&mut rejected).unwrap();
+    let rejected: serde_json::Value = serde_json::from_str(rejected.trim()).unwrap();
+    assert_eq!(rejected["error"]["kind"], "identity_mismatch");
+    assert!(rejected["error"].get("name").is_none());
+    assert!(rejected["error"].get("names").is_none());
+
+    legitimate
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let still_open = matches!(
+        legitimate.read(&mut byte),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+    );
+    assert!(
+        still_open,
+        "unauthenticated exact-registration attach replaced the owner"
+    );
+}
+
+#[test]
+fn broker_times_out_silent_admission_connections() {
+    let (ea, sa) = start_broker();
+    let producer = TcpStream::connect(ea).unwrap();
+    let mut producer_reader = BufReader::new(producer);
+    let mut challenge = [0u8; 25];
+    producer_reader.read_exact(&mut challenge).unwrap();
+    assert_eq!(&challenge[..4], b"ECFA");
+
+    let session = TcpStream::connect(sa).unwrap();
+    let mut session_reader = BufReader::new(session);
+    std::thread::sleep(Duration::from_millis(5300));
+    producer_reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    session_reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut line = String::new();
+    assert_eq!(producer_reader.read_line(&mut line).unwrap(), 0);
+    assert_eq!(session_reader.read_line(&mut line).unwrap(), 0);
+}
+
+#[test]
+fn broker_admission_deadline_cannot_be_extended_by_slow_drip() {
+    let (ea, sa) = start_broker();
+    let producer = TcpStream::connect(ea).unwrap();
+    producer
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut producer_reader = BufReader::new(producer.try_clone().unwrap());
+    let mut challenge = [0u8; 25];
+    producer_reader.read_exact(&mut challenge).unwrap();
+    assert_eq!(&challenge[..4], b"ECFA");
+    let session = TcpStream::connect(sa).unwrap();
+    session
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut session_reader = BufReader::new(session.try_clone().unwrap());
+
+    let producer_drip = std::thread::spawn(move || {
+        let mut producer = producer;
+        for _ in 0..8 {
+            if producer.write_all(b"{").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(750));
+        }
+    });
+    let session_drip = std::thread::spawn(move || {
+        let mut session = session;
+        for _ in 0..8 {
+            if session.write_all(b"{").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(750));
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(5300));
+    // A peer still writing at the deadline may observe FIN or RST. Both prove
+    // admission ended; a timeout or another byte does not.
+    for reader in [&mut producer_reader, &mut session_reader] {
+        let result = reader.read_line(&mut String::new());
+        assert!(
+            matches!(&result, Ok(0))
+                || matches!(&result, Err(error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                )),
+            "admission did not close: {result:?}"
+        );
+    }
+    producer_drip.join().unwrap();
+    session_drip.join().unwrap();
+}
+
+#[test]
+fn broker_admits_controller_behind_full_silent_producer_queue() {
+    let (ea, sa) = start_broker();
+    let mut held = Vec::new();
+    for _ in 0..broker::MAX_PENDING_ADMISSIONS {
+        let stream = TcpStream::connect(&ea).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut challenge = [0u8; 25];
+        reader.read_exact(&mut challenge).unwrap();
+        assert_eq!(&challenge[..4], b"ECFA");
+        held.push(reader);
+    }
+    super::broker_link::probe_session_with_token(
+        &sa,
+        TEST_SESSION_TOKEN,
+        Duration::from_millis(500),
+    )
+    .expect("silent producers must not prevent controller authentication");
+}
+
+#[test]
+fn broker_admits_producer_behind_full_silent_producer_queue() {
+    let (ea, sa) = start_broker();
+    let mut held = Vec::new();
+    for _ in 0..broker::MAX_PENDING_ADMISSIONS {
+        let stream = TcpStream::connect(&ea).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut challenge = [0u8; 25];
+        reader.read_exact(&mut challenge).unwrap();
+        assert_eq!(&challenge[..4], b"ECFA");
+        held.push(reader);
+    }
+    let mut producer = connect_producer(ea);
+    producer
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut hello = String::new();
+    BufReader::new(producer.try_clone().unwrap())
+        .read_line(&mut hello)
+        .unwrap();
+    assert!(hello.contains("hello"));
+    writeln!(
+        producer,
+        "{}",
+        serde_json::json!({"id":0,"ok":true,"result":{
+            "protocol_version":1,
+            "name":"after-silent","methods":["status"]
+        }})
+    )
+    .unwrap();
+    let _owner = connect_registered(&sa, "after-silent");
+    assert_eq!(
+        held[0].read(&mut [0]).unwrap(),
+        0,
+        "oldest silent peer was not evicted"
+    );
+}
+
+fn connect_registered(sa: &str, name: &str) -> super::broker_link::BrokerLink {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match super::broker_link::connect_with_token(
+            sa,
+            Some(name.into()),
+            TEST_SESSION_TOKEN,
+            Duration::from_secs(1),
+        ) {
+            Ok(link) => return link,
+            Err(super::link::LinkError::NoSuchEmulator { .. })
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => panic!("authenticated attachment failed: {result:?}"),
+        }
+    }
+}
+
+#[test]
+fn broker_admits_both_roles_behind_full_controller_queue_and_preserves_owner() {
+    use super::link::EmulatorLink;
+    let (ea, sa) = start_broker();
+    let existing = fake_emu(ea.clone(), Some("existing-owner".into()));
+    let mut owner = connect_registered(&sa, "existing-owner");
+    let mut held = Vec::new();
+    for _ in 0..broker::MAX_PENDING_ADMISSIONS {
+        let mut stream = TcpStream::connect(&sa).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        begin_session_auth(&mut stream, &mut reader);
+        held.push(stream);
+    }
+    let new_producer = fake_emu(ea, Some("new-owner".into()));
+    let mut new_owner = connect_registered(&sa, "new-owner");
+    assert_eq!(
+        new_owner.call("status", serde_json::json!({})).unwrap()["connected"],
+        true
+    );
+    assert_eq!(
+        owner.call("status", serde_json::json!({})).unwrap()["connected"],
+        true
+    );
+    assert_eq!(held[0].read(&mut [0]).unwrap(), 0);
+    existing.join().unwrap();
+    new_producer.join().unwrap();
+}
+
+#[test]
+fn broker_progress_and_established_traffic_survive_bounded_invalid_churn() {
+    use super::link::EmulatorLink;
+    let (ea, sa) = start_broker();
+    let existing = fake_emu(ea.clone(), Some("churn-owner".into()));
+    let mut owner = connect_registered(&sa, "churn-owner");
+    let (started, ready) = std::sync::mpsc::channel();
+    let churn_ea = ea.clone();
+    let churn_sa = sa.clone();
+    let churn = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for index in 0..96 {
+            for addr in [&churn_ea, &churn_sa] {
+                let mut stream = TcpStream::connect(addr).unwrap();
+                stream
+                    .write_all(if index % 2 == 0 {
+                        b"{partial"
+                    } else {
+                        b"invalid\n"
+                    })
+                    .unwrap();
+                held.push(stream);
+            }
+            if index == 32 {
+                started.send(()).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let new_producer = fake_emu(ea, Some("during-churn".into()));
+    let mut new_owner = connect_registered(&sa, "during-churn");
+    assert_eq!(
+        new_owner.call("status", serde_json::json!({})).unwrap()["connected"],
+        true
+    );
+    assert_eq!(
+        owner.call("status", serde_json::json!({})).unwrap()["connected"],
+        true
+    );
+    churn.join().unwrap();
+    existing.join().unwrap();
+    new_producer.join().unwrap();
 }
 
 #[test]
@@ -393,12 +1154,13 @@ fn broker_rejects_a_reconnect_after_emulator_registration_changes() {
 #[test]
 fn broker_accepts_reregistration_only_for_the_same_returned_launch() {
     let (ea, sa) = start_broker();
-    let _first_emulator = fake_managed_emu_alive(ea.clone(), "g", "launch-same", 4000);
+    let first_emulator = controlled_producer(&ea, Some("g"), "launch-same");
     std::thread::sleep(Duration::from_millis(100));
     let (first_session, first) = attach(&sa, Some("g"));
     let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
     let first_registration = first["result"]["broker_registration_id"].as_u64().unwrap();
 
+    disconnect_producer(&first_emulator, &first_session);
     let _replacement_emulator = fake_managed_emu_alive(ea, "g", "launch-same", 4000);
     std::thread::sleep(Duration::from_millis(100));
     let (_continued_session, continued) = attach_with_params(
@@ -406,7 +1168,7 @@ fn broker_accepts_reregistration_only_for_the_same_returned_launch() {
         serde_json::json!({
             "name": "g",
             "expected_registration_id": first_registration,
-            "expected_launch_id": "launch-same",
+            "expected_launch_id": test_launch_id("launch-same"),
         }),
     );
     let continued: serde_json::Value = serde_json::from_str(continued.trim()).unwrap();
@@ -429,7 +1191,7 @@ fn broker_rejects_reregistration_for_a_different_launch() {
         serde_json::json!({
             "name": "g",
             "expected_registration_id": u64::MAX,
-            "expected_launch_id": "launch-old",
+            "expected_launch_id": test_launch_id("launch-old"),
         }),
     );
     assert!(
@@ -442,7 +1204,7 @@ fn broker_rejects_reregistration_for_a_different_launch() {
 fn fake_emu_alive(addr: String, name: &str, hold_ms: u64) -> std::thread::JoinHandle<()> {
     let name = name.to_string();
     std::thread::spawn(move || {
-        let s = TcpStream::connect(addr).unwrap();
+        let s = connect_producer(addr);
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
         let mut hello = String::new();
@@ -463,9 +1225,9 @@ fn fake_managed_emu_alive(
     hold_ms: u64,
 ) -> std::thread::JoinHandle<()> {
     let name = name.to_string();
-    let launch_id = launch_id.to_string();
+    let launch_id = test_launch_id(launch_id);
     std::thread::spawn(move || {
-        let stream = TcpStream::connect(addr).unwrap();
+        let stream = connect_producer_as(addr, &launch_id);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -491,19 +1253,20 @@ fn fake_managed_emu_alive(
 
 #[test]
 fn broker_old_session_reader_does_not_clobber_new_pairing() {
-    // 같은 EMUCAP_NAME 에뮬레이터가 replace된 뒤, 구 세션의 리더가 뒤늦게 종료하며
+    // EOF 후 같은 EMUCAP_NAME 에뮬레이터가 등록된 뒤, 구 세션의 리더가 뒤늦게 종료하며
     // 신규 세션의 페어링을 unpair하면 안 된다(session generation 가드).
     let (ea, sa) = start_broker();
-    let _e1 = fake_emu_alive(ea.clone(), "g", 1000); // 곧 replace됨
+    let e1 = controlled_producer(&ea, Some("g"), "old");
     std::thread::sleep(Duration::from_millis(100));
 
     // 세션 A: 구 에뮬레이터에 페어링(소켓 보관 — 아직 종료 안 함).
     let (a_sock, ar_a) = attach(&sa, Some("g"));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
 
-    // 같은 이름 재등록(replace) — 신규 에뮬레이터는 오래 살아있다.
+    // EOF cleanup releases the name before a different producer registers.
+    disconnect_producer(&e1, &a_sock);
     let _e2 = fake_emu_alive(ea.clone(), "g", 3000);
-    std::thread::sleep(Duration::from_millis(200)); // A는 replaced 통지, 신규 등록 완료
+    std::thread::sleep(Duration::from_millis(200)); // 신규 등록 완료
 
     // 세션 B: 신규 에뮬레이터에 페어링.
     let (_b_sock, ar_b) = attach(&sa, Some("g"));
@@ -572,7 +1335,7 @@ fn fake_emu_hold_reply(
 ) -> std::thread::JoinHandle<()> {
     let name = name.to_string();
     std::thread::spawn(move || {
-        let s = TcpStream::connect(addr).unwrap();
+        let s = connect_producer(addr);
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
         let mut hello = String::new();
@@ -664,14 +1427,15 @@ fn broker_frontend_eof_delivers_negotiated_attachment_detach() {
     let (ea, sa) = start_broker();
     let (sent, received) = std::sync::mpsc::channel();
     let producer = std::thread::spawn(move || {
-        let mut writer = TcpStream::connect(ea).unwrap();
+        let launch_id = test_launch_id("live");
+        let mut writer = connect_producer_as(ea, &launch_id);
         writer
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut reader = BufReader::new(writer.try_clone().unwrap());
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        writeln!(writer,"{}",serde_json::json!({"id":0,"ok":true,"result":{"name":"lifecycle","methods":["step"],"launch_id":"live","control_session_lifecycle":true}})).unwrap();
+        writeln!(writer,"{}",serde_json::json!({"id":0,"ok":true,"result":{"protocol_version":1,"name":"lifecycle","methods":["step"],"launch_id":launch_id,"control_session_lifecycle":true}})).unwrap();
         for _ in 0..3 {
             line.clear();
             assert_ne!(reader.read_line(&mut line).unwrap(), 0);
@@ -709,4 +1473,47 @@ fn broker_frontend_eof_delivers_negotiated_attachment_detach() {
         attached["_control_session"]["attachment"]
     );
     producer.join().unwrap();
+}
+
+#[test]
+fn oversized_admission_is_closed_at_every_stage() {
+    let (producer, session) = start_broker();
+    for (address, stage) in [(&producer, 0), (&session, 1), (&session, 2)] {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        if stage == 0 {
+            let mut challenge = [0u8; 25];
+            reader.read_exact(&mut challenge).unwrap();
+        } else if stage == 2 {
+            begin_session_auth(&mut stream, &mut reader);
+        }
+        // Fragment without a newline: admission must reject before EOF or parsing.
+        let bytes = vec![b' '; broker::MAX_ADMISSION_FRAME_BYTES + 1];
+        for chunk in bytes.chunks(1024) {
+            if stream.write_all(chunk).is_err() {
+                break;
+            }
+        }
+        let mut byte = [0];
+        let result = reader.read(&mut byte);
+        assert!(
+            matches!(result, Ok(0))
+                || result.as_ref().is_err_and(|error| matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                )),
+            "stage {stage}: {result:?}"
+        );
+    }
+    // Rejected candidates release permits; ordinary admission remains available.
+    let _producer = fake_emu(producer, Some("after-limit".into()));
+    std::thread::sleep(Duration::from_millis(150));
+    let (_, response) = attach(&session, Some("after-limit"));
+    assert!(response.contains("after-limit"), "{response}");
 }

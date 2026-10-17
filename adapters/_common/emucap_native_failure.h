@@ -26,6 +26,13 @@ bool emucap_write_native_failure_atomic(
     const std::string& json,
     std::string* error = nullptr);
 
+#ifdef _WIN32
+bool emucap_write_native_failure_atomic_wide(
+    const std::wstring& path,
+    const std::string& json,
+    std::string* error = nullptr);
+#endif
+
 bool emucap_publish_native_failure(
     const char* adapter,
     const char* emulator_build,

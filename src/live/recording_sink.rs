@@ -1,21 +1,11 @@
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
-const SINK_HANDSHAKE_LIMIT: u64 = 1024;
 const SINK_POLL_MS: u64 = 50;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SinkHandshake {
-    token: String,
-    capture_id: String,
-}
 
 #[derive(Debug)]
 pub(super) struct SinkOutcome {
@@ -127,6 +117,15 @@ impl SinkServer {
     }
 }
 
+impl Drop for SinkServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn run_sink(
     listener: TcpListener,
     mut writer: crate::bundle::publish::BoundedEventWriter,
@@ -143,37 +142,14 @@ fn run_sink(
     let mut last_frame = None;
     let mut truncated = false;
     let result = (|| -> Result<(), String> {
-        let stream = loop {
-            if stop.load(Ordering::Acquire) {
-                return Err("sink stopped before connection".into());
-            }
-            if Instant::now() >= deadline {
-                return Err("sink accept deadline exceeded".into());
-            }
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => return Err(format!("sink accept failed: {error}")),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_millis(SINK_POLL_MS)))
-            .map_err(|error| format!("sink timeout setup failed: {error}"))?;
-        let mut reader = BufReader::new(stream);
-        let (handshake, complete) =
-            read_sink_line(&mut reader, SINK_HANDSHAKE_LIMIT, deadline, stop)
-                .map_err(|error| format!("sink handshake read failed: {error}"))?
-                .ok_or_else(|| "sink closed before handshake".to_string())?;
-        if !complete {
-            return Err("sink handshake was truncated".into());
-        }
-        let handshake: SinkHandshake = serde_json::from_slice(&handshake)
-            .map_err(|error| format!("sink handshake JSON failed: {error}"))?;
-        if handshake.token != expected_token || handshake.capture_id != expected_capture {
-            return Err("sink authentication failed".into());
-        }
+        let mut reader = super::recording_admission::accept_authenticated(
+            &listener,
+            expected_token,
+            expected_capture,
+            deadline,
+            stop,
+            Duration::from_millis(SINK_POLL_MS),
+        )?;
 
         while let Some((line, complete)) =
             read_sink_line(&mut reader, max_line_bytes, deadline, stop)

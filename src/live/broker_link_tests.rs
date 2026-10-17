@@ -6,6 +6,199 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
+const TEST_SESSION_TOKEN: &str = "broker-link-test-session-token";
+
+#[test]
+fn controller_reader_never_falls_back_to_producer_file() {
+    let _lock = crate::test_env::lock_env();
+    let _env = crate::test_env::EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_PORT"]);
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", home.path());
+    std::env::set_var("EMUCAP_PORT", "49325");
+    let store = super::runtime::RuntimeStore::discover().unwrap();
+    let controller = super::broker::new_session_token();
+    // Even an old valid shared-key credential must not be treated as a controller file.
+    store.write_compatibility_token(49325, &controller).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    assert!(matches!(
+        broker_link::connect(&address, None, Duration::from_secs(1)),
+        Err(LinkError::NotConnected)
+    ));
+    let producer = super::broker::producer_token_from_controller(&controller);
+    store
+        .write_broker_controller_token(49325, &producer)
+        .unwrap();
+    assert!(matches!(
+        broker_link::connect(&address, None, Duration::from_secs(1)),
+        Err(LinkError::Protocol(_))
+    ));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
+fn empty_registry_exposes_only_producer_capability_and_clears_failed_reload() {
+    let _lock = crate::test_env::lock_env();
+    let _env = crate::test_env::EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_PORT"]);
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", home.path());
+    let emu = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = emu.local_addr().unwrap().port();
+    std::env::set_var("EMUCAP_PORT", port.to_string());
+    let session = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = session.local_addr().unwrap().to_string();
+    let store = super::runtime::RuntimeStore::discover().unwrap();
+    let controller = super::broker::new_session_token();
+    store
+        .write_broker_controller_token(port, &controller)
+        .unwrap();
+    let producer = super::broker::producer_token_from_controller(&controller);
+    std::thread::spawn(move || super::broker::serve(emu, session, controller));
+    let mut link = broker_link::lazy(&address, Some("absent".into()), Duration::from_secs(1));
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NoSuchEmulator { .. })
+    ));
+    assert_eq!(link.session_token(), Some(producer.as_str()));
+    std::fs::remove_file(store.broker_controller_token_path(port)).unwrap();
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_eq!(link.session_token(), None);
+}
+
+fn receive_authenticated_attach(
+    writer: &mut std::net::TcpStream,
+    reader: &mut BufReader<std::net::TcpStream>,
+    session_token: &str,
+) -> serde_json::Value {
+    let mut auth_init = String::new();
+    reader.read_line(&mut auth_init).unwrap();
+    let auth_init: serde_json::Value = serde_json::from_str(auth_init.trim()).unwrap();
+    assert_eq!(auth_init["id"], 0);
+    assert_eq!(auth_init["method"], "broker_authenticate");
+    let client_nonce = auth_init["params"]["client_nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let server_nonce = super::broker::new_auth_nonce();
+    let server_proof =
+        super::broker::session_server_proof(session_token, &client_nonce, &server_nonce);
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({"id": 0, "ok": true, "result": {
+            "protocol_version": 1,
+            "server_nonce": server_nonce.clone(),
+            "server_proof": server_proof,
+        }})
+    )
+    .unwrap();
+
+    let mut attach = String::new();
+    reader.read_line(&mut attach).unwrap();
+    let attach: serde_json::Value = serde_json::from_str(attach.trim()).unwrap();
+    assert!(attach["params"].get("session_token").is_none());
+    let params = attach["params"].as_object().unwrap();
+    let binding = super::broker::session_attach_binding(params);
+    let expected =
+        super::broker::session_client_proof(session_token, &client_nonce, &server_nonce, &binding);
+    assert!(super::broker::auth_proof_matches(
+        &expected,
+        attach["params"]["auth_proof"].as_str().unwrap_or_default(),
+    ));
+    attach
+}
+
+#[test]
+fn broker_link_loads_auth_for_the_configured_producer_port() {
+    let _env_lock = crate::test_env::lock_env();
+    let _env = crate::test_env::EnvGuard::new(&[
+        "EMUCAP_EMU_HOME",
+        "EMUCAP_PORT",
+        super::broker::SESSION_TOKEN_ENV,
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", home.path());
+    std::env::set_var("EMUCAP_PORT", "49321");
+    std::env::set_var(
+        super::broker::SESSION_TOKEN_ENV,
+        "stable-override-must-not-be-used",
+    );
+    let store = super::runtime::RuntimeStore::discover().unwrap();
+    let wrong_default = super::broker::new_session_token();
+    let configured = super::broker::new_session_token();
+    store
+        .write_broker_controller_token(47800, &wrong_default)
+        .unwrap();
+    store
+        .write_broker_controller_token(49321, &configured)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server_token = configured.clone();
+    let worker = std::thread::spawn(move || {
+        let (mut writer, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let attach = receive_authenticated_attach(&mut writer, &mut reader, &server_token);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": attach["id"], "ok": true, "result": {
+                "attached_name": "g", "broker_registration_id": 1, "methods": []
+            }})
+        )
+        .unwrap();
+    });
+
+    let link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        link.session_token(),
+        Some(super::broker::producer_token_from_controller(&configured).as_str())
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn broker_link_rejects_legacy_file_without_contacting_a_listener() {
+    let _env_lock = crate::test_env::lock_env();
+    let _env = crate::test_env::EnvGuard::new(&[
+        "EMUCAP_EMU_HOME",
+        "EMUCAP_PORT",
+        super::broker::SESSION_TOKEN_ENV,
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", home.path());
+    std::env::set_var("EMUCAP_PORT", "49324");
+    std::env::set_var(
+        super::broker::SESSION_TOKEN_ENV,
+        super::broker::new_session_token(),
+    );
+    super::runtime::RuntimeStore::discover()
+        .unwrap()
+        .write_broker_controller_token(49324, "0000000000000000-dead-beef")
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let error = broker_link::connect(
+        &listener.local_addr().unwrap().to_string(),
+        None,
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert!(matches!(error, LinkError::Protocol(_)));
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
 #[test]
 fn broker_link_attaches_and_calls() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -14,9 +207,8 @@ fn broker_link_attaches_and_calls() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap(); // attach
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["status"]}}}}"#
@@ -31,11 +223,61 @@ fn broker_link_attaches_and_calls() {
         )
         .unwrap();
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     assert_eq!(link.capabilities().methods, vec!["status".to_string()]);
     let out = link.call("status", serde_json::json!({})).unwrap();
     assert_eq!(out["connected"], true);
     h.join().unwrap();
+}
+
+#[test]
+fn broker_link_rejects_fake_listener_before_disclosing_bearer_or_attaching() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let fake = std::thread::spawn(move || {
+        let (mut writer, _) = listener.accept().unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let mut auth_init = String::new();
+        reader.read_line(&mut auth_init).unwrap();
+        assert!(auth_init.contains("broker_authenticate"));
+        assert!(
+            !auth_init.contains(TEST_SESSION_TOKEN),
+            "the first frame must not disclose the bearer"
+        );
+        let server_nonce = super::broker::new_auth_nonce();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": 0, "ok": true, "result": {
+                "protocol_version": 1,
+                "server_nonce": server_nonce,
+                "server_proof": "0000000000000000000000000000000000000000000000000000000000000000",
+            }})
+        )
+        .unwrap();
+        let mut forbidden_attach = String::new();
+        assert_eq!(
+            reader.read_line(&mut forbidden_attach).unwrap(),
+            0,
+            "a listener without the token must not receive attach or control traffic"
+        );
+    });
+
+    let error = broker_link::connect_with_token(
+        &addr,
+        Some("secret-target".into()),
+        TEST_SESSION_TOKEN,
+        Duration::from_secs(2),
+    )
+    .unwrap_err();
+    assert!(matches!(error, LinkError::IdentityMismatch { .. }));
+    assert!(!format!("{error:?}").contains(TEST_SESSION_TOKEN));
+    fake.join().unwrap();
 }
 
 #[test]
@@ -46,9 +288,8 @@ fn broker_link_preserves_contract_advertisement_from_attach() {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
-        let mut attach = String::new();
-        reader.read_line(&mut attach).unwrap();
-        let id = serde_json::from_str::<serde_json::Value>(attach.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut writer, &mut reader, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             writer,
             "{}",
@@ -71,7 +312,9 @@ fn broker_link_preserves_contract_advertisement_from_attach() {
         .unwrap();
     });
 
-    let link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     match &link.capabilities().contracts {
         crate::contracts::ContractAdvertisement::Reported(value) => {
             assert_eq!(value.catalog, crate::contracts::CATALOG_ID);
@@ -96,12 +339,13 @@ fn broker_link_connect_returns_busy_on_busy_error() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap(); // attach
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(w, r#"{{"id":{id},"ok":false,"error":{{"kind":"busy"}}}}"#).unwrap();
     });
-    let err = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap_err();
+    let err =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap_err();
     assert!(matches!(err, LinkError::Busy), "Busy 매핑 실패: {err:?}");
     h.join().unwrap();
 }
@@ -115,9 +359,8 @@ fn broker_link_skips_keepalive_and_returns_final() {
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
         // attach 응답
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap();
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["run_frames"]}}}}"#
@@ -140,7 +383,9 @@ fn broker_link_skips_keepalive_and_returns_final() {
         )
         .unwrap();
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     let out = link
         .call("run_frames", serde_json::json!({"n": 60}))
         .unwrap();
@@ -160,17 +405,21 @@ fn broker_link_maps_no_such_emulator_with_names() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap();
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{id},"ok":false,"error":{{"kind":"no_such_emulator","names":["alpha","beta"]}}}}"#
         )
         .unwrap();
     });
-    let err =
-        broker_link::connect(&addr, Some("gamma".into()), Duration::from_secs(2)).unwrap_err();
+    let err = broker_link::connect_with_token(
+        &addr,
+        Some("gamma".into()),
+        TEST_SESSION_TOKEN,
+        Duration::from_secs(2),
+    )
+    .unwrap_err();
     match err {
         LinkError::NoSuchEmulator { names } => {
             assert!(
@@ -195,9 +444,8 @@ fn broker_link_maps_ambiguous_with_names() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap();
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         // 실제 broker 포맷: message 없음
         writeln!(
             w,
@@ -205,7 +453,9 @@ fn broker_link_maps_ambiguous_with_names() {
         )
         .unwrap();
     });
-    let err = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap_err();
+    let err =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap_err();
     match err {
         LinkError::Ambiguous { names } => {
             assert!(
@@ -232,9 +482,7 @@ fn lazy_broker_link_reattaches_after_protocol_desync() {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut writer = stream;
 
-            let mut attach = String::new();
-            reader.read_line(&mut attach).unwrap();
-            let attach = serde_json::from_str::<serde_json::Value>(attach.trim()).unwrap();
+            let attach = receive_authenticated_attach(&mut writer, &mut reader, TEST_SESSION_TOKEN);
             let attach_id = attach["id"].clone();
             if connection == 1 {
                 assert_eq!(attach["params"]["name"], "g");
@@ -263,7 +511,8 @@ fn lazy_broker_link_reattaches_after_protocol_desync() {
         }
     });
 
-    let mut link = broker_link::lazy(&addr, None, Duration::from_secs(2));
+    let mut link =
+        broker_link::lazy_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2));
     assert!(matches!(
         link.call("status", serde_json::json!({})),
         Err(LinkError::Protocol(_))
@@ -271,6 +520,85 @@ fn lazy_broker_link_reattaches_after_protocol_desync() {
     let recovered = link.call("status", serde_json::json!({})).unwrap();
     assert_eq!(recovered["generation"], 2);
     h.join().unwrap();
+}
+
+#[test]
+fn lazy_broker_link_reloads_auth_token_on_reconnect() {
+    let _env_lock = crate::test_env::lock_env();
+    let _env = crate::test_env::EnvGuard::new(&[
+        "EMUCAP_EMU_HOME",
+        "EMUCAP_PORT",
+        super::broker::SESSION_TOKEN_ENV,
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", home.path());
+    std::env::set_var("EMUCAP_PORT", "49322");
+    std::env::set_var(
+        super::broker::SESSION_TOKEN_ENV,
+        "stable-override-must-not-be-used",
+    );
+    let store = super::runtime::RuntimeStore::discover().unwrap();
+    let first_token = super::broker::new_session_token();
+    let second_token = super::broker::new_session_token();
+    store
+        .write_broker_controller_token(49322, &first_token)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server_tokens = [first_token.clone(), second_token.clone()];
+    let worker = std::thread::spawn(move || {
+        for (connection, expected_token) in server_tokens.iter().enumerate() {
+            let (mut writer, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            let attach = receive_authenticated_attach(&mut writer, &mut reader, expected_token);
+            if connection == 1 {
+                assert_eq!(attach["params"]["expected_registration_id"], 1);
+                assert_eq!(attach["params"]["expected_launch_id"], "launch-g");
+            }
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({"id": attach["id"], "ok": true, "result": {
+                    "attached_name": "g", "broker_registration_id": 1,
+                    "launch_id": "launch-g", "methods": ["status"]
+                }})
+            )
+            .unwrap();
+
+            let mut status = String::new();
+            reader.read_line(&mut status).unwrap();
+            let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+            if connection == 0 {
+                writeln!(writer, "malformed").unwrap();
+            } else {
+                writeln!(
+                    writer,
+                    "{}",
+                    serde_json::json!({"id": status["id"], "ok": true, "result": {
+                        "connected": true, "generation": 2
+                    }})
+                )
+                .unwrap();
+            }
+        }
+    });
+
+    let mut link = broker_link::lazy(&addr, None, Duration::from_secs(2));
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::Protocol(_))
+    ));
+    store
+        .write_broker_controller_token(49322, &second_token)
+        .unwrap();
+    let recovered = link.call("status", serde_json::json!({})).unwrap();
+    assert_eq!(recovered["generation"], 2);
+    assert_eq!(
+        link.session_token(),
+        Some(super::broker::producer_token_from_controller(&second_token).as_str())
+    );
+    worker.join().unwrap();
 }
 
 // M1: 응답이 read 타임아웃 경계에 쪼개져 도착해도 pending 버퍼로 이어 읽어 스트림 desync가 없어야
@@ -284,9 +612,8 @@ fn broker_link_preserves_partial_reply_across_timeout() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap(); // attach
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["status"]}}}}"#
@@ -324,7 +651,13 @@ fn broker_link_preserves_partial_reply_across_timeout() {
             }
         }
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_millis(120)).unwrap();
+    let mut link = broker_link::connect_with_token(
+        &addr,
+        None,
+        TEST_SESSION_TOKEN,
+        Duration::from_millis(120),
+    )
+    .unwrap();
     // 반복 호출: 쪼개진 #1은 타임아웃되고 pending에 보존된다. 이어 읽기로 결국 유효 응답을 받아야 하고,
     // 절대 Protocol(desync)로 깨지면 안 된다.
     let mut ok = false;
@@ -361,9 +694,8 @@ fn broker_link_self_heals_after_consecutive_timeouts() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap(); // attach
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["status"]}}}}"#
@@ -372,7 +704,9 @@ fn broker_link_self_heals_after_consecutive_timeouts() {
         // 이후 어떤 요청에도 응답하지 않고 소켓을 연 채 hang(EOF 아님 → read 타임아웃 누적).
         let _ = rel_rx.recv();
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_millis(80)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_millis(80))
+            .unwrap();
     let mut saw_not_connected = false;
     for _ in 0..10 {
         match link.call("status", serde_json::json!({})) {
@@ -404,9 +738,8 @@ fn broker_link_write_timeout_poisons() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap(); // attach
-        let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let id = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["read_memory"]}}}}"#
@@ -415,7 +748,13 @@ fn broker_link_write_timeout_poisons() {
         // 이후 요청을 절대 읽지 않는다 — broker recv 버퍼가 차 큰 요청의 write_all이 스톨한다.
         let _ = rel_rx.recv();
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_millis(200)).unwrap();
+    let mut link = broker_link::connect_with_token(
+        &addr,
+        None,
+        TEST_SESSION_TOKEN,
+        Duration::from_millis(200),
+    )
+    .unwrap();
     #[cfg(windows)]
     link.disable_test_send_buffer();
     // 큰 params로 요청 한 줄을 수십 MB로 만들어 송신+broker recv 버퍼를 넘긴다 → write_all 스톨.
@@ -442,9 +781,8 @@ fn broker_link_bails_on_working_flood_past_deadline() {
         let (s, _) = listener.accept().unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let mut w = s;
-        let mut a = String::new();
-        r.read_line(&mut a).unwrap(); // attach
-        let aid = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
+        let attach = receive_authenticated_attach(&mut w, &mut r, TEST_SESSION_TOKEN);
+        let aid = attach["id"].clone();
         writeln!(
             w,
             r#"{{"id":{aid},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["run_frames"]}}}}"#
@@ -467,7 +805,9 @@ fn broker_link_bails_on_working_flood_past_deadline() {
         }
         let _ = rel_rx.recv();
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     link.set_deferred_deadline(Duration::from_millis(300));
     let r = link.call("run_frames", serde_json::json!({ "n": 1000 }));
     assert!(
@@ -490,9 +830,7 @@ fn broker_progress_preserves_sequence_and_exact_abort_identity() {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
-        let mut attach = String::new();
-        reader.read_line(&mut attach).unwrap();
-        let attach: serde_json::Value = serde_json::from_str(attach.trim()).unwrap();
+        let attach = receive_authenticated_attach(&mut writer, &mut reader, TEST_SESSION_TOKEN);
         writeln!(
             writer,
             "{}",
@@ -549,7 +887,9 @@ fn broker_progress_preserves_sequence_and_exact_abort_identity() {
         )
         .unwrap();
     });
-    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     let cancellation = RequestCancellation::default();
     let trigger = cancellation.clone();
     let control = ProgressCallControl {
@@ -590,15 +930,15 @@ fn broker_temporal_cancellation_drains_ack_before_next_call() {
         std::thread::spawn(move || {
             let (mut writer, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(writer.try_clone().unwrap());
-            let mut attach = String::new();
-            reader.read_line(&mut attach).unwrap();
-            let attach: serde_json::Value = serde_json::from_str(&attach).unwrap();
+            let attach = receive_authenticated_attach(&mut writer, &mut reader, TEST_SESSION_TOKEN);
             writeln!(writer,"{}",serde_json::json!({"id":attach["id"],"ok":true,"result":{
             "attached_name":"temporal", "broker_registration_id":1, "methods":["step","status"]
         }})).unwrap();
             super::temporal::wire::tests::peer(reader, writer, trigger, false);
         });
-    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     let result = link
         .call_with_progress(
             "step",
@@ -622,9 +962,7 @@ fn broker_parent_deadline_closes_a_partial_reply_without_reconnecting() {
     let worker = std::thread::spawn(move || {
         let (mut writer, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(writer.try_clone().unwrap());
-        let mut attach = String::new();
-        reader.read_line(&mut attach).unwrap();
-        let attach: serde_json::Value = serde_json::from_str(&attach).unwrap();
+        let attach = receive_authenticated_attach(&mut writer, &mut reader, TEST_SESSION_TOKEN);
         writeln!(
             writer,
             "{}",
@@ -644,7 +982,8 @@ fn broker_parent_deadline_closes_a_partial_reply_without_reconnecting() {
         .unwrap();
         super::temporal::wire::tests::stalled_parent_peer(reader, writer);
     });
-    let mut link = broker_link::lazy(&addr, None, Duration::from_secs(2));
+    let mut link =
+        broker_link::lazy_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2));
     link.call("status", serde_json::json!({})).unwrap();
     let mut control = super::temporal::wire::tests::control();
     control.max_host_ms = Some(50);
@@ -680,15 +1019,15 @@ fn broker_temporal_rejection_preserves_attachment_for_cleanup() {
         std::thread::spawn(move || {
             let (mut writer, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(writer.try_clone().unwrap());
-            let mut attach = String::new();
-            reader.read_line(&mut attach).unwrap();
-            let attach: serde_json::Value = serde_json::from_str(&attach).unwrap();
+            let attach = receive_authenticated_attach(&mut writer, &mut reader, TEST_SESSION_TOKEN);
             writeln!(writer,"{}",serde_json::json!({"id":attach["id"],"ok":true,"result":{
             "attached_name":"temporal", "broker_registration_id":1, "methods":["step","status"]
         }})).unwrap();
             super::temporal::wire::tests::rejected_input_peer(reader, writer);
         });
-    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let mut link =
+        broker_link::connect_with_token(&addr, None, TEST_SESSION_TOKEN, Duration::from_secs(2))
+            .unwrap();
     let result = link
         .call_with_progress(
             "set_input",

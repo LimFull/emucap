@@ -160,7 +160,6 @@ pub struct OpenMsxBridge<C> {
     /// Bumped by every bridge mutation that can change memory or mapping at one emulated time.
     boundary_seq: u64,
     name: Option<String>,
-    session_token: Option<String>,
     launch_id: Option<String>,
     request_cancellation: crate::live::link::RequestCancellation,
 }
@@ -174,6 +173,11 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         sound: bool,
     ) -> BridgeResult<Self> {
         let profile = session.verify()?;
+        if !runtime_home.is_absolute() || !session.user_data.starts_with(runtime_home) {
+            return Err(OpenMsxBridgeError::BadParams(
+                "openMSX runtime home does not own the prepared session".into(),
+            ));
+        }
         if profile == OpenMsxProfile::MsxTurboR {
             return Err(OpenMsxBridgeError::Unsupported(
                 "MSX turboR requires a separately proven active Z80/R800 bridge".into(),
@@ -267,7 +271,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             capture_epoch: ulid::Ulid::generate().to_string(),
             boundary_seq: 0,
             name: std::env::var("EMUCAP_NAME").ok(),
-            session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
             request_cancellation: Default::default(),
         };
@@ -424,9 +427,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         let object = value.as_object_mut().expect("openMSX hello is an object");
         if let Some(name) = &self.name {
             object.insert("name".into(), json!(name));
-        }
-        if let Some(token) = &self.session_token {
-            object.insert("session_token".into(), json!(token));
         }
         if let Some(launch_id) = &self.launch_id {
             object.insert("launch_id".into(), json!(launch_id));

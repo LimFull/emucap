@@ -131,6 +131,14 @@ pub(crate) fn read_ndjson_chunk(
     reader: &mut impl BufRead,
     pending: &mut Vec<u8>,
 ) -> io::Result<Option<String>> {
+    read_ndjson_chunk_with_limit(reader, pending, MAX_NDJSON_FRAME_BYTES)
+}
+
+pub(crate) fn read_ndjson_chunk_with_limit(
+    reader: &mut impl BufRead,
+    pending: &mut Vec<u8>,
+    max_payload_bytes: usize,
+) -> io::Result<Option<String>> {
     let available = reader.fill_buf()?;
     if available.is_empty() {
         return if pending.is_empty() {
@@ -144,7 +152,7 @@ pub(crate) fn read_ndjson_chunk(
     }
     let newline = available.iter().position(|byte| *byte == b'\n');
     let payload = newline.unwrap_or(available.len());
-    if pending.len().saturating_add(payload) > MAX_NDJSON_FRAME_BYTES {
+    if pending.len().saturating_add(payload) > max_payload_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "control frame too large",

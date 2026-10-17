@@ -455,12 +455,16 @@ impl<G: GdbTransport> Bridge<G> {
         let region = memory_region(memory_type).ok_or_else(|| {
             BridgeError::BadParams(format!("unsupported memory_type: {memory_type}"))
         })?;
+        self.write_abs_bytes(region.base as u64 + start as u64, data)
+    }
+
+    pub(super) fn write_abs_bytes(&mut self, address: u64, data: &[u8]) -> BridgeResult<()> {
         let mut offset = 0usize;
         while offset < data.len() {
             let chunk = MAX_READ_CHUNK.min(data.len() - offset);
             let hex = hex::encode(&data[offset..offset + chunk]);
-            let address = region.base as u64 + start as u64 + offset as u64;
-            let resp = self.send_cmd(&format!("M{address:x},{chunk:x}:{hex}"))?;
+            let target = address + offset as u64;
+            let resp = self.send_cmd(&format!("M{target:x},{chunk:x}:{hex}"))?;
             if resp != "OK" {
                 return Err(BridgeError::Emulator(format!(
                     "GDB memory write failed: {resp}"
@@ -477,8 +481,8 @@ impl<G: GdbTransport> Bridge<G> {
     ) -> BridgeResult<serde_json::Map<String, Value>> {
         let current = self.load_regs_via_lua(regs_hex)?;
         self.frozen = true;
-        let target = state_from_regs_hex(regs_hex);
-        let exact = state_matches_real_mode_pc(&current, &target);
+        // load_regs_via_lua verifies the complete packet before returning.
+        let exact = true;
         let mut out = serde_json::Map::new();
         out.insert("restore_strategy".into(), json!("lua_register_load_hold"));
         out.insert("post_restore_instruction_exact".into(), json!(exact));
@@ -501,13 +505,28 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub(super) fn load_regs_via_lua(&mut self, regs_hex: &str) -> BridgeResult<Value> {
-        let resp = self.lua_cmd_reply("regload", Some(regs_hex))?;
-        let Some(regs) = resp.strip_prefix("OK|") else {
-            return Err(BridgeError::Emulator(format!(
-                "MAME register load failed: {resp}"
-            )));
-        };
-        Ok(state_from_regs_hex(regs))
+        validate_register_packet(regs_hex)?;
+        let result = (|| {
+            let resp = self.lua_cmd_reply("regload", Some(regs_hex))?;
+            let Some(regs) = resp.strip_prefix("OK|") else {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME register load failed: {resp}"
+                )));
+            };
+            validate_register_packet(regs).map_err(|error| {
+                BridgeError::Emulator(format!("invalid restored register packet: {error}"))
+            })?;
+            if !regs.eq_ignore_ascii_case(regs_hex) {
+                return Err(BridgeError::Emulator(
+                    "restored register packet differs from saved state".into(),
+                ));
+            }
+            Ok(state_from_regs_hex(regs))
+        })();
+        if let Err(error) = &result {
+            self.control_fatal = Some(format!("register restoration is unverified: {error}"));
+        }
+        result
     }
 
     pub(super) fn register_probe(
@@ -517,9 +536,47 @@ impl<G: GdbTransport> Bridge<G> {
         address: u64,
         length: usize,
     ) -> BridgeResult<Value> {
+        let max_frames = self.max_sync_frame_count();
+        if frames > max_frames || length == 0 || length > MAX_READ_CHUNK {
+            return Err(BridgeError::BadParams(format!(
+                "register probe exceeds the synchronous frame or memory limit: frames={frames}/{max_frames}, bytes={length}/{MAX_READ_CHUNK}"
+            )));
+        }
+        address
+            .checked_add(length as u64)
+            .ok_or_else(|| BridgeError::BadParams("register probe address overflows".into()))?;
+        validate_register_packet(regs_hex)?;
         let spec = format!("{regs_hex}|{frames}|{address:x}|{length:x}");
-        let resp = self.lua_cmd_reply("regprobe", Some(&spec))?;
-        let result = parse_register_probe_response(&resp)?;
+        let response = if frames == 0 {
+            self.lua_data_cmd_reply("regprobe", Some(&spec))
+        } else {
+            self.drain_buffered_stops()?;
+            let per_frame_ms = self.frame_operation_budget_ms();
+            let estimated_ms = 5_000u64.saturating_add(frames.saturating_mul(per_frame_ms));
+            let plugin_deadline_ms = self.arm_frame_deadline(frames)?;
+            let previous = self.gdb.get_timeout()?;
+            let timeout = Duration::from_millis(
+                plugin_deadline_ms.map_or(estimated_ms, |deadline| deadline + 5_000),
+            );
+            self.gdb.set_timeout(timeout)?;
+            let result = self.lua_data_cmd_reply("regprobe", Some(&spec));
+            let restore = self.gdb.set_timeout(previous);
+            match (result, restore) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(error)) => Err(error.into()),
+                (Err(error), Err(_)) => Err(error),
+            }
+        };
+        let resp = response?;
+        let result = parse_register_probe_response(&resp).map_err(|error| {
+            self.control_fatal = Some(format!("probe restoration is unverified: {error}"));
+            error
+        })?;
+        if frames == 0 && result["regs"] != state_from_regs_hex(regs_hex) {
+            self.control_fatal = Some("zero-frame probe registers differ from saved state".into());
+            return Err(BridgeError::Emulator(self.control_fatal.clone().unwrap()));
+        }
         let actual = result
             .get("hex")
             .and_then(Value::as_str)
@@ -580,41 +637,38 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub(super) fn send_cmd(&mut self, payload: &str) -> BridgeResult<String> {
-        // framestep/BP/WP 히트의 async stop이 drain 창 밖에서 도착하면 버퍼에 남아, 이 데이터
-        // 명령의 응답 자리에 오배달돼 이후 요청/응답이 통째로 off-by-one 디싱크된다. stop을
-        // 정상 응답으로 받는 명령이 아니면, 앞선 stale stop을 이벤트 큐로 걷어내고 진짜 응답을
-        // 이어 읽는다.
-        let mut resp = self.gdb.send(payload)?;
-        if !command_expects_stop(payload) {
-            while is_stop_packet(&resp) {
-                self.note_stop(resp, false);
-                resp = self.gdb.recv_reply()?;
-            }
-        }
-        Ok(resp)
+        self.exchange_command(payload, false)
     }
 
-    /// 데이터(hex/숫자) 응답을 기대하는 명령용 — send_cmd의 stale-stop demux에 더해 스트림에 낀 stale "OK"도
-    /// 걷어낸다. 트레이싱 중 runframes의 frame-target이 pause_on_hit BP 히트와 겹치면 하나의 runframes에
-    /// 완료 "OK"와 BP stop이 이중 응답되고, 브리지가 그중 하나를 소비하면 나머지(늦게 도착한 stale "OK")가
-    /// 다음 데이터 명령(g 레지스터·m 메모리·qEmucap,frame·기타 lua_cmd_reply 읽기)의 응답 자리에 오배달돼
-    /// off-by-one desync된다(get_state가 raw_register_bytes로 깨지고 이후 traceflush가 register 패킷을 받음).
-    /// 데이터를 기대하는 호출자만 이 경로를 쓰고(호출자가 의도 선언), "OK"가 유효 응답인 명령(쓰기 M/G,
-    /// lua_cmd)은 send_cmd를 그대로 써 정상 OK를 소비한다. 드레인 창 크기에 의존하지 않는 결정론적 재정렬.
+    /// Only data commands may discard stale bare OK replies.
     pub(super) fn send_cmd_data(&mut self, payload: &str) -> BridgeResult<String> {
         debug_assert!(!command_expects_stop(payload));
-        let mut resp = self.gdb.send(payload)?;
-        // 데이터 응답 앞에 낀 stale stop(이벤트 큐로)과 stale "OK"(폐기)를 모두 걷어내고 진짜 응답을 읽는다.
-        loop {
-            if is_stop_packet(&resp) {
-                self.note_stop(resp, false);
-            } else if resp == "OK" {
-                // stale 완료 OK — 이 데이터 명령의 유효 응답이 아니므로 폐기(이중 응답의 잔재).
-            } else {
-                return Ok(resp);
-            }
-            resp = self.gdb.recv_reply()?;
+        self.exchange_command(payload, true)
+    }
+
+    fn exchange_command(&mut self, payload: &str, data: bool) -> BridgeResult<String> {
+        if let Some(error) = &self.control_fatal {
+            return Err(BridgeError::Emulator(error.clone()));
         }
+        let mut budget = crate::gdb_rsp::ExchangeBudget::new(self.gdb.get_timeout()?)?;
+        let result = (|| {
+            let mut resp = self.gdb.send_with_timeout(payload, budget.remaining()?)?;
+            loop {
+                if !command_expects_stop(payload) && is_stop_packet(&resp) {
+                    budget.skipped(&resp)?;
+                    self.note_stop(resp, false);
+                } else if data && resp == "OK" {
+                    budget.skipped(&resp)?;
+                } else {
+                    return Ok(resp);
+                }
+                resp = self.gdb.recv_reply_with_timeout(budget.remaining()?)?;
+            }
+        })();
+        if budget.exhausted() || self.gdb.is_terminal() {
+            self.control_fatal = Some("GDB exchange is unverified".into());
+        }
+        result
     }
 
     pub(super) fn lua_cmd(&mut self, name: &str, arg: Option<&str>) -> BridgeResult<String> {
@@ -799,14 +853,28 @@ impl<G: GdbTransport> Bridge<G> {
     /// 자리에 오배달되는 걸 막는다. drain_stop은 frozen이면 조기 반환하지만 스텝 직전엔 frozen
     /// 중에도 직전 프레임 진행의 지연 stop이 남을 수 있어 별도로 항상 버퍼를 비운다.
     pub(super) fn drain_buffered_stops(&mut self) -> BridgeResult<()> {
-        while let Some(pkt) = self.gdb.recv_nonblocking()? {
-            if is_stop_packet(&pkt) {
-                self.note_stop(pkt, false);
-            } else {
-                break;
-            }
+        if let Some(error) = &self.control_fatal {
+            return Err(BridgeError::Emulator(error.clone()));
         }
-        Ok(())
+        let mut budget = crate::gdb_rsp::ExchangeBudget::new(self.gdb.get_timeout()?)?;
+        let result = (|| {
+            while let Some(pkt) = self
+                .gdb
+                .recv_nonblocking_with_timeout(budget.remaining()?)?
+            {
+                budget.skipped(&pkt)?;
+                if is_stop_packet(&pkt) {
+                    self.note_stop(pkt, false);
+                } else {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if budget.exhausted() || self.gdb.is_terminal() {
+            self.control_fatal = Some("GDB drain is unverified".into());
+        }
+        result
     }
 
     pub(super) fn drain_immediate_stops(&mut self) -> BridgeResult<Option<String>> {

@@ -59,9 +59,11 @@ PATCHES=(
   "$HERE/patches/0005-preserve-high-resolution-timer-state.patch"
   "$HERE/patches/0006-add-side-effect-free-memory-peek.patch"
   "$HERE/patches/0007-preflight-native-peek-ranges.patch"
-  "$HERE/patches/0008-initialize-wide-graphics-setting.patch"
   "$HERE/patches/0009-export-windows-debug-api.patch"
   "$HERE/patches/0010-export-elf-debug-api.patch"
+  "$HERE/patches/0011-link-ymz-adpcm.patch"
+  "$HERE/patches/0012-scope-gdi-state-to-windows-frontend.patch"
+  "$HERE/patches/0013-use-windows-link-attributes-in-libretro.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256_path /dev/stdin)"
 if [ "$ACTUAL_PATCHSET_SHA256" != "$NP2KAI_PATCHSET_SHA256" ]; then

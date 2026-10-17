@@ -435,7 +435,7 @@ The emucap patches provide native control while the guest is halted.
   `adapters/openmsx/build.sh`, then build `emucap-openmsx-bridge`. The official
   launcher accepts only the pinned openMSX 21.0 sidecar built with the recorded
   upstream compatibility backport and the maintained emucap host patches. It runs that host
-  with an emucap-owned per-port `HOME` and does not read the user's emulator
+  with an emucap-owned launch-generation `HOME` and does not read the user's emulator
   profile. `msx` is C-BIOS MSX2+; `msx1`, `msx2`, and `msx2p` select
   explicit user-supplied real-firmware profiles. The cartridge surface includes Z80
   state and instruction step, exact headless or visible frame step, bounded CPU

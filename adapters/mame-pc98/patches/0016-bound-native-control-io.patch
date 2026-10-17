@@ -1,0 +1,268 @@
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -12,6 +12,7 @@
+ #include "luaengine.ipp"
+ 
+ #include "mame.h"
++#include "emucap_control_io.h"
+ #include "pluginopts.h"
+ #include "ui/pluginopt.h"
+ #include "ui/ui.h"
+@@ -1036,1 +1037,10 @@
++	auto control_type = emu.new_usertype<emucap::control_socket>(
++			"emucap_control_socket", sol::call_constructor, sol::constructors<emucap::control_socket(std::uint32_t)>());
++	control_type["read"] = &emucap::control_socket::read;
++	control_type["write"] = &emucap::control_socket::write;
++	control_type["close"] = &emucap::control_socket::close;
++	emu["emucap_host_time_ms"] = &emucap::control_socket::now_ms;
++	emu["emucap_host_wait"] = &emucap::control_socket::wait;
++	emu["emucap_read_framebuffer"] = &emucap::read_framebuffer;
++
+ 	auto file_type = emu.new_usertype<emu_file>("file", sol::call_constructor, sol::initializers(
+--- /dev/null
++++ b/src/frontend/mame/emucap_control_io.h
+@@ -0,0 +1,244 @@
++// license:BSD-3-Clause
++// Adapter-local nonblocking transport and bounded regular-file reads.
++#pragma once
++
++#include "asio.h"
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <tuple>
++
++#if defined(_WIN32)
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++namespace emucap {
++
++class control_socket
++{
++public:
++	static constexpr std::size_t chunk_limit = 4096;
++
++	explicit control_socket(std::uint32_t port) : m_listener(m_context), m_peer(m_context)
++	{
++		if (port > 65535)
++			throw std::invalid_argument("invalid control port");
++		using asio::ip::tcp;
++		m_listener.open(tcp::v4());
++#if !defined(_WIN32)
++		// Preserve POSIX same-port restart without Windows' port-sharing semantics.
++		m_listener.set_option(asio::socket_base::reuse_address(true));
++#endif
++		m_listener.bind(tcp::endpoint(asio::ip::address_v4::loopback(), port));
++		m_listener.listen(1);
++		m_listener.non_blocking(true);
++		m_port = m_listener.local_endpoint().port();
++	}
++
++	~control_socket() { close(); }
++	std::uint16_t port() const { return m_port; }
++
++	void close()
++	{
++		m_terminal = true;
++		asio::error_code ignored;
++		m_listener.close(ignored);
++		m_peer.close(ignored);
++	}
++
++	std::tuple<std::string, std::string> read()
++	{
++		if (m_terminal)
++			return { "closed", "" };
++		asio::error_code error;
++		if (m_listener.is_open())
++		{
++			m_listener.accept(m_peer, error);
++			if (idle(error))
++				return { "idle", "" };
++			if (error)
++				return fail(error);
++			m_peer.non_blocking(true, error);
++			if (error)
++				return fail(error);
++			m_peer.set_option(asio::ip::tcp::no_delay(true), error);
++			if (error)
++				return fail(error);
++			m_listener.close(error);
++			if (error)
++				return fail(error);
++			return { "accepted", "" };
++		}
++		std::array<char, chunk_limit> data;
++		auto const size = m_peer.read_some(asio::buffer(data), error);
++		if (idle(error))
++			return { "idle", "" };
++		if (error == asio::error::eof)
++		{
++			close();
++			return { "closed", "" };
++		}
++		if (error)
++			return fail(error);
++		if (!size)
++		{
++			close();
++			return { "closed", "" };
++		}
++		return { "data", std::string(data.data(), size) };
++	}
++
++	std::tuple<std::string, std::size_t> write(std::string_view data)
++	{
++		if (data.empty() || data.size() > chunk_limit)
++			throw std::invalid_argument("control write chunk outside bounds");
++		if (m_terminal)
++			return { "closed", 0 };
++		if (m_listener.is_open())
++			return { "idle", 0 };
++		asio::error_code error;
++		auto const size = m_peer.write_some(asio::buffer(data.data(), data.size()), error);
++		if (idle(error))
++			return { "idle", 0 };
++		if (error)
++		{
++			close();
++			return { "error", 0 };
++		}
++		return { size ? "data" : "idle", size };
++	}
++
++	static double now_ms()
++	{
++		return std::chrono::duration<double, std::milli>(
++			std::chrono::steady_clock::now().time_since_epoch()).count();
++	}
++
++	static void wait() { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
++
++private:
++	static bool idle(asio::error_code const &error)
++	{
++		return error == asio::error::would_block || error == asio::error::try_again;
++	}
++
++	std::tuple<std::string, std::string> fail(asio::error_code const &error)
++	{
++		close();
++		return { "error", error.message() };
++	}
++
++	asio::io_context m_context;
++	asio::ip::tcp::acceptor m_listener;
++	asio::ip::tcp::socket m_peer;
++	std::uint16_t m_port = 0;
++	bool m_terminal = false;
++};
++
++class regular_input
++{
++public:
++	explicit regular_input(std::string const &path)
++	{
++		if (path.empty() || path.size() > 131072 || path.find('\0') != std::string::npos)
++			throw std::invalid_argument("invalid framebuffer path");
++#if defined(_WIN32)
++		auto const length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), int(path.size()), nullptr, 0);
++		if (!length)
++			throw std::runtime_error("invalid UTF-8 framebuffer path");
++		std::wstring wide(length, L'\0');
++		MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), int(path.size()), wide.data(), length);
++		m_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
++			FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
++		if (m_file == INVALID_HANDLE_VALUE)
++			throw std::runtime_error("framebuffer open failed");
++#else
++		m_file = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
++		if (m_file < 0)
++			throw std::runtime_error("framebuffer open failed");
++#endif
++	}
++
++	~regular_input()
++	{
++#if defined(_WIN32)
++		CloseHandle(m_file);
++#else
++		::close(m_file);
++#endif
++	}
++	regular_input(regular_input const &) = delete;
++	regular_input &operator=(regular_input const &) = delete;
++
++	bool exact_size(std::size_t expected) const
++	{
++#if defined(_WIN32)
++		BY_HANDLE_FILE_INFORMATION info;
++		return GetFileType(m_file) == FILE_TYPE_DISK
++			&& GetFileInformationByHandle(m_file, &info)
++			&& !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
++			&& !info.nFileSizeHigh && info.nFileSizeLow == expected;
++#else
++		struct stat info;
++		return !::fstat(m_file, &info) && S_ISREG(info.st_mode)
++			&& info.st_size >= 0 && std::uint64_t(info.st_size) == expected;
++#endif
++	}
++
++	std::size_t read(char *data, std::size_t size)
++	{
++#if defined(_WIN32)
++		DWORD count = 0;
++		if (!ReadFile(m_file, data, DWORD(size), &count, nullptr))
++			throw std::runtime_error("framebuffer read failed");
++		return count;
++#else
++		auto const count = ::read(m_file, data, size);
++		if (count < 0)
++			throw std::runtime_error("framebuffer read failed");
++		return std::size_t(count);
++#endif
++	}
++
++private:
++#if defined(_WIN32)
++	HANDLE m_file = INVALID_HANDLE_VALUE;
++#else
++	int m_file = -1;
++#endif
++};
++
++inline std::string read_framebuffer(std::string const &path, std::uint32_t width, std::uint32_t height)
++{
++	constexpr std::size_t max_bytes = 16 * 1024 * 1024;
++	if (!width || !height || width > max_bytes / 4 || height > max_bytes / 4 / width)
++		throw std::invalid_argument("framebuffer geometry outside bounds");
++	auto const expected = std::size_t(width) * height * 4;
++	regular_input file(path);
++	if (!file.exact_size(expected))
++		throw std::runtime_error("framebuffer must be a regular file of the expected size");
++	std::string data(expected, '\0');
++	for (std::size_t offset = 0; offset < expected; )
++	{
++		auto const count = file.read(data.data() + offset, std::min<std::size_t>(65536, expected - offset));
++		if (!count)
++			throw std::runtime_error("short framebuffer read");
++		offset += count;
++	}
++	char extra;
++	if (file.read(&extra, 1) || !file.exact_size(expected))
++		throw std::runtime_error("framebuffer changed size while reading");
++	return data;
++}
++
++} // namespace emucap

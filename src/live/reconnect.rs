@@ -16,6 +16,7 @@ pub mod cancellation;
 pub mod owned;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKING_INTERVAL: Duration = Duration::from_secs(1);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -221,6 +222,24 @@ where
     F: FnMut(TcpStream, &mut P) -> io::Result<SessionEnd>,
 {
     let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let front_key = std::env::var("EMUCAP_SESSION_TOKEN").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EMUCAP_SESSION_TOKEN is required for producer authentication",
+        )
+    })?;
+    let launch_id = std::env::var("EMUCAP_LAUNCH_ID").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EMUCAP_LAUNCH_ID is required for producer authentication",
+        )
+    })?;
+    let boundary = super::producer_auth::Boundary::from_front_key(&front_key).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EMUCAP_SESSION_TOKEN is not a launch-bound producer key",
+        )
+    })?;
     let mut delay = MIN_RETRY;
     let mut sessions = 0usize;
     loop {
@@ -232,6 +251,24 @@ where
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("[{label}] emucap unavailable ({error}); retrying in {delay:?}");
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(MAX_RETRY);
+                continue;
+            }
+        };
+        let stream = match super::producer_auth::authenticate_producer_stream(
+            stream,
+            &front_key,
+            boundary,
+            port,
+            &launch_id,
+            AUTH_TIMEOUT,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!(
+                    "[{label}] emucap authentication failed ({error}); retrying in {delay:?}"
+                );
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(MAX_RETRY);
                 continue;

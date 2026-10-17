@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use emucap::live::broker_link;
 use emucap::live::continuity;
@@ -56,8 +56,9 @@ use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::launch::{apply_task_entry_transition, make_launch, make_launch_plan};
 use crate::reattach::make_reattach;
 use crate::regression::{
-    default_session_port, ensure_capabilities_loaded, parse_observe_spec, run_one_case,
-    verify_determinism_core, DetOutcome,
+    default_session_port, determinism_preflight_failure, ensure_capabilities_loaded,
+    ensure_capabilities_loaded_before, parse_observe_spec, prepare_case, prepare_suite,
+    regression_deadline, run_prepared_case, verify_determinism_prepared_core, DetOutcome,
 };
 use crate::status::{
     apply_capability_revision, content_identity_for_rom_info, make_bootstrap_value,
@@ -599,7 +600,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Press one or more buttons/keys together for press_frames (including long holds), release them, then advance after_frames. Returns frozen with input released. Read button names and limits from full status."
+        description = "Apply buttons and supported stick axes for press_frames, then release this input and advance after_frames. Use timing={unit:input_polls,press:N,after:M} instead for advertised poll timing. Supports long holds and simultaneous controls. Returns frozen. Read controls and limits from full status."
     )]
     async fn tap(
         &self,
@@ -672,7 +673,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Advance by an exact number of advertised frame or instruction boundaries and return frozen. A configured pausing debugger stop preempts the advance and returns status=interrupted with its stop evidence. Read allowed units and bounds from the live contract."
+        description = "Advance by an exact number of advertised frame, instruction, or input-poll boundaries and return frozen. A configured pausing debugger stop preempts the advance and returns status=interrupted with its stop evidence. Read allowed units and bounds from the live contract."
     )]
     async fn step(
         &self,
@@ -907,21 +908,34 @@ impl Emucap {
             Ok(c) => c,
             Err(e) => return link_error_result(LinkError::Protocol(e)),
         };
+        let planned = match prepare_suite(&cases) {
+            Ok(planned) => planned,
+            Err(e) => return link_error_result(LinkError::Protocol(e)),
+        };
+        let deadline = regression_deadline();
         let mut l = self.link();
-        if let Err(e) = ensure_capabilities_loaded(&mut *l) {
+        if let Err(e) = ensure_capabilities_loaded_before(&mut *l, deadline) {
             return link_error_result(e);
         }
+        let started_running = match analysis_started_running(&mut *l, deadline) {
+            Ok(value) => value,
+            Err(error) => return link_error_result(error),
+        };
         let rom_check_unsupported = !l.capabilities().methods.iter().any(|m| m == "get_rom_info");
         let mut results = Vec::new();
-        for (dir, case) in &cases {
-            let verdict = run_one_case(&mut *l, dir, case);
+        for planned_case in &planned {
+            let verdict = match &planned_case.prepared {
+                Ok(prepared) => run_prepared_case(&mut *l, prepared, deadline),
+                Err(verdict) => verdict.clone(),
+            };
             results.push(regression::CaseResult {
-                id: case.id.clone(),
+                id: planned_case.id.clone(),
                 verdict,
             });
         }
-        // 스위트 종료 후 실행 상태로 복원 (frozen 상태 정리)
-        let _ = l.call("resume", serde_json::json!({}));
+        if let Err(error) = restore_analysis_execution(&mut *l, started_running) {
+            return link_error_result(error);
+        }
         let summary = regression::Summary::from_results(results);
         let body = serde_json::json!({
             "passed": summary.passed, "failed": summary.failed, "invalid": summary.invalid,
@@ -953,16 +967,28 @@ impl Emucap {
             Ok(c) => c,
             Err(e) => return link_error_result(LinkError::Protocol(e)),
         };
+        let prepared = prepare_case(&dir, &case);
 
-        let result = {
-            let mut l = self.link();
-            if let Err(e) = ensure_capabilities_loaded(&mut *l) {
-                return link_error_result(e);
+        let result = match prepared {
+            Err(verdict) => determinism_preflight_failure(verdict, replays),
+            Ok(prepared) => {
+                let deadline = regression_deadline();
+                let mut l = self.link();
+                if let Err(e) = ensure_capabilities_loaded_before(&mut *l, deadline) {
+                    return link_error_result(e);
+                }
+                let started_running = match analysis_started_running(&mut *l, deadline) {
+                    Ok(value) => value,
+                    Err(error) => return link_error_result(error),
+                };
+                let r = verify_determinism_prepared_core(
+                    &mut *l, &prepared, &observe, replays, deadline,
+                );
+                if let Err(error) = restore_analysis_execution(&mut *l, started_running) {
+                    return link_error_result(error);
+                }
+                r
             }
-            let r = verify_determinism_core(&mut *l, &dir, &case, &observe, replays);
-            // frozen 정리(실행 상태 복원)
-            let _ = l.call("resume", serde_json::json!({}));
-            r
         };
 
         // 단일-writer: 원장에 쓰지 않고 결과만 반환한다. 에이전트가 추적 MCP의
@@ -979,6 +1005,48 @@ impl Emucap {
         });
         tool_output_result(ToolOutput::Json(body))
     }
+}
+
+// Analysis may replay from reset or a snapshot; preserve execution mode, not guest state.
+fn analysis_started_running(
+    link: &mut dyn EmulatorLink,
+    deadline: Instant,
+) -> Result<bool, LinkError> {
+    if Instant::now() >= deadline {
+        return Err(LinkError::Protocol(format!(
+            "regression operation exceeded {} ms",
+            emucap::live::temporal::MAX_SYNC_OPERATION_MS
+        )));
+    }
+    let status = link.call("status", serde_json::json!({}))?;
+    match status.get("state").and_then(serde_json::Value::as_str) {
+        Some("running") => Ok(true),
+        Some("frozen") => Ok(false),
+        _ => Err(LinkError::Protocol(
+            "analysis requires a running or frozen runtime".into(),
+        )),
+    }
+}
+
+fn restore_analysis_execution(link: &mut dyn EmulatorLink, running: bool) -> Result<(), LinkError> {
+    let expected = if running { "running" } else { "frozen" };
+    let result = (|| {
+        link.call(
+            if running { "resume" } else { "pause" },
+            serde_json::json!({}),
+        )?;
+        let status = link.call("status", serde_json::json!({}))?;
+        if status.get("state").and_then(serde_json::Value::as_str) != Some(expected) {
+            return Err(LinkError::Protocol(format!(
+                "analysis cleanup did not establish {expected}"
+            )));
+        }
+        Ok(())
+    })();
+    result.map_err(|error: LinkError| LinkError::Emulator {
+        kind: "cleanup_failed".into(),
+        message: format!("restoring analysis execution mode: {error}"),
+    })
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1041,19 +1109,21 @@ impl ServerHandler for Emucap {
     }
 }
 
-fn broker_session_accepting(address: &str) -> bool {
-    address
-        .parse()
-        .ok()
-        .and_then(|endpoint| {
-            std::net::TcpStream::connect_timeout(&endpoint, Duration::from_millis(100)).ok()
-        })
-        .is_some()
+fn broker_session_ready(address: &str) -> bool {
+    broker_link::probe_session(address, Duration::from_millis(100)).is_ok()
 }
 
-fn spawn_reaped(mut command: std::process::Command) -> std::thread::JoinHandle<()> {
+fn spawn_reaped(
+    mut command: std::process::Command,
+) -> std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>> {
     std::thread::spawn(move || {
-        let _ = command.status();
+        let result = command.status();
+        match &result {
+            Ok(status) if !status.success() => eprintln!("broker: helper exited with {status}"),
+            Err(error) => eprintln!("broker: could not start helper ({error})"),
+            _ => {}
+        }
+        result
     })
 }
 
@@ -1067,6 +1137,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false);
 
+    let store = emucap::live::runtime::RuntimeStore::discover()?;
     let link: SharedLink = if broker_mode {
         let sess_port: u16 = std::env::var("EMUCAP_BROKER_SESSION_PORT")
             .ok()
@@ -1076,25 +1147,24 @@ async fn main() -> anyhow::Result<()> {
         let name = std::env::var("EMUCAP_NAME").ok();
         // broker 없으면 auto-spawn 후 lazy link로 접속을 미룬다.
         // 직접 모드로 폴백하지 않는다 — broker를 선택한 세션은 그 연결 경로만 사용한다.
-        if !broker_session_accepting(&sess_addr) {
+        if !broker_session_ready(&sess_addr) {
             if let Ok(exe) = std::env::current_exe() {
                 let broker_bin = exe.with_file_name("emucap-broker");
                 let command = std::process::Command::new(broker_bin);
                 let _ = spawn_reaped(command);
             }
         }
-        Arc::new(Mutex::new(continuity::observed(broker_link::lazy(
-            &sess_addr,
-            name,
-            Duration::from_secs(5),
-        ))))
+        Arc::new(Mutex::new(continuity::ObservedLink::with_store(
+            broker_link::lazy(&sess_addr, name, Duration::from_secs(5)),
+            store,
+        )))
     } else {
         // 직접 모드(기본): 지연 바인드로 포트를 즉시 잡지 않아 MCP 핸드셰이크가 항상 성공하고,
         // 다른 인스턴스가 포트를 쥐고 있어도 서버가 죽지 않는다.
-        Arc::new(Mutex::new(continuity::observed(tcp::lazy(
-            &format!("127.0.0.1:{emu_port}"),
-            Duration::from_secs(5),
-        ))))
+        Arc::new(Mutex::new(continuity::ObservedLink::with_store(
+            tcp::lazy(&format!("127.0.0.1:{emu_port}"), Duration::from_secs(5))?,
+            store,
+        )))
     };
 
     let server = Emucap::new(link);

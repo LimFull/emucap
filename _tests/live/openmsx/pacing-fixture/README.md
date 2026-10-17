@@ -12,7 +12,7 @@ a fixed PSG tone. BIOS initializes the machine before entering the cartridge.
 | `0xC104` | Last border colour, alternates 1 and 15 |
 
 Counters wrap modulo 65536. From one saved origin, `tap(a, press_frames=p, after_frames=q)`
-must increase them by `(p + 1 + q, p)`; advancing the same frames without input increases
+must increase them by `(p + q, p)`; advancing the same frames without input increases
 only the field counter. Pacing policy changes must preserve these guest deltas.
 
 From the repository root:

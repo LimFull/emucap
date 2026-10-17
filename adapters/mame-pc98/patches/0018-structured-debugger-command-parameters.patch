@@ -1,0 +1,55 @@
+diff --git a/src/emu/debug/debugcon.h b/src/emu/debug/debugcon.h
+--- a/src/emu/debug/debugcon.h
++++ b/src/emu/debug/debugcon.h
+@@ -78,6 +78,7 @@
+ 
+ 	// command handling
+ 	CMDERR          execute_command(std::string_view command, bool echo);
++	CMDERR          execute_command_with_parameters(std::string_view command, const std::vector<std::string> &parameters);
+ 	CMDERR          validate_command(std::string_view command);
+ 	void            register_command(std::string_view command, u32 flags, int minparams, int maxparams, std::function<void (const std::vector<std::string_view> &)> &&handler);
+ 	void            source_script(const char *file);
+diff --git a/src/emu/debug/debugcon.cpp b/src/emu/debug/debugcon.cpp
+--- a/src/emu/debug/debugcon.cpp
++++ b/src/emu/debug/debugcon.cpp
+@@ -440,6 +440,26 @@
+ }
+ 
+ 
++// Execute one command with already-separated parameters. In particular, an
++// expression parameter cannot introduce a second command or an action argument.
++CMDERR debugger_console::execute_command_with_parameters(std::string_view command, const std::vector<std::string> &parameters)
++{
++	std::string first(command);
++	if (!parameters.empty())
++	{
++		first += ' ';
++		first += parameters.front();
++	}
++	std::vector<std::string_view> params{first};
++	for (size_t i = 1; i < parameters.size(); ++i)
++		params.emplace_back(parameters[i]);
++	const CMDERR result = internal_execute_command(true, params);
++	if (result.error_class() != CMDERR::NONE)
++		printf("%s\n", cmderr_to_string(result));
++	return result;
++}
++
++
+ //-------------------------------------------------
+ //  validate_command - validate a command string
+ //-------------------------------------------------
+diff --git a/src/frontend/mame/luaengine_debug.cpp b/src/frontend/mame/luaengine_debug.cpp
+--- a/src/frontend/mame/luaengine_debug.cpp
++++ b/src/frontend/mame/luaengine_debug.cpp
+@@ -370,6 +370,10 @@
+ 
+ 	auto debugger_type = sol().registry().new_usertype<debugger_manager>("debugger", sol::no_constructor);
+ 	debugger_type.set_function("command", [] (debugger_manager &debug, std::string const &cmd) { debug.console().execute_command(cmd, false); });
++	debugger_type.set_function("command_with_parameters", [] (debugger_manager &debug, std::string const &cmd, sol::as_table_t<std::vector<std::string>> const &params)
++	{
++		debug.console().execute_command_with_parameters(cmd, params.value());
++	});
+ 	debugger_type["consolelog"] = sol::property([] (debugger_manager &debug) { return wrap_textbuf(debug.console().get_console_textbuf()); });
+ 	debugger_type["errorlog"] = sol::property([](debugger_manager &debug) { return wrap_textbuf(debug.console().get_errorlog_textbuf()); });
+ 	debugger_type["visible_cpu"] = sol::property(

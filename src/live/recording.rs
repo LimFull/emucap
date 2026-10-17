@@ -33,7 +33,7 @@ use super::recording_state::RecordingStateError;
 pub(crate) use super::recording_terminal::terminal_validation;
 use super::runtime::{LeaseState, ProcessState, RuntimeStore};
 use crate::bundle::publish::{
-    verify_published_recording, PublishedRecording, RecordingBundleInput, RecordingStaging,
+    verify_published_recording_checked, PublishedRecording, RecordingBundleInput, RecordingStaging,
 };
 use crate::bundle::recording::{ProducerTerminalReport, RecordingValidationInput};
 use crate::bundle::recording_manifest::{
@@ -131,10 +131,9 @@ pub fn record_window(
         .ok_or_else(|| RecordingError::Unavailable("runtime generation is missing".into()))?;
     if current.launch_id != launch_id
         || current.process_state() != ProcessState::Alive
-        || identity
-            .content
-            .as_deref()
-            .is_none_or(|content| content != current.content)
+        || identity.content.as_deref().is_none_or(|content| {
+            !crate::content_identity::same_content_path(&current.content, content)
+        })
     {
         return Err(RecordingError::Unavailable(
             "live adapter and runtime generation are not exactly bound".into(),
@@ -882,11 +881,25 @@ pub fn reconcile_abandoned_capture(
         ));
     }
     let current_lease = CaptureLeaseIdentity::current();
+    repository.check_recovery_eligibility(&capsule, &current_lease)?;
     let registry = EventContractRegistry::builtin()?;
     let destination = Path::new(&capsule.destination_path);
     let verified = if destination.exists() {
         Some(
-            verify_published_recording(destination, &registry).map_err(|error| {
+            verify_published_recording_checked(destination, &registry, |path, manifest| {
+                if manifest.capture_id != capsule.capture_id
+                    || manifest.request_digest_sha256 != capsule.request_digest_sha256
+                    || manifest.runtime.launch_id != capsule.launch_id
+                    || manifest.runtime.capability_revision != capsule.capability_revision
+                    || path != destination
+                {
+                    return Err(crate::bundle::error::PublishedBundleError::Invalid(
+                        "published bundle identity does not match the abandoned capture".into(),
+                    ));
+                }
+                Ok(())
+            })
+            .map_err(|error| {
                 RecordingError::Recovery(format!(
                     "the capture destination exists but is not the exact verified bundle: {error}"
                 ))

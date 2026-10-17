@@ -46,7 +46,7 @@ distribute those system ROMs.
 
 The official launcher validates `emucap-openmsx-build.json`, starts the bridge, captures both
 process identities, and waits for authenticated adapter readiness before publishing the runtime
-generation. openMSX receives an emucap-owned per-port `HOME`, so it does not read or change the
+generation. openMSX receives an emucap-owned launch-generation `HOME`, so it does not read or change the
 operator's normal openMSX profile.
 
 The canonical pinned build and representative cartridge have passed:

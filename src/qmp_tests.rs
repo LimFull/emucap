@@ -206,6 +206,11 @@ fn pacing_reply_timeout_fences_a_late_committed_response() {
     let (release, wait) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let (mut stream, mut reader) = accept_with_greeting(listener);
+        // Configure the socket before the client can time out and close it (macOS EINVAL).
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         answer_capabilities(&mut stream, &mut reader);
         let request = read_json(&mut reader);
         assert_eq!(request["execute"], "xemu-emucap-pacing");
@@ -215,10 +220,6 @@ fn pacing_reply_timeout_fences_a_late_committed_response() {
             &mut stream,
             json!({"return":{"percent":committed},"id":request["id"]}),
         );
-        reader
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
         let mut next = String::new();
         let result = reader.read_line(&mut next);
         assert!(result.is_err() || matches!(result, Ok(0)));
@@ -230,11 +231,7 @@ fn pacing_reply_timeout_fences_a_late_committed_response() {
     });
     let mut client =
         QmpClient::connect("127.0.0.1", port, Duration::from_secs(1), Duration::ZERO).unwrap();
-    client
-        .stream
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_millis(20)))
-        .unwrap();
+    client.timeout = Duration::from_millis(20);
     assert!(client
         .execute("xemu-emucap-pacing", Some(json!({"percent":50})))
         .is_err());
@@ -245,4 +242,73 @@ fn pacing_reply_timeout_fences_a_late_committed_response() {
         Err(QmpError::Poisoned)
     ));
     assert_eq!(worker.join().unwrap(), 50);
+}
+
+#[test]
+fn pending_events_are_bounded_by_count_and_bytes() {
+    for payload_bytes in [0, 1024 * 1024] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let event = json!({"event":"STOP", "data":"x".repeat(payload_bytes)});
+        let mut encoded = serde_json::to_vec(&event).unwrap();
+        encoded.push(b'\n');
+        let expected = MAX_PENDING_EVENTS.min(MAX_PENDING_EVENT_BYTES / encoded.len());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, mut reader) = accept_with_greeting(listener);
+            answer_capabilities(&mut stream, &mut reader);
+            read_json(&mut reader);
+            for _ in 0..=expected {
+                if stream.write_all(&encoded).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client =
+            QmpClient::connect("127.0.0.1", port, Duration::from_secs(3), Duration::ZERO).unwrap();
+        let error = client.execute("query-status", None).unwrap_err();
+        assert!(
+            matches!(error, QmpError::Protocol(ref reason) if reason.contains("event budget")),
+            "{error}"
+        );
+        assert!(client.is_terminal());
+        assert_eq!(client.drain_events().len(), expected);
+        assert_eq!(client.event_bytes, 0);
+        assert!(matches!(
+            client.execute("query-status", None),
+            Err(QmpError::Poisoned)
+        ));
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn exchange_deadline_covers_partial_frames_and_continuous_events() {
+    for complete_events in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, mut reader) = accept_with_greeting(listener);
+            answer_capabilities(&mut stream, &mut reader);
+            read_json(&mut reader);
+            for _ in 0..50 {
+                let bytes: &[u8] = if complete_events {
+                    b"{\"event\":\"STOP\"}\n"
+                } else {
+                    b" "
+                };
+                if stream.write_all(bytes).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut client =
+            QmpClient::connect("127.0.0.1", port, Duration::from_secs(2), Duration::ZERO).unwrap();
+        client.timeout = Duration::from_millis(80);
+        let started = Instant::now();
+        assert!(client.execute("query-status", None).is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(client.is_terminal());
+        worker.join().unwrap();
+    }
 }

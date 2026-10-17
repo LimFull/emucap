@@ -51,43 +51,6 @@ LOCAL_MAME_BIN="$HERE/work/mame"
 LOCAL_MAME_RAW_BIN="$HERE/work/mame.raw"
 LOCAL_MAME_INVALID=""
 
-emucap_data_root() {
-  if [ -n "${EMUCAP_EMU_HOME:-}" ]; then
-    printf '%s\n' "$EMUCAP_EMU_HOME"
-    return
-  fi
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin)
-      if [ -n "${HOME:-}" ]; then
-        printf '%s\n' "$HOME/Library/Application Support/emucap"
-      else
-        printf '%s\n' "/tmp/emucap"
-      fi
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      if [ -n "${LOCALAPPDATA:-}" ]; then
-        printf '%s\n' "$LOCALAPPDATA/emucap"
-      elif [ -n "${APPDATA:-}" ]; then
-        printf '%s\n' "$APPDATA/emucap"
-      elif [ -n "${USERPROFILE:-}" ]; then
-        printf '%s\n' "$USERPROFILE/AppData/Local/emucap"
-      elif [ -n "${HOME:-}" ]; then
-        printf '%s\n' "$HOME/AppData/Local/emucap"
-      else
-        printf '%s\n' "/tmp/emucap"
-      fi
-      ;;
-    *)
-      if [ -n "${XDG_DATA_HOME:-}" ]; then
-        printf '%s\n' "$XDG_DATA_HOME/emucap"
-      elif [ -n "${HOME:-}" ]; then
-        printf '%s\n' "$HOME/.local/share/emucap"
-      else
-        printf '%s\n' "/tmp/emucap"
-      fi
-      ;;
-  esac
-}
 
 default_rompath() {
   local base candidate
@@ -112,7 +75,7 @@ else
   fi
   MAME_BIN="mame"
 fi
-EMUCAP_DATA_ROOT="$(emucap_data_root)"
+EMUCAP_DATA_ROOT="$(emucap_runtime_base)"
 RUN_DIR="$EMUCAP_DATA_ROOT/mame-pc98/$PORT"
 FALLBACK_ROMPATH="$EMUCAP_DATA_ROOT/mame-pc98/roms"
 DEFAULT_ROMPATH="$(default_rompath)"
@@ -156,10 +119,16 @@ if [ -z "$BRIDGE" ] && command -v emucap-mame-pc98-bridge >/dev/null 2>&1; then
 fi
 EMUCAP_BUILD_HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PLUGINPATH="${MAME_PLUGINPATH:-$HERE/plugins}"
-TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
-if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SESSION_TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
+emucap_require_front_identity "$SESSION_TOKEN" "${EMUCAP_LAUNCH_ID:-}" || exit 2
+if [ ! -r /dev/urandom ]; then
+  echo "ERROR: /dev/urandom is required to mint the native MAME control credential" >&2
+  exit 1
+fi
+NATIVE_DEBUG_TOKEN="native-$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \r\n')"
+if [ ${#NATIVE_DEBUG_TOKEN} -ne 71 ]; then
+  echo "ERROR: failed to mint the native MAME control credential" >&2
+  exit 1
 fi
 MAME_CBUS0_DEFAULTED=0
 if [ "${MAME_CBUS0+x}" != "x" ] && [ "$MACHINE" = "pc9801rs" ]; then
@@ -285,8 +254,7 @@ fi
   echo "  media=$MEDIA"
   echo "  port=$PORT"
   echo "  name=${NAME:-<none>}"
-  echo "  session_token=${SESSION_TOKEN:+present}"
-  echo "  token_file=$TOKEN_FILE"
+  echo "  front_key=${SESSION_TOKEN:+present}"
   echo "  machine=$MACHINE"
   echo "  mame_bin=$MAME_BIN"
   if [ -n "$LOCAL_MAME_INVALID" ]; then
@@ -357,7 +325,8 @@ if [ -n "${MAME_FLOP2:-}" ]; then
   ARGS+=(-flop2 "$MAME_FLOP2")
 fi
 
-nohup "$MAME_BIN" "${ARGS[@]}" </dev/null >>"$LOG" 2>&1 &
+EMUCAP_NATIVE_DEBUG_TOKEN="$NATIVE_DEBUG_TOKEN" \
+  nohup "$MAME_BIN" "${ARGS[@]}" </dev/null >>"$LOG" 2>&1 &
 MAME_PID="$!"
 echo "$MAME_PID" >"$MAME_PIDFILE"
 disown "$MAME_PID" 2>/dev/null || true
@@ -383,6 +352,7 @@ if command -v lsof >/dev/null 2>&1; then
 fi
 
 EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$MEDIA" \
+  EMUCAP_NATIVE_DEBUG_TOKEN="$NATIVE_DEBUG_TOKEN" \
   EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$MAME_PID" \
   nohup "$BRIDGE" "$PORT" "127.0.0.1:$GDB_PORT" </dev/null >>"$LOG" 2>&1 &
 BRIDGE_PID="$!"

@@ -187,3 +187,7 @@ class EmucapRecording {
   std::string reason_;
   std::string final_execution_state_ = "unknown";
 };
+
+// Reads the declared movie extent plus at most one excess byte before parsing.
+bool emucap_read_recording_input_movie(const std::string& path,
+    std::uint64_t expected_bytes, std::string& text, std::string& error);

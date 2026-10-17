@@ -22,6 +22,65 @@ pub(super) fn approved_content_identity(
     })
 }
 
+pub(super) struct BoundLaunchContent {
+    pub args: LaunchArgs,
+    pub source: Option<String>,
+}
+
+pub(super) fn bind_approved_content(
+    args: &LaunchArgs,
+    adapter: &str,
+    identity: Option<&emucap::content_identity::ContentIdentity>,
+    prepared: &emucap::live::runtime::PreparedGeneration,
+) -> Result<BoundLaunchContent, serde_json::Value> {
+    let mut effective = args.clone();
+    let Some(identity) = identity else {
+        return Ok(BoundLaunchContent {
+            args: effective,
+            source: None,
+        });
+    };
+    let destination = prepared.generation_dir().join("content");
+    match emucap::content_identity::stage_verified_composite_content(
+        Path::new(&args.content_path),
+        adapter,
+        identity,
+        &destination,
+    ) {
+        Ok(staged) => {
+            effective.content_path = staged.display().to_string();
+            Ok(BoundLaunchContent {
+                args: effective,
+                source: Some(args.content_path.clone()),
+            })
+        }
+        Err(error) => {
+            let _ = prepared.abort();
+            Err(serde_json::json!({
+                "launched": false,
+                "reason": "failed to bind the approved media graph into the launch generation",
+                "error": error.to_string(),
+                "content_identity": identity.summary_value(),
+                "next_action": "Restore the approved source bytes and request a fresh launch plan; no process was signalled.",
+            }))
+        }
+    }
+}
+
+pub(super) fn annotate_bound_content(outcome: &mut serde_json::Value, bound: &BoundLaunchContent) {
+    let (Some(source), Some(object)) = (bound.source.as_ref(), outcome.as_object_mut()) else {
+        return;
+    };
+    object.insert("source_content".into(), serde_json::json!(source));
+    object
+        .entry("runtime_content")
+        .or_insert_with(|| serde_json::json!(&bound.args.content_path));
+    object.insert(
+        "content_identity_binding".into(),
+        serde_json::json!("generation_copy"),
+    );
+}
+
 pub(super) fn ext_lower(path: &str) -> Option<String> {
     Path::new(path)
         .extension()

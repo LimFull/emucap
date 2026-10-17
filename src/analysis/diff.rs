@@ -131,6 +131,18 @@ pub fn diff(
     ignore: &[IgnoreSpec],
     baseline: &Baseline,
 ) -> DiffReport {
+    diff_bounded(a, b, ignore, baseline, usize::MAX).expect("unbounded comparison")
+}
+
+/// Retain every divergence or fail before exceeding the caller's report budget.
+pub fn diff_bounded(
+    a: &RegionSet,
+    b: &RegionSet,
+    ignore: &[IgnoreSpec],
+    baseline: &Baseline,
+    max_divergences: usize,
+) -> Result<DiffReport, &'static str> {
+    let mut total_divergences = 0_usize;
     let mut regions = Vec::new();
     let mut unmatched = Vec::new();
 
@@ -151,6 +163,10 @@ pub fn diff(
                 continue;
             }
             if ra.bytes[off] != rb.bytes[off] {
+                if total_divergences == max_divergences {
+                    return Err("diff divergence budget exceeded");
+                }
+                total_divergences += 1;
                 divergences.push(o);
                 if first.is_none() {
                     first = Some(Divergence {
@@ -178,7 +194,7 @@ pub fn diff(
             unmatched.push(name.clone());
         }
     }
-    DiffReport { regions, unmatched }
+    Ok(DiffReport { regions, unmatched })
 }
 
 pub fn render_json(report: &DiffReport) -> String {

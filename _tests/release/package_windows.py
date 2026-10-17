@@ -1,6 +1,5 @@
 """Package an authenticated Windows CI payload without rebuilding native code."""
 import argparse
-import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import shutil
@@ -10,26 +9,26 @@ import tempfile
 import tomllib
 import zipfile
 
-from native_build import OUTPUTS, payload_hashes
+from native_build import OUTPUTS, identity, payload_hashes
 from package_native import files_manifest, run, sha
+from native_payload import RECORD, SIGNATURE
+from native_provenance import Verifier, create_record
 
 
-def verify_payload(payload, source, adapter, binary_digest=None):
+def verify_payload(payload, source, adapter, binary_digest=None, producer_revision=None):
     metadata = payload / 'NATIVE-BUILD.json'
-    revision = run('git', '-C', source, 'rev-parse', 'HEAD')
+    revision = producer_revision or run('git', '-C', source, 'rev-parse', 'HEAD')
     if metadata.exists():
         record = json.loads(metadata.read_text())
-        if record['files'] != payload_hashes(payload) or not record['files']:
+        actual = {name: digest for name, digest in payload_hashes(payload).items()
+                  if name not in (RECORD, SIGNATURE)}
+        if record['files'] != actual or not record['files']:
             raise ValueError('Windows payload file manifest mismatch')
         if 'build_inputs' in record:
             inputs = record['build_inputs']
-            encoded = json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()
-            if hashlib.sha256(encoded).hexdigest() != record['identity'] or inputs['adapter'] != adapter:
+            expected_key, expected_inputs = identity(source, adapter, inputs['toolchain'])
+            if inputs != expected_inputs or record['identity'] != expected_key:
                 raise ValueError('Windows build identity mismatch')
-            for name, digest in inputs['inputs'].items():
-                path = source / name
-                if not path.resolve().is_relative_to(source.resolve()) or sha(path) != digest:
-                    raise ValueError(f'Windows producer input mismatch: {name}')
             binary = OUTPUTS[adapter][1]
         else:
             if record['revision'] != revision or record['adapter'] != adapter:
@@ -61,7 +60,9 @@ def matching_source(directory, source, adapter):
     if sha(archive) != record['artifacts'][archive.name]:
         raise ValueError('native source archive digest mismatch')
     owner = 'mame-pc98' if adapter == 'mame-neogeo' else adapter
-    tracked = run('git', '-C', source, 'ls-files', f'adapters/{owner}', f'adapters/{adapter}').splitlines()
+    paths = [f'adapters/{owner}', f'adapters/{adapter}']
+    if adapter not in OUTPUTS: paths.append('adapters/_common')
+    tracked = run('git', '-C', source, 'ls-files', *paths).splitlines()
     # Native code can be copied into upstream directly, not only applied as patches.
     # Platform build recipes are supplied separately from the exact Windows commit.
     required = [p for p in tracked if Path(p).suffix not in ('.md', '.sh', '.ps1')]
@@ -78,9 +79,16 @@ def matching_source(directory, source, adapter):
 
 def package(args):
     source = args.source.resolve()
-    binary = verify_payload(args.payload, source, args.adapter, args.binary_digest)
+    runtime = Verifier(args.repo).verify(args.payload, 'runtime', args.adapter, 'windows', source)
+    origin = Verifier(args.repo).verify(args.native_source, 'package', args.adapter, args.source_platform)
+    binary_digest = runtime.record['files'].get('xemu.exe', {}).get('sha256') if args.adapter == 'xemu' else None
+    binary = verify_payload(args.payload, source, args.adapter, binary_digest,
+                            runtime.record['native']['source_revision'])
     sources, source_record = matching_source(args.native_source, source, args.adapter)
-    revision = run('git', '-C', source, 'rev-parse', 'HEAD')
+    if (source_record['source_revision'] != origin.record['native']['source_revision']
+            or source_record['packaging_revision'] != origin.record['producer']['revision']):
+        raise ValueError('native source package differs from authenticated origin')
+    revision = runtime.record['native']['source_revision']
     version = tomllib.loads((source / 'Cargo.toml').read_text())['package']['version']
     name = f'emucap-{version}-{args.adapter}-windows-x86_64'
     args.output.mkdir(parents=True, exist_ok=True)
@@ -122,7 +130,9 @@ def package(args):
     # the exact Windows producer recipes, which may differ from its Unix source collector.
     shutil.copy2(sources, args.output / sources.name)
     recipes = args.output / (name + '-recipes.tar.gz')
-    paths = [f'adapters/{args.adapter}', 'adapters/_common', 'LICENSE', 'NOTICE', 'licenses']
+    paths = [f'adapters/{args.adapter}', 'adapters/_common', 'LICENSE', 'NOTICE', 'licenses',
+             '_tests/adapters/build-lock-test.sh', '_tests/native/np2kai-load-api.py',
+             'src/np2kai_adapter/ffi.rs']
     if args.adapter == 'mame-neogeo': paths.append('adapters/mame-pc98')
     subprocess.run(['git', '-C', str(source), 'archive', '--format=tar.gz',
                     f'--output={recipes.resolve()}', 'HEAD', '--', *paths], check=True)
@@ -130,6 +140,7 @@ def package(args):
     record['artifacts'] = {p.name: sha(p) for p in (target, args.output / sources.name, recipes)}
     (args.output / (name + '.json')).write_text(json.dumps(record, indent=2) + '\n')
     (args.output / (name + '.sha256')).write_text(''.join(f'{digest}  {path}\n' for path, digest in record['artifacts'].items()))
+    create_record(args.output, source, 'package', args.adapter, 'windows', parents=[runtime, origin])
     print(json.dumps(record))
 
 
@@ -138,7 +149,8 @@ def main():
     for key in ('source', 'payload', 'native-source', 'output'):
         parser.add_argument('--' + key, type=Path, required=True)
     parser.add_argument('--adapter', required=True)
-    parser.add_argument('--binary-digest')
+    parser.add_argument('--source-platform', choices=('linux', 'macos'), required=True)
+    parser.add_argument('--repo', required=True)
     package(parser.parse_args())
 
 

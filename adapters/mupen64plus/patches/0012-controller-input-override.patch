@@ -1,0 +1,64 @@
+--- a/src/backends/plugins_compat/input_plugin_compat.c
++++ b/src/backends/plugins_compat/input_plugin_compat.c
+@@ -29,6 +29,7 @@
+ #include "main/main.h"
+ #include "main/netplay.h"
+ 
++#include <SDL.h>
+ #include <stdint.h>
+ #include <string.h>
+ #include <api/m64p_plugin.h>
+@@ -46,6 +47,35 @@
+  * causing incorrect pak accesses */
+ enum { PAK_SWITCH_DELAY = 20 };
+ enum { GB_CART_SWITCH_DELAY = 20 };
++
++/* One native owner publishes enable and the complete controller word together.
++ * No plugin call or guest work occurs under this short lock. Host state is not
++ * part of savestates; the library is unloaded only after the guest has stopped. */
++static SDL_SpinLock emucap_input_lock;
++static uint32_t emucap_input_word;
++static uint32_t emucap_input_enabled;
++
++EXPORT m64p_error CALL CoreEmucapInput(uint32_t version, uint32_t port,
++    uint32_t enabled, uint32_t buttons, int32_t x, int32_t y)
++{
++    if (version != 1 || port != 0 || enabled > 1 || buttons > 0x3fff ||
++        x < -128 || x > 127 || y < -128 || y > 127)
++        return M64ERR_INPUT_INVALID;
++    SDL_AtomicLock(&emucap_input_lock);
++    emucap_input_word = buttons | ((uint32_t)(uint8_t)x << 16)
++        | ((uint32_t)(uint8_t)y << 24);
++    emucap_input_enabled = enabled;
++    SDL_AtomicUnlock(&emucap_input_lock);
++    return M64ERR_SUCCESS;
++}
++
++static void emucap_controller_input(int port, uint32_t* word)
++{
++    if (port != 0) return;
++    SDL_AtomicLock(&emucap_input_lock);
++    if (emucap_input_enabled) *word = emucap_input_word;
++    SDL_AtomicUnlock(&emucap_input_lock);
++}
+ 
+ static int is_button_released(uint32_t input, uint32_t last_input, uint32_t mask)
+ {
+@@ -132,6 +162,7 @@
+     cin_compat->last_pak_type = Controls[cin_compat->control_id].Plugin;
+     cin_compat->last_input = keys.Value;
+ 
++    emucap_controller_input(cin_compat->control_id, &keys.Value);
+     *input_ = keys.Value;
+     return M64ERR_SUCCESS;
+ }
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -42,6 +42,7 @@
+ CoreShutdown;
+ CoreStartup;
+ CoreEmucapPacing;
++CoreEmucapInput;
+ DebugBreakpointCommand;
+ DebugBreakpointLookup;
+ DebugBreakpointTriggeredBy;

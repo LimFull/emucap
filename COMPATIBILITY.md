@@ -26,9 +26,9 @@ support on every emulator. Advertised operations keep their documented semantics
 An unsafe or unverifiable operation fails explicitly rather than reporting success.
 A corrective restriction is documented with its affected profile and recovery path.
 
-Experimental profiles are identified in the README and adapter documentation. Their
-coverage and adapter-specific extensions may change with a changelog entry; stable
-core response and lifecycle guarantees still apply when those profiles are used.
+Platform and profile qualification boundaries are identified in adapter documentation and live
+capabilities. Their coverage and adapter-specific extensions may change with a changelog entry;
+stable core response and lifecycle guarantees still apply to every advertised operation.
 
 Native hosts, bridge binaries, patches and sidecars form a matched build. Host API
 versions may advance within 1.x, requiring an adapter rebuild. Older incompatible

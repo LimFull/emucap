@@ -1,5 +1,4 @@
 //! Native parent cleanup; the transport must authenticate the supplied attachment.
-use super::control::{normalize_buttons, require_port_zero};
 use super::*;
 use crate::live::{
     control_session::{Attachment, EventKind, SessionEvent},
@@ -66,7 +65,11 @@ impl Mupen64PlusHost {
         self.require_connected()?;
         self.parent_owner()?
             .begin(attachment, key)
-            .map_err(ownership_error)
+            .map_err(ownership_error)?;
+        if self.parent_input_baseline.is_none() {
+            self.parent_input_baseline = Some(self.controller.clone());
+        }
+        Ok(())
     }
     pub fn finish_temporal_operation(
         &mut self,
@@ -102,21 +105,34 @@ impl Mupen64PlusHost {
         }
         let input = match request.method.as_str() {
             "set_input" => {
-                require_port_zero(&request.params)?;
-                normalize_buttons(request.params.get("buttons"))?;
+                self.validate_input(&request.params)?;
+                if request.params["_input_scope"] == "validate" {
+                    self.parent_owner()?
+                        .authorize_observation(attachment, key)
+                        .map_err(ownership_error)?;
+                    return Ok(self.handle_request_cancellable(request, cancellation));
+                }
                 Some(0)
             }
             "pause" => None,
-            "step" => {
+            "step" | "step_input_polls" => {
                 if request
                     .params
                     .get("unit")
                     .and_then(Value::as_str)
-                    .unwrap_or("frames")
-                    != "frames"
+                    .unwrap_or(if request.method == "step_input_polls" {
+                        "input_polls"
+                    } else {
+                        "frames"
+                    })
+                    != if request.method == "step_input_polls" {
+                        "input_polls"
+                    } else {
+                        "frames"
+                    }
                 {
                     return Err(N64Error::Unsupported(
-                        "cancellation requires frame stepping".into(),
+                        "advance unit does not match the method".into(),
                     ));
                 }
                 let child: OperationKey =
@@ -171,8 +187,11 @@ impl Mupen64PlusHost {
                 }
                 evidence.stop_verified = true;
                 for port in &plan.input_ports {
-                    self.set_input(&json!({"port":port,"buttons":[]}))?;
-                    if !self.held_buttons.is_empty() {
+                    self.restore_input_baseline()?;
+                    if let Some(baseline) = self.parent_input_baseline.clone() {
+                        self.publish_controller(baseline)?;
+                    }
+                    if self.input_baseline.is_some() {
                         return Err(N64Error::BadState(
                             "owned N64 input was not released".into(),
                         ));
@@ -183,6 +202,7 @@ impl Mupen64PlusHost {
             Ok(())
         })();
         let finished = self.parent_owner()?.finish_cleanup(&plan, evidence);
+        self.parent_input_baseline = None;
         if let Err(error) = cleanup {
             return Err(self.stop_generation_with_unresolved_effect("parent cleanup", &error));
         }
@@ -251,13 +271,13 @@ impl crate::live::reconnect::owned::OwnedHandler for Mupen64PlusHost {
                     if describes_session && response.ok {
                         if let Some(result) = response.result.as_mut() {
                             result[crate::live::control_session::LIFECYCLE_FIELD] = json!(true);
-                            if self.display {
+                            {
                                 result["methods"]
                                     .as_array_mut()
                                     .expect("session methods")
                                     .push(json!("cancel_operation"));
                                 result["temporal_cancellation_capability"] = json!({
-                                    "methods":["step"], "control_service_ms":25, "stop_host_ms":2000
+                                    "methods":vec!["step","step_input_polls"], "control_service_ms":25, "stop_host_ms":2000
                                 });
                             }
                         }

@@ -22,6 +22,52 @@ fn wait_survives_passes_a_living_process_and_flags_an_exited_one() {
     let _ = dead.wait(); // reap so the pid is gone
     assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn wait_gdb_ready_requires_both_exact_loopback_listeners_to_belong_to_the_process() {
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let arm9 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let arm7 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let arm9_port = arm9.local_addr().unwrap().port();
+    let arm7_port = arm7.local_addr().unwrap().port();
+    assert!(super::wait_gdb_ready(
+        std::process::id(),
+        arm9_port,
+        arm7_port,
+        Duration::from_secs(2)
+    )
+    .is_ok());
+
+    // A live unrelated process cannot borrow either listener's readiness identity.
+    let mut unrelated = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .unwrap();
+    let error = super::wait_gdb_ready(
+        unrelated.id(),
+        arm9_port,
+        arm7_port,
+        Duration::from_millis(250),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to release"));
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+
+    // A wildcard listener owned by the expected PID does not satisfy the exact bind contract.
+    let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
+    let error = super::wait_gdb_ready(
+        std::process::id(),
+        arm9_port,
+        wildcard.local_addr().unwrap().port(),
+        Duration::from_millis(250),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to release"));
+}
 use crate::test_env::{lock_env, EnvGuard};
 use std::path::Path;
 
@@ -85,7 +131,7 @@ fn emu_spec_mirrors_launch_sh_argv() {
     let bridge = dir.path().join("bridge");
     let log = dir.path().join("nds.log");
     let l = launch_for(&binary, &bridge, &log);
-    let spec = emu_spec(&l, 48800, 48801);
+    let spec = emu_spec(&l, 48800, 48801, "native-debug-token");
     assert_eq!(
         spec.args,
         vec![
@@ -97,6 +143,30 @@ fn emu_spec_mirrors_launch_sh_argv() {
             "/roms/game.nds",
         ]
     );
+    assert!(spec.env.contains(&(
+        "EMUCAP_NATIVE_DEBUG_TOKEN".to_string(),
+        "native-debug-token".to_string()
+    )));
+    assert!(!spec
+        .env
+        .iter()
+        .any(|(key, _)| key == "EMUCAP_SESSION_TOKEN"));
+}
+
+#[test]
+fn launch_rejects_missing_or_empty_session_token_before_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("missing-desmume-cli");
+    let bridge = dir.path().join("missing-bridge");
+    let log = dir.path().join("nds.log");
+    let mut l = launch_for(&binary, &bridge, &log);
+
+    for token in [None, Some("")] {
+        l.session_token = token;
+        let err = super::launch(&l).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("EMUCAP_SESSION_TOKEN"));
+    }
 }
 
 #[test]
@@ -106,7 +176,7 @@ fn bridge_spec_mirrors_launch_sh_argv_and_env() {
     let bridge = dir.path().join("bridge");
     let log = dir.path().join("nds.log");
     let l = launch_for(&binary, &bridge, &log);
-    let spec = bridge_spec(&l, 48800, 48801);
+    let spec = bridge_spec(&l, 48800, 48801, "native-debug-token");
     assert_eq!(spec.program, bridge);
     assert_eq!(
         spec.args,
@@ -121,6 +191,19 @@ fn bridge_spec_mirrors_launch_sh_argv_and_env() {
     assert!(spec
         .env
         .contains(&("EMUCAP_SESSION_TOKEN".to_string(), "token".to_string())));
+    assert!(spec.env.contains(&(
+        "EMUCAP_NATIVE_DEBUG_TOKEN".to_string(),
+        "native-debug-token".to_string()
+    )));
+}
+
+#[test]
+fn native_debug_tokens_are_fresh_and_distinct_from_the_front_session_token() {
+    let first = super::new_native_debug_token();
+    let second = super::new_native_debug_token();
+    assert!(first.starts_with("native-"));
+    assert_ne!(first, second);
+    assert_ne!(first, "token");
 }
 
 #[test]

@@ -8,26 +8,12 @@ on:
         type: choice
         default: all
         options: [all, mesen2, dolphin, ppsspp]
-  push:
-    branches: [main, next]
-    paths:
-      - 'adapters/mesen2/**'
-      - 'adapters/dolphin/**'
-      - 'adapters/ppsspp/**'
-      - '!**/*.md'
-      - '_tests/release/native_build*'
-      - '.github/workflows/native-adapters.yml'
-  pull_request:
-    paths:
-      - 'adapters/mesen2/**'
-      - 'adapters/dolphin/**'
-      - 'adapters/ppsspp/**'
-      - '!**/*.md'
-      - '_tests/release/native_build*'
-      - '.github/workflows/native-adapters.yml'
 
 permissions:
   contents: read
+  actions: read
+  id-token: write
+  attestations: write
 
 concurrency:
   group: native-adapters-${{ github.ref }}${{ inputs.adapter && inputs.adapter != 'all' && format('-{0}', inputs.adapter) || '' }}
@@ -35,7 +21,7 @@ concurrency:
 
 jobs:
   windows:
-    runs-on: windows-2022
+    runs-on: ${{ matrix.adapter == 'dolphin' && 'windows-2025-vs2026' || 'windows-2022' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -46,7 +32,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Patch hashes are byte identities; never convert checkout line endings.
           fetch-depth: 1
@@ -55,32 +41,44 @@ jobs:
           git config core.autocrlf false
           git rm --cached -r .
           git reset --hard HEAD
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '8.0.x'
       - name: Identify build environment
         run: |
           if (-not $env:ImageVersion) { throw 'Missing runner image version' }
-          "NATIVE_TOOLCHAIN=windows-2022/$env:ImageVersion/dotnet-$(dotnet --version)" >> $env:GITHUB_ENV
+          "NATIVE_TOOLCHAIN=${{ matrix.adapter == 'dolphin' && 'windows-2025-vs2026' || 'windows-2022' }}/$env:ImageVersion/dotnet-$(dotnet --version)" >> $env:GITHUB_ENV
       - name: Check reuse invariants
         run: python _tests/release/native_build_tests.py
       - id: inputs
         name: Hash native inputs
         run: python _tests/release/native_build.py identity --adapter '${{ matrix.adapter }}' --toolchain "$env:NATIVE_TOOLCHAIN"
+      - id: provenance-policy
+        name: Identify producer verification policy
+        run: |
+          $key = python _tests/release/native_provenance.py pipeline-key
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "key=$key" >> $env:GITHUB_OUTPUT
       - id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: native-payload
-          key: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}
+          key: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}-${{ steps.provenance-policy.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}-${{ steps.provenance-policy.outputs.key }}-
       - id: verify
-        name: Verify retained payload
+        name: Authenticate and verify retained payload
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if (Test-Path native-payload) {
             python _tests/release/native_build.py verify --adapter '${{ matrix.adapter }}' --toolchain "$env:NATIVE_TOOLCHAIN"
-            if ($LASTEXITCODE -eq 0) { 'reused=true' >> $env:GITHUB_OUTPUT; exit 0 }
+            if ($LASTEXITCODE -eq 0) {
+              python _tests/release/native_provenance.py verify --directory native-payload --source . --purpose runtime --adapter '${{ matrix.adapter }}' --platform windows
+              if ($LASTEXITCODE -eq 0) { 'reused=true' >> $env:GITHUB_OUTPUT; exit 0 }
+            }
             Remove-Item native-payload -Recurse -Force
           }
           'reused=false' >> $env:GITHUB_OUTPUT
@@ -91,13 +89,26 @@ jobs:
           & './adapters/${{ matrix.adapter }}/build.ps1' *> native-build.log
           if ($LASTEXITCODE -ne 0) { Get-Content native-build.log -Tail 80; exit 1 }
           python _tests/release/native_build.py stage --adapter '${{ matrix.adapter }}' --toolchain "$env:NATIVE_TOOLCHAIN"
-      - uses: actions/cache/save@v4
-        if: success() && steps.cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+      - name: Record native producer and payload
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python _tests/release/native_provenance.py create --source . --directory native-payload --purpose runtime --adapter '${{ matrix.adapter }}' --platform windows ${{ steps.verify.outputs.reused == 'true' && '--reuse-runtime' || '' }}
+      - name: Attest native provenance
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        id: native-attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          path: native-payload
-          key: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}
+          subject-path: native-payload/NATIVE-PROVENANCE.json
+      - name: Retain signed provenance
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        shell: pwsh
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.native-attestation.outputs.bundle-path }}
+        run: Copy-Item -LiteralPath $env:ATTESTATION_BUNDLE -Destination native-payload/NATIVE-PROVENANCE.sigstore.json
       - name: Retain native runtime payload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-runtime-${{ matrix.adapter }}-windows-x86_64
           path: native-payload/
@@ -106,7 +117,7 @@ jobs:
           if-no-files-found: error
       - name: Retain build evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-evidence-${{ matrix.adapter }}-windows-x86_64
           path: |
@@ -114,3 +125,8 @@ jobs:
             native-build.log
           retention-days: 7
           if-no-files-found: warn
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: success() && steps.verify.outputs.reused != 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        with:
+          path: native-payload
+          key: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}-${{ steps.provenance-policy.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}

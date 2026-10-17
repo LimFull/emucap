@@ -5,6 +5,8 @@ pub mod legacy_manifest;
 pub mod manifest;
 pub mod publish;
 mod publish_event_writer;
+mod publish_layout;
+mod publish_movie;
 mod publish_state;
 pub mod raw;
 pub mod recording;

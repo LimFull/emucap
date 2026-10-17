@@ -16,6 +16,7 @@
 #include <mednafen/hash/sha1.h>  // sha1(EMUCAP_CONTENT 보조 해시 — get_rom_info)
 
 #include "emucap.h"
+#include "emucap_front_auth.h"
 #include "emucap_completed_frame.h"
 #include "emucap_driver_frames.h"
 #include "emucap_video_restore.h"
@@ -38,6 +39,7 @@
 #include "emucap_pcfx.h"
 #include "emucap_psx.h"
 #include "emucap_recording.h"
+#include "emucap_pattern.h"
 #include "emucap_native_failure.h"
 
 extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
@@ -64,6 +66,7 @@ extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 #define EMUCAP_MEDNAFEN_MD_REPEATABLE_CONDITIONS_SHA256 ""
 #endif
 
+#include <algorithm>
 #include <exception>
 #include <atomic>
 #include <chrono>
@@ -79,6 +82,7 @@ extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 #include <io.h>         // unlink/_unlink
 #else
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #endif
@@ -100,6 +104,9 @@ static inline void emucap_net_init() { static bool d = false; if (!d) { WSADATA 
 static inline int  emucap_closesock(int s) { return ::closesocket((SOCKET)s); }
 static inline int  emucap_set_nonblock(int s) { u_long m = 1; return ::ioctlsocket((SOCKET)s, FIONBIO, &m); }
 static inline bool emucap_sock_wouldblock() { int e = ::WSAGetLastError(); return e == WSAEWOULDBLOCK || e == WSAEINTR; }
+static inline bool emucap_sock_eintr() { return ::WSAGetLastError() == WSAEINTR; }
+static inline void emucap_set_rcvtimeo_ms(int s, int ms) { DWORD t = (DWORD)ms; ::setsockopt((SOCKET)s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t)); }
+static inline void emucap_set_sndtimeo_ms(int s, int ms) { DWORD t = (DWORD)ms; ::setsockopt((SOCKET)s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t)); }
 static inline int  emucap_mkdir(const char* p) { return ::_mkdir(p); }
 static inline std::string emucap_temp_file(const std::string& name) {
   char dir[MAX_PATH]; DWORD n = ::GetTempPathA(MAX_PATH, dir);
@@ -111,6 +118,9 @@ static inline void emucap_net_init() {}
 static inline int  emucap_closesock(int s) { return ::close(s); }
 static inline int  emucap_set_nonblock(int s) { return ::fcntl(s, F_SETFL, O_NONBLOCK); }
 static inline bool emucap_sock_wouldblock() { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
+static inline bool emucap_sock_eintr() { return errno == EINTR; }
+static inline void emucap_set_rcvtimeo_ms(int s, int ms) { struct timeval tv{ms / 1000, (ms % 1000) * 1000}; ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+static inline void emucap_set_sndtimeo_ms(int s, int ms) { struct timeval tv{ms / 1000, (ms % 1000) * 1000}; ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)); }
 static inline int  emucap_mkdir(const char* p) { return ::mkdir(p, 0755); }
 static inline std::string emucap_temp_file(const std::string& name) {
   const char* t = getenv("TMPDIR"); std::string d = (t && *t) ? std::string(t) : std::string("/tmp");
@@ -565,6 +575,59 @@ void emucap_connect() {
     emucap_closesock(fd);
     return;
   }
+  const char* front_key = getenv("EMUCAP_SESSION_TOKEN");
+  const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+  if (!front_key || !front_key[0] || !launch_id || !launch_id[0]) {
+    emucap_closesock(fd);
+    return;
+  }
+  const auto auth_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  auto auth_budget = [&]() -> int {
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        auth_deadline - std::chrono::steady_clock::now()).count();
+    return remaining <= 0 ? 0 : (int)std::min<long long>(remaining, 5000);
+  };
+  auto read_exact = [&](std::uint8_t* bytes, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+      int budget = auth_budget();
+      if (!budget) return false;
+      emucap_set_rcvtimeo_ms(fd, budget);
+      ssize_t count = recv(fd, reinterpret_cast<char*>(bytes + offset), size - offset, 0);
+      if (count <= 0) {
+        if (count < 0 && emucap_sock_eintr()) continue;
+        return false;
+      }
+      offset += (size_t)count;
+    }
+    return true;
+  };
+  auto write_all = [&](const std::uint8_t* bytes, size_t size) {
+    size_t offset = 0;
+#ifdef MSG_NOSIGNAL
+    constexpr int send_flags = MSG_NOSIGNAL;
+#else
+    constexpr int send_flags = 0;
+#endif
+    while (offset < size) {
+      int budget = auth_budget();
+      if (!budget) return false;
+      emucap_set_sndtimeo_ms(fd, budget);
+      ssize_t count = ::send(fd, reinterpret_cast<const char*>(bytes + offset), size - offset,
+                             send_flags);
+      if (count <= 0) {
+        if (count < 0 && emucap_sock_eintr()) continue;
+        return false;
+      }
+      offset += (size_t)count;
+    }
+    return true;
+  };
+  if (!emucap_front_auth::Authenticate(front_key, launch_id, (std::uint16_t)emucap_port(),
+          read_exact, write_all)) {
+    emucap_closesock(fd);
+    return;
+  }
   emucap_set_nonblock(fd);  // recv는 논블로킹
   g_fd = fd;
   owned_connected();
@@ -881,17 +944,8 @@ bool recording_input_movie(
     return false;
   }
 
-  std::ifstream input(path.c_str(), std::ios::in | std::ios::binary);
-  if (!input) {
-    error = "input_movie open failed";
-    return false;
-  }
-  const std::string text(
-      (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-  if (input.bad() || text.size() != expected_bytes || text.empty() || text.back() != '\n') {
-    error = "input_movie size or terminal newline mismatch";
-    return false;
-  }
+  std::string text;
+  if (!emucap_read_recording_input_movie(path, expected_bytes, text, error)) return false;
 
   if (!emucap_parse_recording_input_movie(
           text, frames, lookup_button_bit, masks, error)) {
@@ -1913,7 +1967,7 @@ void handle_find_pattern(long id, const std::string& line) {
   if (!sp) { reply_err(id, "bad_params", "unknown memory_type"); return; }
 
   std::vector<uint8> pat;
-  if (!decode_hex_bytes(pat_hex, pat)) {
+  if (pat_hex.size() > 2 * (size_t)MAX_FIND_LEN || !decode_hex_bytes(pat_hex, pat)) {
     reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string");
     return;
   }
@@ -1959,18 +2013,12 @@ void handle_find_pattern(long id, const std::string& line) {
     sp->GetAddressSpaceBytes(mt.c_str(), (uint32)start, scan_len, buf.data());
 
   std::vector<uint32> matches;
-  if (pat.size() <= buf.size()) {
-    for (uint32 off = 0; off + pat.size() <= buf.size(); off++) {
-      if (((uint64)start + off) % (uint64)align != 0) continue;
-      if (memcmp(buf.data() + off, pat.data(), pat.size()) == 0) {
-        matches.push_back((uint32)((uint64)start + off));
-        if ((long)matches.size() >= max_matches) {
-          truncated = true;
-          break;
-        }
-      }
-    }
-  }
+  emucap_pattern_matches(buf.data(), buf.size(), pat.data(), pat.size(), [&](size_t off) {
+    if (((uint64)start + off) % (uint64)align != 0) return true;
+    matches.push_back((uint32)((uint64)start + off));
+    if ((long)matches.size() >= max_matches) { truncated = true; return false; }
+    return true;
+  });
 
   std::string arr = "[";
   for (size_t i = 0; i < matches.size(); i++) {
@@ -2450,11 +2498,10 @@ void handle_save_state(long id, const std::string& line) {
   reply_ok(id, "{\"status\":\"completed\"}");
 }
 
-void handle_load_state(long id, const std::string& line) {
-  std::string path = json_str(line, "path");
-  if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
+bool restore_state_transaction(long id, const std::string& path, bool& output_history) {
+  if (path.empty()) { reply_err(id, "bad_params", "path is required"); return false; }
   bool native_load_started = false;
-  bool output_history = false;
+  output_history = false;
   try {
     FileStream fs(path, FileStream::MODE_READ);
     const auto size = fs.size();
@@ -2494,13 +2541,19 @@ void handle_load_state(long id, const std::string& line) {
   } catch (std::exception& e) {
     if (native_load_started) quarantine_state_restore(e.what());
     reply_err(id, native_load_started ? "restore_unverified" : "io_error", e.what());
-    return;
+    return false;
   } catch (...) {
     if (native_load_started) quarantine_state_restore("unknown native state-load exception");
     reply_err(id, native_load_started ? "restore_unverified" : "io_error",
               "unknown native state-load exception");
-    return;
+    return false;
   }
+  return true;
+}
+
+void handle_load_state(long id, const std::string& line) {
+  bool output_history = false;
+  if (!restore_state_transaction(id, json_str(line, "path"), output_history)) return;
   // The native CPU acknowledges replacement after discarding old callback locals.
   // WS also distinguishes an exhausted/idle slice from an instruction-ready park.
   if (defer_native_core_refresh(id, output_history ? CORE_REFRESH_LOAD_STATE_WITH_OUTPUT
@@ -3540,7 +3593,6 @@ void handle_legacy(long id, const std::string& method, const std::string& line,
     append_owned_control_capabilities(hello_resp);
     // broker 등록용 name(EMUCAP_NAME 설정 시 포함, 직접 모드는 무시됨).
     const char* emu_name = getenv("EMUCAP_NAME");
-    const char* session_token = getenv("EMUCAP_SESSION_TOKEN");
     const char* content = getenv("EMUCAP_CONTENT");
     const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
     std::string resp = std::move(hello_resp);
@@ -3553,12 +3605,6 @@ void handle_legacy(long id, const std::string& method, const std::string& line,
         resp.pop_back();
         resp += ",\"name\":\"" + json_escape(nm) + "\"}";
       }
-    }
-    if (session_token && session_token[0] && !resp.empty() && resp.back() == '}') {
-      std::string tok(session_token);
-      if (tok.size() > 256) tok.resize(256);
-      resp.pop_back();
-      resp += ",\"session_token\":\"" + json_escape(tok) + "\"}";
     }
     if (content && content[0] && !resp.empty() && resp.back() == '}') {
       std::string c(content);
@@ -3794,11 +3840,11 @@ void handle_legacy(long id, const std::string& method, const std::string& line,
     if (g_insn_armed) rearm_breakpoints();
     start_advance_clock();
   } else if (method == "probe") {
-    // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
-    // frame-boundary park에서는 그대로 수행할 수 있다. CPU callback 안의 instruction-boundary
-    // park만 host callback stack과 restored CPU state를 섞을 수 있어 상태를 건드리기 전에 거부한다.
-    if (g_frozen && g_frozen_via_cb) {
-      reply_err(id, "unsafe_halt", "probe requires a frame-boundary halt; call resume, then pause");
+    // Probe restores and advances on the native frame owner. A callback or pacing
+    // stack cannot be reused for the restored guest, even if a prior park was frozen.
+    if (!g_native_control.Valid()
+        || g_native_control.CurrentContext() != EmucapControl::NativeControl::Context::Frame) {
+      reply_err(id, "unsafe_halt", "probe requires a native frame boundary");
       return;
     }
     std::string probe_mt = json_str(line, "memory_type");
@@ -3817,11 +3863,8 @@ void handle_legacy(long id, const std::string& method, const std::string& line,
       reply_err(id, "bad_params", "unknown memory_type or address/length exceeds the region");
       return;
     }
-    try {                              // 즉시 복귀(원자적 진입)
-      FileStream fs(path, FileStream::MODE_READ);
-      MDFNSS_LoadSM(&fs);
-      fs.close();
-    } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
+    bool output_history = false;
+    if (!restore_state_transaction(id, path, output_history)) return;
     if (frames == 0) {
       std::string hex;
       if (!read_aspace_hex(probe_mt, probe_addr, probe_len, hex)) {

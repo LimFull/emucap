@@ -2,6 +2,9 @@
 
 Live-debug the Dreamcast (SH-4) with emucap.
 
+`upstream.lock` pins Flycast v2.7 (`5aa091fde632fb332c8d8c34e280d62dc951954c`)
+and its exact recursive submodule manifest.
+
 ## What the user provides (agent: relay these by name)
 
 You (the agent) run `build.sh` and launch yourself. Three inputs come from the **user** — walk them
@@ -21,16 +24,15 @@ through each by exact filename/path and confirm before proceeding:
 2. **Dreamcast BIOS `dc_boot.bin`** — user-supplied. It is copyrighted Dreamcast firmware, **not included**
    with Flycast or emucap, and **must not be committed** to the repo; it comes from the user's own Dreamcast
    console / their own dumps. Put `dc_boot.bin` in a folder and set that folder (the **directory**, not the
-   file itself) as `Dreamcast.BiosPath` in `emu.cfg` (see Usage). Flycast can **HLE-boot many games without a
+   file itself) as `Dreamcast.BiosPath` in a dedicated `emu.cfg`, then set its absolute path in
+   `EMUCAP_FLYCAST_CONFIG` (see Usage). Flycast can **HLE-boot many games without a
    BIOS**, so this is often optional — ask the user for `dc_boot.bin` only when a game refuses to boot without it.
 
 3. **Game disc** — a `.gdi`, `.cdi`, or `.chd` image the user provides. Pass its path to the MCP `launch`
    tool. `launch.sh` is a legacy fallback.
 
-**OS reality:** macOS (arm64) is the tested runtime path; Linux is experimental; Windows is **BETA**. The Rust
-launcher copies `Flycast.exe` and its adjacent DLLs into an emucap-owned portable directory
-and writes `emu.cfg` next to that copy. Native Windows CI builds pass; managed Windows game
-execution remains under qualification.
+The Windows launcher copies `Flycast.exe` and adjacent DLLs into an emucap-owned portable
+directory and writes `emu.cfg` beside that copy.
 
 ## Native adapter
 
@@ -52,6 +54,8 @@ snapshot payload; all header integers are little-endian (unit: u32, memory count
 length: u64). Raw snapshots from earlier producers lack this continuation and are rejected before
 restore. Create new checkpoints with the maintained producer. Invalid header fields or lengths
 are also rejected before changing the machine; the native payload still uses upstream validation.
+Managed states are limited to 512 MiB, including the header, on both save and load.
+Load checks the opened regular file and fixed header before allocating its payload.
 
 `read_memory_batch` reads up to 64 ranges (64 KiB) of `ram`, `vram` and `aica` at one frozen stop
 (vblank park or exec breakpoint) from their backing host arrays. `debug.execution_speed` sets an
@@ -85,12 +89,11 @@ contracts are not available under the native adapter's vblank-frame freeze model
 MCP launch enables audio with `sound:true` (default false). The shell launcher uses
 `EMUCAP_MUTE=0`. Both write `aica.Volume` only in the emucap-owned config copy.
 
-⚠ **screenshot works via a continuous buffer.** GetLastFrame needs the GL context (UI thread), but freeze (the park spin) blocks
-UI rendering, so a gui_runOnUiThread/deferred approach deadlocks. Instead, mainui_rend_frame copies the latest raw frame into a
-buffer on every render via `emucap_capture_latest()`, and on a screenshot request the emu thread PNG-encodes that buffer
-(no GL needed) → it works even while frozen (buffer = the frame just before freeze = the frozen frame). ⚠ After a load_state while
-frozen the screen buffer is not refreshed (UI rendering is stopped). Until a new rendered frame is captured, `screenshot`
-fails with `bad_state` instead of returning the pre-load image; advance one frame with `step(1)` and retry.
+**Frozen screenshots use the last presented guest image.** The renderer publishes RGB after
+each successful presentation, before the observation fence completes. Screenshot requests encode
+that buffer on the emulation thread. Loading a state invalidates the image; advance until the
+guest presents again before requesting a screenshot. A vblank without a presentation can retain
+the previous image within the same execution generation.
 
 ⚠ **Input is injected at the game's consumption point, not into `kcode[]`.** The source of Flycast input is `kcode[4]` (Lua
 `pressButtons` writes here too), but writing to the `kcode[]` global gets reset every frame by `os_UpdateInputState` (UI thread) and
@@ -110,7 +113,7 @@ the OS default shown below).
 Default build output:
 - macOS: `~/Library/Application Support/emucap/flycast-build/work/build/Flycast.app/Contents/MacOS/Flycast`
 - Linux: `${XDG_DATA_HOME:-~/.local/share}/emucap/flycast-build/work/build/flycast`
-- Windows BETA: `%LOCALAPPDATA%\emucap\flycast-build\work\build\Flycast.exe`
+- Windows build path (runtime qualification pending): `%LOCALAPPDATA%\emucap\flycast-build\work\build\Flycast.exe`
 `FLYCAST_APP` may point to either the executable or a macOS `Flycast.app` bundle.
 The adapter `build` identity uses the form
 `<emucap-revision>@flycast-<upstream-revision>`, so `status.emulator_build` distinguishes both inputs.
@@ -121,8 +124,11 @@ instance.
 
 ## Usage
 
-The launcher runs Flycast from an emucap-owned runtime copy and seeds an isolated `emu.cfg` under
-`EMUCAP_EMU_HOME/flycast/<port>/`; it also copies an existing user `emu.cfg` as input when present.
+The managed launcher runs Flycast from an emucap-owned launch-generation copy and seeds its isolated
+`emu.cfg`. It does not inspect the user's default Flycast profile. Set `EMUCAP_FLYCAST_CONFIG` to an
+absolute, bounded regular UTF-8 config file when an explicit import is needed; only the private copy
+is changed. The legacy fallback uses `EMUCAP_EMU_HOME/flycast/<port>/` and retains its compatibility
+behavior of seeding from an existing user config when present.
 When a BIOS is required, the seeded `[config]` includes:
 ```ini
 Dreamcast.BiosPath = <directory containing dc_boot.bin>
@@ -140,3 +146,9 @@ adapters/flycast/launch.sh "<disc.gdi>" <listening_port> [name]
 
 Addresses are all SH-4 addresses (main RAM `0x8C......`, 1ST_READ.BIN from `0x8C010000`). hex strings accepted.
 For an accurate snapshot, read after `pause` (emucap determinism convention).
+
+Pattern search scans up to 16 MiB per request and returns at most 4096 matches.
+Exact hexadecimal patterns support overlapping matches and region-relative alignment.
+
+The native debugger retains up to 128 active breakpoint registrations. Clearing a
+registration frees its slot; duplicate addresses keep distinct breakpoint IDs.

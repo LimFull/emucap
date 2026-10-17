@@ -6,6 +6,48 @@ use std::sync::{
     Arc,
 };
 
+const AUTH_ROOT: &str = "reconnect-test-root";
+const AUTH_LAUNCH: &str = "launch-01arz3ndektsv4rrffq69g5fav";
+
+struct ReconnectAuthEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _env: crate::test_env::EnvGuard,
+}
+
+impl ReconnectAuthEnv {
+    fn new(port: u16) -> Self {
+        let guard = crate::test_env::lock_env();
+        let env = crate::test_env::EnvGuard::new(&["EMUCAP_SESSION_TOKEN", "EMUCAP_LAUNCH_ID"]);
+        let front_key = crate::live::producer_auth::derive_front_key(
+            AUTH_ROOT,
+            crate::live::producer_auth::Boundary::Direct,
+            port,
+            AUTH_LAUNCH,
+        )
+        .unwrap();
+        std::env::set_var("EMUCAP_SESSION_TOKEN", front_key);
+        std::env::set_var("EMUCAP_LAUNCH_ID", AUTH_LAUNCH);
+        Self {
+            _guard: guard,
+            _env: env,
+        }
+    }
+}
+
+fn accept_authenticated(listener: &TcpListener, port: u16) -> TcpStream {
+    let (stream, _) = listener.accept().unwrap();
+    crate::live::producer_auth::authenticate_listener_stream(
+        stream,
+        AUTH_ROOT,
+        crate::live::producer_auth::Boundary::Direct,
+        port,
+        std::time::Instant::now() + Duration::from_secs(2),
+        None,
+    )
+    .unwrap()
+    .0
+}
+
 #[test]
 fn reconnects_front_session_without_recreating_handler_state() {
     const SESSIONS: u64 = 32;
@@ -20,6 +62,7 @@ fn reconnects_front_session_without_recreating_handler_state() {
     let before = count_fds();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let _auth = ReconnectAuthEnv::new(port);
     let worker = std::thread::spawn(move || {
         let mut calls = 0u64;
         serve_reconnecting_inner(
@@ -39,7 +82,7 @@ fn reconnects_front_session_without_recreating_handler_state() {
     });
 
     for expected in 1..=SESSIONS {
-        let (mut socket, _) = listener.accept().unwrap();
+        let mut socket = accept_authenticated(&listener, port);
         socket
             .write_all(
                 format!("{{\"v\":1,\"id\":{expected},\"method\":\"status\",\"params\":{{}}}}\n")
@@ -165,6 +208,7 @@ fn frontend_disconnect_does_not_abandon_backend_terminal_cleanup() {
 fn backend_terminal_reply_closes_front_and_exits_instead_of_reconnecting() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let _auth = ReconnectAuthEnv::new(port);
     let worker = std::thread::spawn(move || {
         serve_reconnecting_controlled_inner(
             port,
@@ -185,7 +229,7 @@ fn backend_terminal_reply_closes_front_and_exits_instead_of_reconnecting() {
         )
     });
 
-    let (mut socket, _) = listener.accept().unwrap();
+    let mut socket = accept_authenticated(&listener, port);
     socket
         .write_all(b"{\"v\":1,\"id\":11,\"method\":\"status\",\"params\":{}}\n")
         .unwrap();
@@ -204,6 +248,7 @@ fn backend_terminal_reply_closes_front_and_exits_instead_of_reconnecting() {
 fn idle_front_is_closed_when_process_dependency_ends() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let _auth = ReconnectAuthEnv::new(port);
     let terminal = Arc::new(AtomicBool::new(false));
     let terminal_in_probe = Arc::clone(&terminal);
     let worker = std::thread::spawn(move || {
@@ -227,7 +272,7 @@ fn idle_front_is_closed_when_process_dependency_ends() {
         )
     });
 
-    let (socket, _) = listener.accept().unwrap();
+    let socket = accept_authenticated(&listener, port);
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();

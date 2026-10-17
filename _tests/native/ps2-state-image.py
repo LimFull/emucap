@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Decode the maintained state PNG reader, including rejected and truncated images."""
+import argparse
 from pathlib import Path
 import shlex
 import struct
@@ -7,7 +8,11 @@ import subprocess
 import tempfile
 import zlib
 root = Path(__file__).resolve().parents[2]
-text = (root / 'adapters/pcsx2/work/pcsx2/pcsx2/SaveState.cpp').read_text()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--source', type=Path, default=root / 'adapters/pcsx2/work/pcsx2/pcsx2',
+                    help='patched pcsx2 source directory')
+native_source = parser.parse_args().source
+text = (native_source / 'SaveState.cpp').read_text()
 start = text.index('static bool SaveState_ReadScreenshot(zip_t*')
 end = text.index('\n// ---', start)
 function = text[start:end]

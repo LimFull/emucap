@@ -104,3 +104,24 @@ fn text_descriptors_reject_embedded_string_terminators() {
         io::ErrorKind::InvalidData
     );
 }
+
+#[test]
+fn hashing_admission_rechecks_actual_member_and_aggregate_sizes() {
+    use super::{admit_hashed_member, MAX_GRAPH_BYTES, MAX_MEMBER_BYTES};
+    assert_eq!(
+        admit_hashed_member(1, MAX_MEMBER_BYTES).unwrap(),
+        1 + MAX_MEMBER_BYTES
+    );
+    assert_eq!(
+        admit_hashed_member(MAX_GRAPH_BYTES - 1, 1).unwrap(),
+        MAX_GRAPH_BYTES
+    );
+    for (total, size) in [
+        (0, 0),
+        (0, MAX_MEMBER_BYTES + 1),
+        (MAX_GRAPH_BYTES, 1),
+        (u64::MAX, 1),
+    ] {
+        assert!(admit_hashed_member(total, size).is_err());
+    }
+}

@@ -224,6 +224,18 @@ cleanup, and mid-frame recording failures do not inherit that eligibility.
   frozen input; native `press_buttons` is surfaced only as input-drawer `pulse_while_running`
   because it leaves execution running.
 
+Persistent breakpoints and register/VRAM watches share a limit of 128 registrations. Each owns
+up to two native callbacks; successful clear or automatic expiry releases its capacity. Failed
+callback cleanup keeps the registration visible for a later clear. A partial installation that
+cannot be rolled back is listed with `registration_failed: true`.
+Register watches default to 1,000,000 instructions and accept at most 50,000,000; reconstructed
+VRAM watches default to and accept at most 100,000,000. Zero selects one instruction. Expiry
+continues when the event queue is full. Internal stepping, reset and state-I/O hooks retain their
+separate ownership.
+The maintained native dispatcher supports callback removal during execution, including multiple
+expiring watches and nested callbacks. New callbacks begin with the next dispatch; removed callbacks
+are skipped immediately. Rebuild the host with patch `0027` before using this Lua adapter.
+
 ### The agent launches Mesen
 
 Get the port from `status`'s `listening_port` — never hardcode 47800. Prefer the MCP `launch` tool:
@@ -247,14 +259,16 @@ launch a `.gba` file with `system: "gba"`; for NES, launch a `.nes` file with `s
 {"content_path": "/path/to/game.nes", "system": "nes", "name": "nes_session"}
 ```
 
-The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
+The managed launcher uses an emucap-owned, launch-generation portable Mesen copy under
+`EMUCAP_EMU_HOME` or the OS default emucap
 data root. Every system gets a local `settings.json` portable-home marker so Mesen cannot fall back to
 the user's ordinary configuration or native library. The shared portable template triggers Mesen's
 built-in input defaults on every launch, while `--donotSaveSettings` keeps that initialization
-ephemeral. The Rust MCP launcher applies required options on the command line; fallback launchers use
-the same isolation rule. On macOS each portable app also gets a port-specific bundle identifier,
-keeping its LaunchServices and saved-state namespace separate from the user's Mesen and other emucap
-ports. Pidfiles and logs stay under the per-port directory unless `EMUCAP_LOG` overrides the log path.
+ephemeral. The Rust MCP launcher applies required options on the command line. On macOS each managed
+portable app also gets a generation-specific bundle identifier, keeping its LaunchServices and
+saved-state namespace separate from the user's Mesen and other emucap generations. Managed pidfiles
+and logs stay in that generation. The legacy fallback launchers below retain port-scoped compatibility
+directories and their own pidfiles.
 
 **macOS / Linux fallback** — use `launch.sh` only when the MCP `launch` tool is unavailable:
 
@@ -473,6 +487,11 @@ Find what the patch broke — drive both ROMs to the same logical moment and com
 ## Caveat
 The call context of `createSavestate` and the return keys of `getInput` may differ by Mesen2
 version. On first use, confirm the behavior empirically before relying on it.
+
+State files are limited to 64 MiB on save and load. Input movies are read within their
+declared size (at most 1 MiB). Pattern inputs are limited to the 128 KiB scan window.
+Breakpoint snapshots accept up to 64 ranges totaling 128 KiB per hit; oversized
+requests fail before callback registration.
 
 ## Instruction snapshot receipts
 

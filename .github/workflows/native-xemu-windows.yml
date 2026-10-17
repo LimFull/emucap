@@ -2,22 +2,11 @@ name: Native xemu Windows build
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, next]
-    paths:
-      - 'adapters/xemu/**'
-      - 'adapters/_common/**'
-      - '!**/*.md'
-      - '.github/workflows/native-xemu-windows.yml'
-  pull_request:
-    paths:
-      - 'adapters/xemu/**'
-      - 'adapters/_common/**'
-      - '!**/*.md'
-      - '.github/workflows/native-xemu-windows.yml'
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 concurrency:
   group: native-xemu-windows-${{ github.ref }}
@@ -38,24 +27,45 @@ jobs:
       CROSSAR: x86_64-w64-mingw32.static-gcc-ar
       EMUCAP_XEMU_PLATFORM: win64-cross
       EMUCAP_BUILD_JOBS: 4
+      NATIVE_CONTAINER: ghcr.io/xemu-project/xemu-win64-toolchain-gcc@sha256:5bb480ccba1009cc45d2de3e9f49456b83cc7f003b354dcdd361525f64637832
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build pinned Windows source
         run: |
           set -euo pipefail
           bash adapters/xemu/build.sh 2>&1 | tee native-build.log
           test -f adapters/xemu/work/xemu/dist/xemu.exe
           sha256sum adapters/xemu/work/xemu/dist/xemu.exe > native-binary.sha256
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Record native producer and payload
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        shell: bash
+        run: python _tests/release/native_provenance.py create --source . --directory adapters/xemu/work/xemu/dist --purpose runtime --adapter 'xemu' --platform windows
+      - name: Attest native provenance
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        id: native-attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: adapters/xemu/work/xemu/dist/NATIVE-PROVENANCE.json
+      - name: Retain signed provenance
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        shell: bash
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.native-attestation.outputs.bundle-path }}
+        run: cp "$ATTESTATION_BUNDLE" adapters/xemu/work/xemu/dist/NATIVE-PROVENANCE.sigstore.json
       - name: Retain native runtime payload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-runtime-xemu-windows-x86_64
           path: adapters/xemu/work/xemu/dist/
+          include-hidden-files: true
           retention-days: 7
           if-no-files-found: error
       - name: Retain build evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-evidence-xemu-windows-x86_64
           path: |

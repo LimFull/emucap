@@ -28,6 +28,33 @@ fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     }
 }
 
+fn request_payload(frame: &[u8]) -> &str {
+    let marker = frame.iter().position(|byte| *byte == b'#').unwrap();
+    std::str::from_utf8(&frame[1..marker]).unwrap()
+}
+
+#[test]
+fn mame_native_auth_proof_matches_the_pinned_native_vector() {
+    assert_eq!(
+        super::native_auth_proof(
+            "native-control-test-token",
+            b"server",
+            "102132435465768798a9bacbdcedfe0f",
+            "00112233445566778899aabbccddeeff",
+        ),
+        "cd4b1bb6f36d7577ff4df790e3b62b98973be1c5"
+    );
+    assert_eq!(
+        super::native_auth_proof(
+            "native-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            b"server",
+            "102132435465768798a9bacbdcedfe0f",
+            "00112233445566778899aabbccddeeff",
+        ),
+        "bfd0896d0923c875b3677c82eaacd43d285982e6"
+    );
+}
+
 #[test]
 fn client_sends_acknowledged_packet_and_decodes_reply() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -59,6 +86,209 @@ fn client_sends_acknowledged_packet_and_decodes_reply() {
     .unwrap();
     assert_eq!(client.send("g").unwrap(), "OK");
     handle.join().unwrap();
+}
+
+#[test]
+fn authentication_is_the_first_packet_and_allows_followup_commands() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let auth_payload = format!("qEmucap,auth:{}", hex::encode(b"native-debug-token"));
+        assert_eq!(
+            read_request(&mut stream),
+            GdbRspClient::frame(&auth_payload)
+        );
+        stream.write_all(b"+$OK#9a").unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+
+        assert_eq!(read_request(&mut stream), b"$?#3f");
+        stream.write_all(b"+$S05#b8").unwrap();
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+    });
+
+    let mut client = GdbRspClient::connect(
+        "127.0.0.1",
+        port,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    client.authenticate("native-debug-token").unwrap();
+    assert_eq!(client.send("?").unwrap(), "S05");
+    assert!(!client.is_terminal());
+    handle.join().unwrap();
+}
+
+#[test]
+fn authentication_rejection_poisons_the_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        stream.write_all(b"+$E01#a6").unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+    });
+
+    let mut client = GdbRspClient::connect(
+        "127.0.0.1",
+        port,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(matches!(
+        client.authenticate("wrong-token"),
+        Err(GdbError::Emulator(_))
+    ));
+    assert!(client.is_terminal());
+    assert!(matches!(client.send("?"), Err(GdbError::Poisoned)));
+    handle.join().unwrap();
+}
+
+#[test]
+fn empty_authentication_token_fails_without_sending_a_packet() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    });
+
+    let mut client = GdbRspClient::connect(
+        "127.0.0.1",
+        port,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(matches!(
+        client.authenticate(""),
+        Err(GdbError::Emulator(_))
+    ));
+    assert!(client.is_terminal());
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn mutual_authentication_proves_mame_before_sending_the_client_proof() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let first = read_request(&mut stream);
+        let client_nonce = request_payload(&first)
+            .strip_prefix("qEmucap,auth1:")
+            .unwrap();
+        assert!(super::is_hex(client_nonce, 32));
+        let server_nonce = "00112233445566778899aabbccddeeff";
+        let server_proof =
+            super::native_auth_proof("native-debug-token", b"server", client_nonce, server_nonce);
+        let reply = format!("qEmucap,auth2:{server_nonce}:{server_proof}");
+        stream.write_all(b"+").unwrap();
+        stream.write_all(&GdbRspClient::frame(&reply)).unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+
+        let third = read_request(&mut stream);
+        let client_proof = request_payload(&third)
+            .strip_prefix("qEmucap,auth3:")
+            .unwrap();
+        assert_eq!(
+            client_proof,
+            super::native_auth_proof("native-debug-token", b"client", client_nonce, server_nonce,)
+        );
+        stream.write_all(b"+$OK#9a").unwrap();
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+
+        assert_eq!(read_request(&mut stream), b"$?#3f");
+        stream.write_all(b"+$S05#b8").unwrap();
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+    });
+
+    let mut client = GdbRspClient::connect(
+        "127.0.0.1",
+        port,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    client.authenticate_mutual("native-debug-token").unwrap();
+    assert_eq!(client.send("?").unwrap(), "S05");
+    assert!(!client.is_terminal());
+    handle.join().unwrap();
+}
+
+#[test]
+fn counterfeit_mame_never_receives_a_client_proof_or_ordinary_command() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let first = read_request(&mut stream);
+        assert!(request_payload(&first).starts_with("qEmucap,auth1:"));
+        let reply = format!(
+            "qEmucap,auth2:{}:{}",
+            "00112233445566778899aabbccddeeff",
+            "00".repeat(20)
+        );
+        stream.write_all(b"+").unwrap();
+        stream.write_all(&GdbRspClient::frame(&reply)).unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], b'+');
+        let mut unexpected = [0u8; 1];
+        assert_eq!(stream.read(&mut unexpected).unwrap(), 0);
+    });
+
+    let mut client = GdbRspClient::connect(
+        "127.0.0.1",
+        port,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(matches!(
+        client.authenticate_mutual("native-debug-token"),
+        Err(GdbError::Emulator(_))
+    ));
+    assert!(client.is_terminal());
+    assert!(matches!(client.send("?"), Err(GdbError::Poisoned)));
+    handle.join().unwrap();
+}
+
+#[test]
+fn mutual_authentication_rejects_missing_or_oversized_tokens_before_writing() {
+    for token in [String::new(), "x".repeat(257)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        let mut client = GdbRspClient::connect(
+            "127.0.0.1",
+            port,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(client.authenticate_mutual(&token).is_err());
+        assert!(client.is_terminal());
+        handle.join().unwrap();
+    }
 }
 
 #[test]
@@ -388,10 +618,12 @@ fn oversized_rsp_retires_blocking_and_polling_connections_without_ack() {
         assert!(matches!(error,GdbError::Io(ref e) if e.kind()==std::io::ErrorKind::InvalidData));
         assert!(client.is_terminal());
         assert!(matches!(client.send("?"), Err(GdbError::Poisoned)));
-        peer.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         assert_eq!(
-            peer.read(&mut [0]).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
+            peer.read(&mut [0]).unwrap(),
+            0,
+            "rejected stream closes without an ACK"
         );
     }
 }
@@ -403,10 +635,12 @@ fn oversized_rsp_request_is_rejected_before_socket_write() {
         .send_no_reply(&"x".repeat(MAX_RSP_PAYLOAD_BYTES + 1))
         .is_err());
     assert!(client.is_terminal());
-    peer.set_nonblocking(true).unwrap();
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     assert_eq!(
-        peer.read(&mut [0]).unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
+        peer.read(&mut [0]).unwrap(),
+        0,
+        "rejected stream closes without a request"
     );
 }
 
@@ -434,4 +668,112 @@ fn bounded_failure_preserves_primary_error_when_timeout_cleanup_also_fails() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("primary protocol failure"));
     assert!(client.poisoned);
+}
+
+#[test]
+fn ordinary_exchange_deadline_cannot_be_refreshed_by_fragment_drip() {
+    let (mut client, mut peer) = connected_pair();
+    client.set_timeout(Duration::from_millis(100)).unwrap();
+    let worker = std::thread::spawn(move || {
+        read_request(&mut peer);
+        peer.write_all(b"+$").unwrap();
+        for _ in 0..50 {
+            if peer.write_all(b"x").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let start = Instant::now();
+    assert!(client.send("g").is_err());
+    assert!(start.elapsed() < Duration::from_millis(400));
+    assert!(client.is_terminal());
+    worker.join().unwrap();
+}
+
+#[test]
+fn framing_prefix_is_bounded_for_blocking_and_polling_reads() {
+    for polling in [false, true] {
+        let (mut client, mut peer) = connected_pair();
+        client.buf.extend(vec![b'+'; MAX_RSP_PREFIX_BYTES + 1]);
+        let result = if polling {
+            client.recv_nonblocking().map(|_| ())
+        } else {
+            client.recv_reply().map(|_| ())
+        };
+        assert!(
+            matches!(result, Err(GdbError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        assert!(client.is_terminal());
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+}
+/// Immediate adversarial packets, or a delayed stream that honors the supplied budget.
+pub(crate) struct DemuxFlood {
+    pub packet: &'static str,
+    pub polling: bool,
+    pub delayed: bool,
+    pub budgets: Vec<Duration>,
+    pub resumes: usize,
+}
+
+impl DemuxFlood {
+    pub fn new(packet: &'static str, polling: bool, delayed: bool) -> Self {
+        Self {
+            packet,
+            polling,
+            delayed,
+            budgets: Vec::new(),
+            resumes: 0,
+        }
+    }
+    fn reply(&mut self, budget: Duration) -> GdbResult<String> {
+        if self.delayed {
+            if let Some(previous) = self.budgets.last() {
+                assert!(budget < *previous);
+            }
+            std::thread::sleep(budget.min(Duration::from_millis(8)));
+        }
+        self.budgets.push(budget);
+        Ok(self.packet.into())
+    }
+}
+impl GdbTransport for DemuxFlood {
+    fn send(&mut self, _: &str) -> GdbResult<String> {
+        Ok("S05".into())
+    }
+    fn send_no_reply(&mut self, _: &str) -> GdbResult<()> {
+        self.resumes += 1;
+        Ok(())
+    }
+    fn interrupt(&mut self) -> GdbResult<String> {
+        Ok("S02".into())
+    }
+    fn get_timeout(&self) -> GdbResult<Duration> {
+        Ok(if self.delayed {
+            Duration::from_millis(30)
+        } else {
+            Duration::from_secs(5)
+        })
+    }
+    fn send_with_timeout(&mut self, _: &str, budget: Duration) -> GdbResult<String> {
+        self.reply(budget)
+    }
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> GdbResult<String> {
+        self.reply(budget)
+    }
+    fn recv_nonblocking_with_timeout(&mut self, budget: Duration) -> GdbResult<Option<String>> {
+        if self.polling {
+            self.reply(budget).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[test]
+fn demultiplexing_budget_bounds_bytes_before_count() {
+    let mut budget = ExchangeBudget::new(Duration::from_secs(1)).unwrap();
+    budget.skipped(&"x".repeat(8 * 1024 * 1024)).unwrap();
+    assert!(budget.skipped("x").is_err());
 }

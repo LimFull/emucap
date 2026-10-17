@@ -877,6 +877,9 @@ fn supported_system_catalog_keeps_platform_routing_without_launcher_paths() {
         .is_some_and(|system| {
             system["adapter"] == "mupen64plus"
                 && system["content"] == serde_json::json!(["z64", "n64", "v64"])
+                && system["notes"]
+                    .as_str()
+                    .is_some_and(|notes| notes.contains("Both modes expose rendered-frame"))
         }));
     assert!(supported_systems_value()
         .as_array()

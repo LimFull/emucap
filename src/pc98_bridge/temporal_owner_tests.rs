@@ -7,6 +7,19 @@ struct Native {
     exchanges: usize,
 }
 impl GdbTransport for Native {
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> crate::gdb_rsp::GdbResult<String> {
         assert_eq!(payload, "?");
         Ok("S05".into())

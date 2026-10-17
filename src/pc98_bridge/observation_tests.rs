@@ -1,6 +1,6 @@
 use super::*;
 
-const FEATURES: &str = "peek_block,throttle_wait_hook,fastforward_readback";
+const FEATURES: &str = "peek_block,throttle_wait_hook,fastforward_readback,validated_pacing";
 
 fn lua(name: &str, arg: &str) -> String {
     format!("qEmucap,{name},{}", hex::encode(arg))
@@ -195,6 +195,17 @@ fn slow_frame_step_carries_a_deadline_and_reports_partial_progress() {
     assert_eq!(value["status"], "interrupted");
     assert_eq!(value["reason"], "host_deadline");
     assert_eq!(value["completed"], 118);
+}
+
+#[test]
+fn older_pacing_host_keeps_its_slow_frame_deadline() {
+    let mut bridge = featured(vec![
+        ("qEmucap,pacing".into(), pacing(4, 1, 1)),
+        (lua("opdeadline", "245000"), "OK".into()),
+    ]);
+    bridge.gdb.features =
+        Some("throttle_wait_hook,fastforward_readback,operation_deadline_v1".into());
+    assert_eq!(bridge.arm_frame_deadline(60).unwrap(), Some(245000));
 }
 
 #[test]

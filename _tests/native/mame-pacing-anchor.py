@@ -16,19 +16,23 @@ def body(text,signature):
   depth+=(text[i]=='{')-(text[i]=='}');i+=1
  return text[start:i]
 setters='\n'.join(body(h,'void set_'+n+'(') for n in ['throttled','throttle_rate','fastforward','speed_factor'])
-methods=body(cpp,'void video_manager::update_throttle(')+'\n'+body(cpp,'void video_manager::postload(')+'\n'+body(cpp,'void video_manager::resume(')
+methods='\n'.join(body(cpp, signature) for signature in ['void video_manager::update_throttle(', 'void video_manager::postload(', 'void video_manager::resume(', 'bool video_manager::is_valid_throttle_rate('])
+helpers='\n'.join(body(cpp, signature) for signature in ['static attoseconds_t checked_throttle_period(', 'static bool throttle_elapsed('])
 resume=body((a.source/'machine.cpp').read_text(),'void running_machine::resume(').replace('running_machine::','Machine::')
 registration=next(line for line in cpp.splitlines() if 'machine.add_notifier(MACHINE_NOTIFY_RESUME,' in line)
 preamble=r'''
+#include <bit>
 #include <cassert>
 #include <functional>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 using u32=uint32_t;using attoseconds_t=int64_t;using osd_ticks_t=uint64_t;
 constexpr int64_t ATTOSECONDS_PER_SECOND=1000000000000000000LL;
+constexpr int ATTOTIME_MAX_SECONDS=1000000000;
 constexpr bool LOG_THROTTLE=false;constexpr unsigned PAUSED_REFRESH_RATE=60;
 struct attotime {
  long double seconds=0;
@@ -47,7 +51,8 @@ static attotime operator*(attotime a,unsigned b){return attotime::from_double(a.
 static attotime operator/(attotime a,unsigned b){return attotime::from_double(a.seconds/b);}
 [[maybe_unused]] static bool operator<(attotime a,attotime b){return a.seconds<b.seconds;}
 [[maybe_unused]] static bool operator>=(attotime a,attotime b){return a.seconds>=b.seconds;}
-static unsigned population_count_32(u32 x){return __builtin_popcount(x);}
+static bool operator>(attotime a,attotime b){return a.seconds>b.seconds;}
+[[maybe_unused]] static unsigned population_count_32(u32 x){return __builtin_popcount(x);}
 static uint64_t ticks=10000000,waited;
 static uint64_t osd_ticks(){return ticks;}
 static uint64_t osd_ticks_per_second(){return 1000000;}
@@ -74,10 +79,10 @@ public:
  bool m_throttled=true,m_fastforward=false,m_throttle_resync=true;
  float m_throttle_rate=1;
  uint64_t throttle_until_ticks(uint64_t target){assert(target>=ticks);waited+=target-ticks;ticks=target;return ticks;}
- void update_throttle(attotime);void postload();void resume();
+ void update_throttle(attotime);void postload();void resume();bool is_valid_throttle_rate(double) const;
  video_manager(){auto& machine=m_machine;EMUCAP_RESUME_REGISTRATION}
 '''
-preamble=preamble.replace('EMUCAP_RESUME_REGISTRATION',registration)
+preamble=preamble.replace('EMUCAP_RESUME_REGISTRATION',registration).replace('class video_manager {', helpers+'\nclass video_manager {')
 cases=r'''
 int main(){
  const unsigned rates[]={1000,10,1,11,500,4000,100000};
@@ -122,6 +127,6 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='mame-pacing-anchor-') as d:
  d=Path(d);(d/'test.cpp').write_text(preamble+setters+'\n};\n'+methods+'\n'+resume+cases)
- subprocess.run(['c++','-std=c++17','-O1','-g','-fsanitize=address,undefined','-Wall','-Wextra','-Werror','-Wno-sign-compare',str(d/'test.cpp'),'-o',str(d/'test')],check=True)
+ subprocess.run(['c++','-std=c++20','-O1','-g','-fsanitize=address,undefined','-Wall','-Wextra','-Werror','-Wno-sign-compare',str(d/'test.cpp'),'-o',str(d/'test')],check=True)
  subprocess.run([str(d/'test')],check=True)
 print('native limiter: actual resume notification, no-op resume, policy/load reanchor, no-op preservation, full-duration jumps and low-rate frame waits passed')

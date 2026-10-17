@@ -1,3 +1,4 @@
+mod budget;
 pub mod clock;
 pub mod compare;
 pub mod id;
@@ -31,3 +32,6 @@ mod repro_tests;
 mod store_tests;
 #[cfg(test)]
 mod summary_tests;
+
+#[cfg(test)]
+mod budget_tests;

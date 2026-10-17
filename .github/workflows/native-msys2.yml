@@ -8,44 +8,11 @@ on:
         type: choice
         default: all
         options: [all, mednafen, flycast, np2kai, mupen64plus, openmsx, mame-pc98, mame-neogeo, pcsx2, desmume-nds]
-  push:
-    branches: [main, next]
-    paths:
-      - 'adapters/mednafen/**'
-      - 'adapters/flycast/**'
-      - 'adapters/np2kai/**'
-      - 'adapters/mupen64plus/**'
-      - 'adapters/openmsx/**'
-      - 'adapters/mame-pc98/**'
-      - 'adapters/mame-neogeo/**'
-      - 'adapters/pcsx2/**'
-      - 'adapters/desmume-nds/**'
-      - 'adapters/_common/**'
-      - '_tests/adapters/build-lock-test.sh'
-      - '_tests/release/windows_native_payload*'
-      - '_tests/release/native_build.py'
-      - '!**/*.md'
-      - '.github/workflows/native-msys2.yml'
-  pull_request:
-    paths:
-      - 'adapters/mednafen/**'
-      - 'adapters/flycast/**'
-      - 'adapters/np2kai/**'
-      - 'adapters/mupen64plus/**'
-      - 'adapters/openmsx/**'
-      - 'adapters/mame-pc98/**'
-      - 'adapters/mame-neogeo/**'
-      - 'adapters/pcsx2/**'
-      - 'adapters/desmume-nds/**'
-      - 'adapters/_common/**'
-      - '_tests/adapters/build-lock-test.sh'
-      - '_tests/release/windows_native_payload*'
-      - '_tests/release/native_build.py'
-      - '!**/*.md'
-      - '.github/workflows/native-msys2.yml'
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 concurrency:
   group: native-msys2-${{ github.ref }}${{ inputs.adapter && inputs.adapter != 'all' && format('-{0}', inputs.adapter) || '' }}
@@ -61,7 +28,7 @@ jobs:
       matrix:
         adapter: ${{ fromJSON(inputs.adapter && inputs.adapter != 'all' && format('["{0}"]', inputs.adapter) || '["mednafen", "flycast", "np2kai", "mupen64plus", "openmsx", "mame-pc98", "mame-neogeo", "pcsx2", "desmume-nds"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Restore canonical checkout bytes
         shell: pwsh
         run: |
@@ -77,7 +44,7 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$parseErrors)
             if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
           }
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: MINGW64
           path-type: inherit
@@ -145,16 +112,33 @@ jobs:
           python _tests/release/windows_native_payload_tests.py
           python _tests/release/windows_native_payload.py --adapter "$ADAPTER" \
             --binary "$binary" --dll-directory "$(cygpath -w /mingw64/bin)" "${payload_args[@]}"
+      - name: Record native producer and payload
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        shell: msys2 {0}
+        run: python _tests/release/native_provenance.py create --source . --directory native-payload --purpose runtime --adapter '${{ matrix.adapter }}' --platform windows
+      - name: Attest native provenance
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        id: native-attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: native-payload/NATIVE-PROVENANCE.json
+      - name: Retain signed provenance
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+        shell: bash
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.native-attestation.outputs.bundle-path }}
+        run: cp "$ATTESTATION_BUNDLE" native-payload/NATIVE-PROVENANCE.sigstore.json
       - name: Retain native runtime payload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-runtime-${{ matrix.adapter }}-windows-x86_64
           path: native-payload/
+          include-hidden-files: true
           retention-days: 7
           if-no-files-found: error
       - name: Retain build evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-evidence-${{ matrix.adapter }}-windows-mingw64
           path: |

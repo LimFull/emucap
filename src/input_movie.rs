@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const INPUT_MOVIE_FORMAT: &str = "frame-full-state-1";
 
@@ -6,6 +6,7 @@ pub const INPUT_MOVIE_FORMAT: &str = "frame-full-state-1";
 pub struct MovieFrame {
     pub frame: u64,
     pub buttons: Vec<String>,
+    pub axes: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,12 @@ pub struct CanonicalMovie {
 /// ignored, button names are trimmed and lowercased, and frames are sorted for the existing
 /// regression runner.
 pub fn parse_movie(text: &str) -> Result<Movie, String> {
+    parse_movie_bounded(text, usize::MAX)
+}
+
+/// Parse the shared movie grammar while bounding nonblank frame rows before allocating the next
+/// frame. Callers remain responsible for bounding the encoded input bytes.
+pub fn parse_movie_bounded(text: &str, max_rows: usize) -> Result<Movie, String> {
     let mut frames = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -36,12 +43,33 @@ pub fn parse_movie(text: &str) -> Result<Movie, String> {
             .trim()
             .parse()
             .map_err(|_| format!("line {}: frame is not an integer", index + 1))?;
-        let buttons = buttons
-            .split(',')
-            .map(|button| button.trim().to_ascii_lowercase())
-            .filter(|button| !button.is_empty())
-            .collect();
-        frames.push(MovieFrame { frame, buttons });
+        let (buttons, axes) = if buttons.trim_start().starts_with('{') {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ControllerRow {
+                buttons: Vec<String>,
+                #[serde(default)]
+                axes: BTreeMap<String, i64>,
+            }
+            let row: ControllerRow = serde_json::from_str(buttons)
+                .map_err(|e| format!("line {}: invalid controller state: {e}", index + 1))?;
+            (row.buttons, row.axes)
+        } else {
+            let buttons = buttons
+                .split(',')
+                .map(|button| button.trim().to_ascii_lowercase())
+                .filter(|button| !button.is_empty())
+                .collect();
+            (buttons, BTreeMap::new())
+        };
+        if frames.len() >= max_rows {
+            return Err(format!("movie exceeds {max_rows} frame rows"));
+        }
+        frames.push(MovieFrame {
+            frame,
+            buttons,
+            axes,
+        });
     }
     frames.sort_by_key(|frame| frame.frame);
     Ok(Movie { frames })
@@ -62,6 +90,9 @@ pub fn canonical_recording_movie(
         ));
     }
 
+    if movie.frames.iter().any(|f| !f.axes.is_empty()) {
+        return Err("recording frame-full-state-1 does not encode controller axes".into());
+    }
     let mut canonical = String::new();
     for (expected, frame) in movie.frames.iter_mut().enumerate() {
         let expected = u64::try_from(expected).map_err(|_| "recording movie is too large")?;

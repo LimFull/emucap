@@ -1,7 +1,8 @@
 diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index 1440d33cb8..e0b996c01d 100644
 --- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-@@ -213,6 +213,8 @@
+@@ -212,6 +212,8 @@ void WebSocketSteppingState::Pacing(DebuggerRequest &req) {
  		bool value = false;
  		if (!req.ParamBool("unlimited", &value) || !value)
  			return req.Fail("unlimited must be true");
@@ -10,7 +11,7 @@ diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebS
  		__DisplaySetEmucapSpeed(0);
  	} else if (req.HasParam("percent")) {
  		uint32_t percent = 0;
-@@ -220,6 +222,8 @@
+@@ -219,6 +221,8 @@ void WebSocketSteppingState::Pacing(DebuggerRequest &req) {
  			return;
  		if (percent == 0 || percent > 10000)
  			return req.Fail("percent must be between 1 and 10000");

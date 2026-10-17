@@ -77,12 +77,13 @@ base64 = "0.23"
 rmcp = { version = "3.1.0", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "time", "sync"] }
 schemars = "1.2.1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 ulid = "3"
 time = { version = "0.3", features = ["formatting"] }
 zip = { version = "8.4", default-features = false, features = ["deflate"] }
 tungstenite = "0.30"
 fs2 = "0.4"
+getrandom = "0.4"
 libloading = "0.8"
 png = "0.17"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
@@ -92,10 +93,7 @@ iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "d
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
-
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_System_IO", "Win32_Networking_WinSock", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

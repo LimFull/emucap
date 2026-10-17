@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <fstream>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -658,4 +659,34 @@ EmucapRecordingResult EmucapRecording::result(std::uint64_t now_ms) const {
   result.stop_frame = stop_frame_;
   result.stop_occurrence = stop_occurrence_;
   return result;
+}
+
+bool emucap_read_recording_input_movie(const std::string& path,
+    std::uint64_t expected_bytes, std::string& text, std::string& error) {
+  text.clear();
+  if (expected_bytes < 1 || expected_bytes > 1024 * 1024) {
+    error = "input_movie identity is invalid";
+    return false;
+  }
+  std::ifstream input(path.c_str(), std::ios::in | std::ios::binary);
+  if (!input) {
+    error = "input_movie open failed";
+    return false;
+  }
+  input.seekg(0, std::ios::end);
+  if (!input || input.tellg() != static_cast<std::streamoff>(expected_bytes)) {
+    error = "input_movie size or terminal newline mismatch";
+    return false;
+  }
+  input.seekg(0, std::ios::beg);
+  std::string bytes(static_cast<std::size_t>(expected_bytes) + 1, '\0');
+  input.read(&bytes[0], static_cast<std::streamsize>(bytes.size()));
+  if (input.bad() || input.gcount() != static_cast<std::streamsize>(expected_bytes)
+      || bytes[static_cast<std::size_t>(expected_bytes) - 1] != '\n') {
+    error = "input_movie size or terminal newline mismatch";
+    return false;
+  }
+  bytes.resize(static_cast<std::size_t>(expected_bytes));
+  text.swap(bytes);
+  return true;
 }

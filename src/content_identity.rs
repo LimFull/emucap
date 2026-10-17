@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 const MAX_PERSISTED_IDENTITY_BYTES: usize = 96 * 1024;
 const APPROVAL_BINDING_DOMAIN: &[u8] = b"emucap-indirect-media-approval\0";
@@ -100,6 +101,155 @@ impl ContentIdentity {
             "member_count": self.members.len(),
         })
     }
+}
+
+/// Treat host-specific spellings as the same content path only when they resolve to the same
+/// existing filesystem object. An identical spelling remains comparable after the file has been
+/// staged or removed because managed composite identity can outlive its entry path.
+pub fn same_content_path(expected: &str, observed: &str) -> bool {
+    if expected == observed {
+        return true;
+    }
+    match (
+        fs::canonicalize(Path::new(expected)),
+        fs::canonicalize(Path::new(observed)),
+    ) {
+        (Ok(expected), Ok(observed)) => expected == observed,
+        _ => false,
+    }
+}
+
+/// Copy an already admitted composite graph into a generation-owned directory and prove that the
+/// finished loader-visible graph has the same format-aware identity. The destination must not
+/// exist; partial acquisition is removed on failure.
+pub fn stage_verified_composite_content(
+    source_entry: &Path,
+    adapter: &str,
+    identity: &ContentIdentity,
+    destination: &Path,
+) -> io::Result<PathBuf> {
+    let entry = identity.members.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "composite content identity has no entry member",
+        )
+    })?;
+    let source_name = source_entry
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "entry has no UTF-8 name"))?;
+    if entry.declared_name != source_name
+        || !crate::path_safety::is_portable_relative_member(&entry.declared_name)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "composite entry identity does not match the selected entry",
+        ));
+    }
+    let source_root = source_entry.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir(destination)?;
+    let result = (|| {
+        for (index, member) in identity.members.iter().enumerate() {
+            if !crate::path_safety::is_portable_relative_member(&member.declared_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "composite identity contains an unsafe member name",
+                ));
+            }
+            let input = if index == 0 {
+                crate::path_safety::open_regular_file_no_follow(source_entry)?
+            } else {
+                crate::path_safety::open_regular_member_no_follow(
+                    source_root,
+                    &member.declared_name,
+                )?
+            };
+            let output = destination.join(&member.declared_name);
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            copy_member(input, &output, member)?;
+        }
+        let staged_entry = destination.join(&entry.declared_name);
+        let staged = identify_composite_content_for_adapter(&staged_entry, Some(adapter))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "staged entry no longer identifies a composite graph",
+                )
+            })?;
+        if &staged != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged composite graph identity differs from its admitted identity",
+            ));
+        }
+        Ok(staged_entry)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    result
+}
+
+fn copy_member(
+    mut input: File,
+    destination: &Path,
+    expected: &ContentMemberIdentity,
+) -> io::Result<()> {
+    let metadata = input.metadata()?;
+    if !metadata.is_file() || metadata.len() != expected.size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "composite member size changed: {:?}",
+                expected.declared_name
+            ),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o400);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut output = options.open(destination)?;
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("composite member size overflow"))?;
+        if copied > expected.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "composite member grew while it was staged",
+            ));
+        }
+        output.write_all(&buffer[..count])?;
+        digest.update(&buffer[..count]);
+    }
+    output.sync_all()?;
+    if copied != expected.size || hex::encode(digest.finalize()) != expected.digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "composite member changed while it was staged: {:?}",
+                expected.declared_name
+            ),
+        ));
+    }
+    let mut permissions = output.metadata()?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(destination, permissions)?;
+    Ok(())
 }
 
 fn composite_extension(path: &Path) -> Option<String> {

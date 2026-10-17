@@ -1,0 +1,41 @@
+diff --git a/.github/workflows/scripts/macos/build-dependencies.sh b/.github/workflows/scripts/macos/build-dependencies.sh
+index 15f5198c6..7781fabd6 100755
+--- a/.github/workflows/scripts/macos/build-dependencies.sh
++++ b/.github/workflows/scripts/macos/build-dependencies.sh
+@@ -11,7 +11,8 @@ fi
+ # Users may want to use system ffmpeg for additional features
+ : ${BUILD_FFMPEG:=1}
+ 
+-export MACOSX_DEPLOYMENT_TARGET=11.0
++: ${MACOSX_DEPLOYMENT_TARGET:=11.0}
++export MACOSX_DEPLOYMENT_TARGET
+ 
+ NPROCS="$(getconf _NPROCESSORS_ONLN)"
+ SCRIPTDIR=$(realpath $(dirname "${BASH_SOURCE[0]}"))
+@@ -43,6 +44,7 @@ CMAKE_COMMON=(
+ 	-DCMAKE_BUILD_TYPE=Release
+ 	-DCMAKE_SHARED_LINKER_FLAGS="-dead_strip -dead_strip_dylibs"
+ 	-DCMAKE_PREFIX_PATH="$INSTALLDIR"
++	-DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+ 	-DCMAKE_INSTALL_PREFIX="$INSTALLDIR"
+ 	-DCMAKE_OSX_ARCHITECTURES="x86_64"
+ 	-DCMAKE_APPLE_SILICON_PROCESSOR="x86_64"
+@@ -235,8 +236,8 @@ patch -p1 < "$SCRIPTDIR/4cf93f0f16b1503580cdb7ffdedb056321446677.patch"
+ patch -p1 < "$SCRIPTDIR/mvk-texture-swizzle.patch"
+ sed -i '' 's/xcodebuild "$@"/xcodebuild $XCODEBUILD_EXTRA_ARGS "$@"/g' fetchDependencies
+ sed -i '' 's/XCODEBUILD :=/XCODEBUILD ?=/g' Makefile
+-XCODEBUILD_EXTRA_ARGS="VALID_ARCHS=x86_64" ./fetchDependencies --macos
+-XCODEBUILD="set -o pipefail && xcodebuild VALID_ARCHS=x86_64" make macos MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0 MVK_CONFIG_USE_METAL_PRIVATE_API=1
++XCODEBUILD_EXTRA_ARGS="VALID_ARCHS=x86_64 MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" ./fetchDependencies --macos
++XCODEBUILD="set -o pipefail && xcodebuild VALID_ARCHS=x86_64 MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" make macos MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0 MVK_CONFIG_USE_METAL_PRIVATE_API=1
+ cp Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib "$INSTALLDIR/lib/"
+ cd ..
+ 
+@@ -275,4 +276,6 @@ patch -u src/tools/macdeployqt/shared/shared.cpp <<EOF
+ EOF
+-cmake -B build "${CMAKE_COMMON[@]}" -DCMAKE_BUILD_TYPE=MinSizeRel -DFEATURE_dbus=OFF -DFEATURE_framework=OFF -DFEATURE_icu=OFF -DFEATURE_opengl=OFF -DFEATURE_sql=OFF -DFEATURE_gssapi=OFF -DFEATURE_system_png=ON -DFEATURE_system_jpeg=ON -DFEATURE_system_zlib=ON -DFEATURE_system_freetype=ON -DFEATURE_system_harfbuzz=ON
++# SDK 27 declares dup3, but it is unavailable below macOS 27. Keep Qt on its
++# existing portable dup2 fallback for the selected deployment target.
++cmake -B build "${CMAKE_COMMON[@]}" -DCMAKE_BUILD_TYPE=MinSizeRel -DFEATURE_dup3=OFF -DFEATURE_dbus=OFF -DFEATURE_framework=OFF -DFEATURE_icu=OFF -DFEATURE_opengl=OFF -DFEATURE_sql=OFF -DFEATURE_gssapi=OFF -DFEATURE_system_png=ON -DFEATURE_system_jpeg=ON -DFEATURE_system_zlib=ON -DFEATURE_system_freetype=ON -DFEATURE_system_harfbuzz=ON
+ make -C build "-j$NPROCS"
+ make -C build install

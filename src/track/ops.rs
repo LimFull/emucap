@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -7,6 +7,34 @@ use crate::track::id::IdGen;
 use crate::track::model::*;
 use crate::track::repro;
 use crate::track::store::{self, TrackError};
+
+/// Largest single file that may be registered as tracking evidence. The limit is inclusive and
+/// covers the largest bounded artifact currently produced by the analysis surface (a 1 GiB dump
+/// region) while keeping hashing work finite.
+pub const MAX_TRACK_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+pub(crate) fn hash_reader_bounded(mut reader: impl Read, max_bytes: u64) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.checked_add(n as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "artifact byte count overflow")
+        })?;
+        if total > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("artifact exceeds {max_bytes} bytes"),
+            ));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -200,17 +228,20 @@ pub fn log_artifact(
     abs_path: &Path,
     meta: Option<serde_json::Value>,
 ) -> Result<String, OpsError> {
-    let mut file = std::fs::File::open(abs_path).map_err(TrackError::Io)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf).map_err(TrackError::Io)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+    // Validate the destination record before doing potentially expensive I/O. This is read-only;
+    // the ledger is not changed unless the bounded hash completes successfully.
+    let mut run = load(root, rom_sha1, run_id)?;
+    let mut file =
+        crate::path_safety::open_regular_file_no_follow(abs_path).map_err(TrackError::Io)?;
+    if file.metadata().map_err(TrackError::Io)?.len() > MAX_TRACK_ARTIFACT_BYTES {
+        return Err(TrackError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("artifact exceeds {MAX_TRACK_ARTIFACT_BYTES} bytes"),
+        ))
+        .into());
     }
-    let sha256 = hex::encode(hasher.finalize());
+    let sha256 =
+        hash_reader_bounded(&mut file, MAX_TRACK_ARTIFACT_BYTES).map_err(TrackError::Io)?;
 
     let run_dir = store::run_dir(root, rom_sha1, run_id)?;
     // 저장 경로 우선순위: run_dir 상대 > repo(track root의 부모=git root) 상대 > 절대(repo 밖만).
@@ -225,7 +256,6 @@ pub fn log_artifact(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| abs_path.to_string_lossy().into_owned());
 
-    let mut run = load(root, rom_sha1, run_id)?;
     let id = gen.new_id();
     run.artifacts.push(Artifact {
         id: id.clone(),

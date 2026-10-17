@@ -31,6 +31,38 @@ fn set_ini_adds_config_section_when_absent() {
 }
 
 #[test]
+fn flycast_config_import_is_explicit_and_bounded() {
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_FLYCAST_CONFIG"]);
+    std::env::remove_var("EMUCAP_FLYCAST_CONFIG");
+    assert_eq!(super::imported_config().unwrap(), "");
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("emu.cfg");
+    std::fs::write(&config, "[config]\nDreamcast.BiosPath = /bios\n").unwrap();
+    std::env::set_var("EMUCAP_FLYCAST_CONFIG", &config);
+    assert!(super::imported_config()
+        .unwrap()
+        .contains("Dreamcast.BiosPath"));
+
+    let relative = std::path::PathBuf::from("relative-emu.cfg");
+    std::env::set_var("EMUCAP_FLYCAST_CONFIG", relative);
+    assert_eq!(
+        super::imported_config().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    let oversized = dir.path().join("oversized.cfg");
+    std::fs::write(
+        &oversized,
+        vec![b'x'; super::MAX_IMPORTED_CONFIG_BYTES as usize + 1],
+    )
+    .unwrap();
+    std::env::set_var("EMUCAP_FLYCAST_CONFIG", oversized);
+    assert!(super::imported_config().is_err());
+}
+
+#[test]
 fn runtime_binary_uses_emucap_owned_plain_exe_dir() {
     let src = tempfile::tempdir().unwrap();
     let iso = tempfile::tempdir().unwrap();

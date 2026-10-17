@@ -189,12 +189,18 @@ impl<G: GdbTransport> Bridge<G> {
     /// Paced frame waits carry a host deadline so they stop at the reached frame instead of
     /// outliving the synchronous operation budget. Returns the plugin deadline in milliseconds.
     pub(super) fn arm_frame_deadline(&mut self, frames: u64) -> BridgeResult<Option<u64>> {
-        if !mame::supports_pacing(&self.mame_features()) {
+        let features = self.mame_features();
+        if !mame::supports_pacing_readback(&features)
+            && !mame::supports_operation_deadline(&features)
+        {
             return Ok(None);
         }
-        let per_frame = self
-            .native_pacing()?
-            .frame_budget_ms(self.frame_operation_budget_ms());
+        let per_frame = if mame::supports_pacing_readback(&features) {
+            self.native_pacing()?
+                .frame_budget_ms(self.frame_operation_budget_ms())
+        } else {
+            self.frame_operation_budget_ms()
+        };
         let budget = crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64 - 5_000;
         let deadline = 5_000u64
             .saturating_add(frames.saturating_mul(per_frame))

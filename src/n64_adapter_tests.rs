@@ -9,7 +9,7 @@ fn frame_gate_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 #[test]
-fn readiness_requires_the_first_rendered_frame_only_in_visible_mode() {
+fn readiness_requires_the_first_rendered_frame_in_both_modes() {
     assert_eq!(
         readiness_for(true, false, false, false, false),
         AdapterReadiness::WaitingForDebugger
@@ -28,7 +28,7 @@ fn readiness_requires_the_first_rendered_frame_only_in_visible_mode() {
     );
     assert_eq!(
         readiness_for(false, true, true, false, false),
-        AdapterReadiness::Ready
+        AdapterReadiness::WaitingForFirstRenderedFrame
     );
     assert_eq!(
         readiness_for(false, true, true, true, true),
@@ -152,37 +152,10 @@ fn initial_contract_advertisement_validates() {
 }
 
 #[test]
-fn headless_contract_removes_frame_step_and_reports_the_exception() {
-    let exceptions = exceptions_for(false);
-    let advertisement = crate::contracts::advertisement_from_hello(&json!({
-        "contracts": crate::contracts::advertisement_value(&exceptions)
-    }));
-    let methods = methods_for(false)
-        .iter()
-        .map(|method| (*method).to_string())
-        .collect::<Vec<_>>();
-    let status = crate::contracts::validate_advertisement(
-        &advertisement,
-        Some("mupen64plus-native"),
-        Some("n64"),
-        &methods,
-    );
-    assert_eq!(status.state, "validated", "{:?}", status.errors);
-    assert_eq!(
-        status.constraints["execution.step.units"],
-        json!(["instructions"])
-    );
-    assert!(methods.iter().any(|method| method == "set_input"));
-    assert!(methods.iter().any(|method| method == "call_stack"));
-    for unavailable in [
-        "step",
-        "press_buttons",
-        "screenshot",
-        "save_state",
-        "load_state",
-    ] {
-        assert!(!methods.iter().any(|method| method == unavailable));
-    }
+fn headless_keeps_the_same_renderer_capabilities_and_contracts() {
+    assert_eq!(methods_for(false), methods_for(true));
+    assert_eq!(exceptions_for(false), exceptions_for(true));
+    assert!(!exceptions_for(false).contains(&"n64.execution.frame-step-absent"));
 }
 
 #[test]
@@ -208,7 +181,7 @@ fn frame_gate_rearms_before_releasing_the_previous_callback() {
 }
 
 #[test]
-fn timed_out_frame_gate_returns_callback_ownership() {
+fn timed_out_gate_preserves_the_target_until_native_recovery() {
     let _guard = frame_gate_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -221,6 +194,8 @@ fn timed_out_frame_gate_returns_callback_ownership() {
     assert!(!frame_gate_is_blocked());
 
     let callback = std::thread::spawn(|| frame::frame_callback(0));
+    assert_eq!(wait_frame_gate(Duration::from_secs(1)).unwrap(), 1);
+    release_frame_gate().unwrap();
     callback.join().unwrap();
     assert!(!frame_gate_is_blocked());
     reset_frame_gate();
@@ -476,4 +451,27 @@ fn frame_resume_hook_runs_on_the_parked_thread_and_is_retired_before_shutdown() 
     reset_frame_gate();
     frame::frame_callback(3);
     assert!(OBSERVED.lock().unwrap().is_empty());
+}
+
+#[test]
+fn poll_and_render_barriers_do_not_consume_each_others_callbacks() {
+    let _guard = frame_gate_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    reset_frame_gate();
+    arm_frame_gate(FrameGateTrigger::NextPoll).unwrap();
+    frame::frame_callback(42);
+    assert!(!frame_gate_is_blocked());
+    let worker = std::thread::spawn(|| frame::poll_callback(7));
+    assert_eq!(wait_frame_gate(Duration::from_secs(1)).unwrap(), 7);
+    assert_eq!(release_frame_gate().unwrap(), 7);
+    worker.join().unwrap();
+    arm_frame_gate(FrameGateTrigger::NextFrame).unwrap();
+    frame::poll_callback(8);
+    assert!(!frame_gate_is_blocked());
+    let worker = std::thread::spawn(|| frame::frame_callback(43));
+    assert_eq!(wait_frame_gate(Duration::from_secs(1)).unwrap(), 44);
+    release_frame_gate().unwrap();
+    worker.join().unwrap();
+    reset_frame_gate();
 }

@@ -6,6 +6,8 @@ use emucap::analysis::regression;
 use emucap::live::link::{Capabilities, EmulatorIdentity, FakeLink};
 
 struct DetReplayLink {
+    running: bool,
+    fail_resume: bool,
     caps: Capabilities,
     obs_queue: std::collections::VecDeque<&'static str>,
 }
@@ -115,6 +117,8 @@ impl DetReplayLink {
                 features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
+            running: false,
+            fail_resume: false,
             obs_queue: std::collections::VecDeque::new(),
         }
     }
@@ -136,9 +140,21 @@ impl EmulatorLink for DetReplayLink {
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, LinkError> {
         match method {
-            "reset" | "pause" | "set_input" | "step" | "clear_all_breakpoints" | "resume" => {
-                Ok(serde_json::json!({}))
+            "status" => {
+                Ok(serde_json::json!({"state":if self.running {"running"} else {"frozen"}}))
             }
+            "pause" => {
+                self.running = false;
+                Ok(serde_json::json!({"state":"frozen"}))
+            }
+            "resume" => {
+                if self.fail_resume {
+                    return Err(LinkError::Protocol("resume failed".into()));
+                }
+                self.running = true;
+                Ok(serde_json::json!({"state":"running"}))
+            }
+            "reset" | "set_input" | "step" | "clear_all_breakpoints" => Ok(serde_json::json!({})),
             "read_memory" => Ok(serde_json::json!({
                 "hex": self.obs_queue.pop_front().unwrap_or("00")
             })),
@@ -198,10 +214,9 @@ fn contains_hangul(text: &str) -> bool {
 
 #[test]
 fn server_info_identifies_the_control_binary() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let info = Emucap::new(shared).get_info();
     assert_eq!(info.server_info.name, "emucap-mcp");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
@@ -210,10 +225,9 @@ fn server_info_identifies_the_control_binary() {
 
 #[test]
 fn control_mcp_consumer_metadata_is_english() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let server = Emucap::new(shared);
     let instructions = server.get_info().instructions.unwrap_or_default();
     let tools = serde_json::to_string(&server.tool_router.list_all()).unwrap();
@@ -227,10 +241,9 @@ fn control_mcp_consumer_metadata_is_english() {
 
 #[tokio::test]
 async fn analysis_dispatcher_is_the_only_analysis_tool_surface() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let server = Emucap::new(shared);
 
     let initial: Vec<_> = server
@@ -260,10 +273,9 @@ async fn analysis_dispatcher_is_the_only_analysis_tool_surface() {
 
 #[test]
 fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let server = Emucap::new(shared);
     let visible: std::collections::BTreeSet<_> = server
         .visible_tools()
@@ -396,10 +408,9 @@ fn drawers_publish_only_current_operations_and_bind_execution_to_the_revision() 
         .get("move_pointer")
         .is_none());
 
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let server = Emucap::new(shared);
     assert!(server
         .validate_routed_operation(&status, "debug", "probe", Some("revision-a"), true, true,)
@@ -570,10 +581,9 @@ async fn repeated_status_keeps_live_state_and_omits_unchanged_capabilities() {
 
 #[test]
 fn stop_is_exposed_as_a_host_lifecycle_tool_with_required_generation_identity() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let tools = Emucap::new(shared).tool_router.list_all();
     let stop = tools
         .iter()
@@ -587,10 +597,9 @@ fn stop_is_exposed_as_a_host_lifecycle_tool_with_required_generation_identity() 
 
 #[test]
 fn reattach_is_exposed_as_an_exact_generation_lifecycle_tool() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let tools = Emucap::new(shared).tool_router.list_all();
     let reattach = tools
         .iter()
@@ -604,10 +613,9 @@ fn reattach_is_exposed_as_an_exact_generation_lifecycle_tool() {
 
 #[test]
 fn debugger_tools_expose_optional_cpu_and_instruction_mode_routing() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let tools = Emucap::new(shared).tool_router.list_all();
 
     let disassemble = tools
@@ -680,9 +688,9 @@ fn record_window_drawer_schema_is_generic_and_requires_an_explicit_evidence_root
 }
 
 #[test]
-fn broker_probe_detects_a_listening_session_port() {
+fn broker_probe_rejects_an_unauthenticated_listener() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    assert!(broker_session_accepting(
+    assert!(!broker_session_ready(
         &listener.local_addr().unwrap().to_string()
     ));
 }
@@ -691,7 +699,14 @@ fn broker_probe_detects_a_listening_session_port() {
 #[test]
 fn broker_helper_child_is_waited_by_reaper_thread() {
     let command = std::process::Command::new("true");
-    spawn_reaped(command).join().unwrap();
+    assert!(spawn_reaped(command).join().unwrap().unwrap().success());
+}
+
+#[test]
+fn broker_missing_helper_reports_spawn_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let command = std::process::Command::new(root.path().join("missing-broker"));
+    assert!(spawn_reaped(command).join().unwrap().is_err());
 }
 
 #[test]
@@ -725,10 +740,9 @@ fn image_output_publishes_screenshot_provenance() {
 // 죽지 않는지(다음 호출이 panic 안 함). poison이면 lock().unwrap()은 panic한다.
 #[test]
 fn link_helper_recovers_from_poison() {
-    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
-        "127.0.0.1:0",
-        Duration::from_millis(50),
-    )));
+    let shared: SharedLink = Arc::new(Mutex::new(
+        tcp::lazy("127.0.0.1:0", Duration::from_millis(50)).unwrap(),
+    ));
     let server = Emucap::new(shared.clone());
     let s2 = shared.clone();
     let _ = std::thread::spawn(move || {
@@ -874,4 +888,52 @@ async fn file_write_validation_failure_has_no_adapter_side_effect() {
     let link = concrete.lock().unwrap();
     assert_eq!(link.last_method, None);
     assert_eq!(link.last_params, None);
+}
+
+#[test]
+fn determinism_restores_execution_mode_and_reports_cleanup_failure() {
+    for (running, fail_resume) in [(false, false), (true, false), (true, true)] {
+        let mut mock = DetReplayLink::new(&[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+            "resume",
+            "status",
+        ])
+        .obs(&["aa", "aa"]);
+        mock.running = running;
+        mock.fail_resume = fail_resume;
+        let shared = Arc::new(Mutex::new(mock));
+        let srv = Emucap::new(shared.clone());
+        let (_t, dir) = det_input_case();
+        let result = srv.verify_determinism_impl(VerifyDeterminismArgs {
+            case_dir: dir.to_string_lossy().into(),
+            observe: Some("memory".into()),
+            memory_type: Some("w".into()),
+            address: Some(Num(0)),
+            length: Some(Num(1)),
+            replays: Some(2),
+        });
+        if fail_resume {
+            assert_eq!(result.is_error, Some(true));
+            assert!(body_text(&result).contains("cleanup_failed"));
+        } else {
+            assert_ne!(result.is_error, Some(true), "{}", body_text(&result));
+            assert_eq!(shared.lock().unwrap().running, running);
+        }
+        shared.lock().unwrap().running = running;
+        let result = srv.regression_run_impl(RegressionRunArgs {
+            suite_dir: dir.parent().unwrap().to_string_lossy().into(),
+        });
+        if fail_resume {
+            assert_eq!(result.is_error, Some(true));
+            assert!(body_text(&result).contains("cleanup_failed"));
+        } else {
+            assert_ne!(result.is_error, Some(true), "{}", body_text(&result));
+            assert_eq!(shared.lock().unwrap().running, running);
+        }
+    }
 }

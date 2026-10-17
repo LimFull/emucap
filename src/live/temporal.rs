@@ -88,8 +88,10 @@ impl CancellationCapability {
         }
         let mut unique = std::collections::HashSet::new();
         for method in &capability.methods {
-            if !matches!(method.as_str(), "step" | "step_instructions")
-                || !methods.contains(method)
+            if !matches!(
+                method.as_str(),
+                "step" | "step_instructions" | "step_input_polls"
+            ) || !methods.contains(method)
                 || !unique.insert(method)
             {
                 return Err("invalid temporal cancellation method".into());

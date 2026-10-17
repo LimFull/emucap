@@ -9,6 +9,7 @@ impl<G: GdbTransport> CpuConn<G> {
             gdb,
             frozen,
             events: Vec::new(),
+            control_unverified: false,
         }
     }
 
@@ -30,27 +31,69 @@ impl<G: GdbTransport> CpuConn<G> {
     /// and the true reply is read next, so a late breakpoint stop cannot desync the stream.
     pub(super) fn send_cmd(&mut self, payload: &str) -> NdsResult<String> {
         self.with_frozen(|s| {
-            let mut resp = s.gdb.send(payload)?;
-            if !command_expects_stop(payload) {
-                while is_stop_packet(&resp) {
-                    s.note_stop(resp);
-                    resp = s.gdb.recv_reply()?;
-                }
-            }
-            Ok(resp)
+            let mut budget = crate::gdb_rsp::ExchangeBudget::new(s.gdb.get_timeout()?)?;
+            s.exchange(payload, &mut budget, false)
         })
     }
 
-    /// Drain any buffered async stop packets (breakpoint hits) without blocking.
-    pub(super) fn drain_stops(&mut self) -> NdsResult<()> {
-        while let Some(pkt) = self.gdb.recv_nonblocking()? {
-            if is_stop_packet(&pkt) {
-                self.note_stop(pkt);
-            } else {
-                break;
-            }
+    fn exchange(
+        &mut self,
+        payload: &str,
+        budget: &mut crate::gdb_rsp::ExchangeBudget,
+        base64_reply: bool,
+    ) -> NdsResult<String> {
+        if self.control_unverified {
+            return Err(NdsBridgeError::Emulator("GDB control is unverified".into()));
         }
-        Ok(())
+        let result = (|| {
+            let mut resp = self.gdb.send_with_timeout(payload, budget.remaining()?)?;
+            while if base64_reply {
+                looks_like_stray_stop(&resp)
+            } else {
+                !command_expects_stop(payload) && is_stop_packet(&resp)
+            } {
+                budget.skipped(&resp)?;
+                self.note_stop(resp);
+                resp = self.gdb.recv_reply_with_timeout(budget.remaining()?)?;
+            }
+            Ok(resp)
+        })();
+        if result.is_err() && (budget.exhausted() || self.gdb.is_terminal()) {
+            self.control_unverified = true;
+        }
+        result
+    }
+
+    pub(super) fn drain_stops(&mut self) -> NdsResult<()> {
+        let mut budget = crate::gdb_rsp::ExchangeBudget::new(self.gdb.get_timeout()?)?;
+        self.drain_stops_with_budget(&mut budget)
+    }
+
+    fn drain_stops_with_budget(
+        &mut self,
+        budget: &mut crate::gdb_rsp::ExchangeBudget,
+    ) -> NdsResult<()> {
+        if self.control_unverified {
+            return Err(NdsBridgeError::Emulator("GDB control is unverified".into()));
+        }
+        let result = (|| {
+            while let Some(pkt) = self
+                .gdb
+                .recv_nonblocking_with_timeout(budget.remaining()?)?
+            {
+                budget.skipped(&pkt)?;
+                if is_stop_packet(&pkt) {
+                    self.note_stop(pkt);
+                } else {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() && (budget.exhausted() || self.gdb.is_terminal()) {
+            self.control_unverified = true;
+        }
+        result
     }
 
     /// Read one asynchronous stop without classifying it yet. Shared frame stepping watches both
@@ -272,6 +315,9 @@ impl<G: GdbTransport> CpuConn<G> {
     }
 
     pub(super) fn resume(&mut self) -> NdsResult<()> {
+        if self.control_unverified {
+            return Err(NdsBridgeError::Emulator("GDB control is unverified".into()));
+        }
         if self.frozen {
             self.gdb.send_no_reply("c")?;
             self.frozen = false;
@@ -286,15 +332,9 @@ impl<G: GdbTransport> CpuConn<G> {
     /// skip only base64-impossible stop shapes (`looks_like_stray_stop`) before returning the reply.
     pub(super) fn send_b64_reply(&mut self, payload: &str) -> NdsResult<String> {
         self.with_frozen(|s| {
-            s.drain_stops()?;
-            let mut resp = s.gdb.send(payload)?;
-            let mut guard = 0;
-            while looks_like_stray_stop(&resp) && guard < 16 {
-                s.note_stop(resp);
-                resp = s.gdb.recv_reply()?;
-                guard += 1;
-            }
-            Ok(resp)
+            let mut budget = crate::gdb_rsp::ExchangeBudget::new(s.gdb.get_timeout()?)?;
+            s.drain_stops_with_budget(&mut budget)?;
+            s.exchange(payload, &mut budget, true)
         })
     }
 
@@ -325,7 +365,7 @@ impl<G: GdbTransport> CpuConn<G> {
         // itself injected it, i.e. no reportable stop was drained.
         let resume_after = if was_running { !self.pause()? } else { false };
         let r = f(self);
-        if resume_after {
+        if resume_after && !self.control_unverified && !self.gdb.is_terminal() {
             let _ = self.resume();
         }
         r
@@ -366,18 +406,9 @@ impl<G: GdbTransport> CpuConn<G> {
     /// Queries the fork answers while the guest runs (pacing and override counters). A frozen core
     /// takes the normal path; a running one is not paused, so polling cannot shorten a pacing wait.
     pub(super) fn query_running_safe(&mut self, payload: &str) -> NdsResult<String> {
-        // A stop that is already waiting means the core is halted; take the frozen path so the
-        // stop is classified before the reply.
-        self.drain_stops()?;
-        if self.frozen {
-            return self.send_cmd(payload);
-        }
-        let mut resp = self.gdb.send(payload)?;
-        while is_stop_packet(&resp) {
-            self.note_stop(resp);
-            resp = self.gdb.recv_reply()?;
-        }
-        Ok(resp)
+        let mut budget = crate::gdb_rsp::ExchangeBudget::new(self.gdb.get_timeout()?)?;
+        self.drain_stops_with_budget(&mut budget)?;
+        self.exchange(payload, &mut budget, false)
     }
 
     pub(super) fn override_remaining(&mut self, status_command: &str) -> NdsResult<i64> {

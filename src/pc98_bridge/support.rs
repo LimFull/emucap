@@ -1,5 +1,12 @@
 use super::*;
 
+mod state_archive;
+pub(super) use state_archive::{
+    extract_presented_framebuffer, extract_save_items, open_pc98_state_archive,
+    read_state_manifest, read_state_regions, state_format, state_registers,
+    validate_register_packet,
+};
+
 pub(super) fn error_kind(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::Busy => "busy",
@@ -338,7 +345,13 @@ pub(super) fn parse_snapshot_specs(raw: Option<&Value>) -> BridgeResult<Vec<Snap
     let Some(items) = raw.as_array() else {
         return Err(BridgeError::BadParams("snapshot must be a list".into()));
     };
+    if items.len() > MAX_BREAKPOINT_SNAPSHOTS {
+        return Err(BridgeError::BadParams(format!(
+            "snapshot accepts at most {MAX_BREAKPOINT_SNAPSHOTS} ranges"
+        )));
+    }
     let mut out = Vec::new();
+    let mut total = 0u64;
     for item in items {
         let Some(raw_spec) = item.as_str() else {
             return Err(BridgeError::BadParams(format!(
@@ -351,27 +364,42 @@ pub(super) fn parse_snapshot_specs(raw: Option<&Value>) -> BridgeResult<Vec<Snap
                 "invalid snapshot spec: {raw_spec}"
             )));
         }
-        if memory_region(parts[0]).is_none() {
-            return Err(BridgeError::BadParams(format!(
-                "unsupported snapshot memory_type: {}",
-                parts[0]
-            )));
-        }
+        let region = memory_region(parts[0]).ok_or_else(|| {
+            BridgeError::BadParams(format!("unsupported snapshot memory_type: {}", parts[0]))
+        })?;
         let address = parse_num_str(parts[1]).ok_or_else(|| {
             BridgeError::BadParams(format!("invalid snapshot address: {}", parts[1]))
-        })? as usize;
+        })?;
         let length = parse_num_str(parts[2]).ok_or_else(|| {
             BridgeError::BadParams(format!("invalid snapshot length: {}", parts[2]))
-        })? as usize;
-        if length > MAX_READ_CHUNK {
+        })?;
+        if length == 0
+            || length > MAX_READ_CHUNK as u64
+            || address
+                .checked_add(length)
+                .is_none_or(|end| end > u64::from(region.size))
+        {
             return Err(BridgeError::BadParams(format!(
-                "snapshot length exceeds {MAX_READ_CHUNK} bytes"
+                "snapshot range exceeds {}",
+                region.name
+            )));
+        }
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| BridgeError::BadParams("snapshot byte total overflow".into()))?;
+        if total > MAX_BREAKPOINT_SNAPSHOT_BYTES {
+            return Err(BridgeError::BadParams(format!(
+                "snapshot byte total exceeds {MAX_BREAKPOINT_SNAPSHOT_BYTES:#x}"
             )));
         }
         out.push(SnapshotSpec {
-            memory_type: parts[0].into(),
-            address,
-            length,
+            memory_type: region.name.into(),
+            address: usize::try_from(address).map_err(|_| {
+                BridgeError::BadParams("snapshot address does not fit this host".into())
+            })?,
+            length: usize::try_from(length).map_err(|_| {
+                BridgeError::BadParams("snapshot length does not fit this host".into())
+            })?,
         });
     }
     Ok(out)
@@ -524,26 +552,6 @@ pub(super) fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
-/// A sibling `.partial` temp of `dst` (same parent → the later rename stays on one filesystem and is
-/// atomic), tagged with an unguessable identifier. save_state stages the zip here and
-/// renames over `dst` only when complete, so a mid-save failure never truncates a pre-existing save.
-pub(super) fn state_partial_sibling(dst: &Path) -> BridgeResult<PathBuf> {
-    let parent = dst.parent().ok_or_else(|| {
-        BridgeError::BadParams(format!(
-            "save path {} has no parent directory to stage under",
-            dst.display()
-        ))
-    })?;
-    let name = dst
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("state.zip");
-    Ok(parent.join(format!(
-        ".{name}.partial.{}",
-        ulid::Ulid::generate().to_string().to_ascii_lowercase()
-    )))
-}
-
 pub(super) fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
     for _ in 0..100u32 {
         let path = std::env::temp_dir().join(format!(
@@ -551,7 +559,7 @@ pub(super) fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
             std::process::id(),
             ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
-        match fs::create_dir(&path) {
+        match crate::private_fs::create_private_dir(&path) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -565,14 +573,23 @@ pub(super) fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
 
 pub(super) fn save_item_members(root: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> std::io::Result<()> {
+        crate::private_fs::privatize_dir(dir)?;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("PC-98 save item is a symlink: {}", path.display()),
+                ));
+            }
+            if metadata.is_dir() {
                 walk(root, &path, out)?;
                 continue;
             }
-            if path.is_file() {
+            if metadata.is_file() {
+                crate::private_fs::privatize_file(&path)?;
                 let rel = path.strip_prefix(root).unwrap_or(&path);
                 let member = rel
                     .components()
@@ -580,7 +597,12 @@ pub(super) fn save_item_members(root: &Path) -> std::io::Result<Vec<(PathBuf, St
                     .collect::<Vec<_>>()
                     .join("/");
                 out.push((path, format!("{SAVE_ITEMS_DIR}/{member}")));
+                continue;
             }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("PC-98 save item is not a regular file: {}", path.display()),
+            ));
         }
         Ok(())
     }
@@ -610,40 +632,6 @@ pub(super) fn parse_save_items_response(
     out.insert("items".into(), json!(items));
     out.insert("skipped".into(), json!(skipped));
     Ok(out)
-}
-
-pub(super) fn read_state_manifest<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-) -> BridgeResult<Value> {
-    let mut file = archive.by_name("state.json")?;
-    if file.size() > MAX_STATE_MANIFEST_BYTES {
-        return Err(BridgeError::BadParams(format!(
-            "PC-98 state manifest exceeds {MAX_STATE_MANIFEST_BYTES} bytes"
-        )));
-    }
-    let mut text = String::new();
-    Read::by_ref(&mut file)
-        .take(MAX_STATE_MANIFEST_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_STATE_MANIFEST_BYTES {
-        return Err(BridgeError::BadParams(format!(
-            "PC-98 state manifest exceeds {MAX_STATE_MANIFEST_BYTES} bytes"
-        )));
-    }
-    Ok(serde_json::from_str(&text)?)
-}
-
-pub(super) fn state_format(manifest: &Value) -> BridgeResult<String> {
-    let format = manifest
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if format != STATE_FORMAT && format != LEGACY_STATE_FORMAT {
-        return Err(BridgeError::BadParams(format!(
-            "unsupported PC-98 state format: {format}"
-        )));
-    }
-    Ok(format.into())
 }
 
 pub(super) fn parse_framebuffer_response(
@@ -682,228 +670,6 @@ pub(super) fn parse_framebuffer_response(
     ]))
 }
 
-pub(super) fn extract_save_items<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    manifest: &Value,
-    target_root: &Path,
-) -> BridgeResult<Option<PathBuf>> {
-    let Some(save_items) = manifest.get("save_items").and_then(Value::as_object) else {
-        return Ok(None);
-    };
-    let directory = save_items
-        .get("dir")
-        .and_then(Value::as_str)
-        .unwrap_or(SAVE_ITEMS_DIR)
-        .trim_matches('/');
-    if directory != SAVE_ITEMS_DIR {
-        return Err(BridgeError::BadParams(format!(
-            "unsupported PC-98 save item directory: {directory}"
-        )));
-    }
-    let names = archive
-        .file_names()
-        .filter(|name| name.starts_with(&format!("{SAVE_ITEMS_DIR}/")))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if names.len() > MAX_SAVE_ITEM_MEMBERS {
-        return Err(BridgeError::BadParams(format!(
-            "PC-98 save item count exceeds {MAX_SAVE_ITEM_MEMBERS}"
-        )));
-    }
-    if !names.iter().any(|name| name == SAVE_ITEMS_MANIFEST) {
-        return Err(BridgeError::BadParams(
-            "PC-98 save item manifest is missing".into(),
-        ));
-    }
-    let out_dir = target_root.join(SAVE_ITEMS_DIR);
-    let mut total_bytes = 0u64;
-    for name in names {
-        let rel = &name[SAVE_ITEMS_DIR.len() + 1..];
-        if rel.is_empty() || rel.ends_with('/') {
-            continue;
-        }
-        let parts = rel.split('/').collect::<Vec<_>>();
-        if parts
-            .iter()
-            .any(|part| part.is_empty() || *part == "." || *part == ".." || part.contains('\\'))
-        {
-            return Err(BridgeError::BadParams(format!(
-                "unsafe PC-98 save item member: {name}"
-            )));
-        }
-        let dest = parts
-            .iter()
-            .fold(out_dir.clone(), |path, part| path.join(part));
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut src = archive.by_name(&name)?;
-        if src.size() > MAX_SAVE_ITEM_MEMBER_BYTES {
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 save item exceeds {MAX_SAVE_ITEM_MEMBER_BYTES} bytes: {name}"
-            )));
-        }
-        total_bytes = total_bytes
-            .checked_add(src.size())
-            .ok_or_else(|| BridgeError::BadParams("PC-98 save item byte count overflow".into()))?;
-        if total_bytes > MAX_SAVE_ITEM_TOTAL_BYTES {
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 save item bytes exceed {MAX_SAVE_ITEM_TOTAL_BYTES}"
-            )));
-        }
-        let mut output = File::create(&dest)?;
-        let copied = std::io::copy(
-            &mut Read::by_ref(&mut src).take(MAX_SAVE_ITEM_MEMBER_BYTES + 1),
-            &mut output,
-        )?;
-        if copied != src.size() || copied > MAX_SAVE_ITEM_MEMBER_BYTES {
-            let _ = fs::remove_file(&dest);
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 save item size changed during extraction: {name}"
-            )));
-        }
-    }
-    Ok(Some(out_dir))
-}
-
-pub(super) fn extract_presented_framebuffer<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    manifest: &Value,
-    target_root: &Path,
-) -> BridgeResult<Option<PathBuf>> {
-    let Some(framebuffer) = manifest.get("framebuffer").and_then(Value::as_object) else {
-        return Ok(None);
-    };
-    let member = framebuffer
-        .get("file")
-        .and_then(Value::as_str)
-        .ok_or_else(|| BridgeError::BadParams("PC-98 state framebuffer is missing file".into()))?;
-    if member != FRAMEBUFFER_MEMBER {
-        return Err(BridgeError::BadParams(format!(
-            "unsupported PC-98 state framebuffer member: {member}"
-        )));
-    }
-    let encoding = framebuffer
-        .get("encoding")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            BridgeError::BadParams("PC-98 state framebuffer is missing encoding".into())
-        })?;
-    if encoding != "mame_rgb32_native" {
-        return Err(BridgeError::BadParams(format!(
-            "unsupported PC-98 state framebuffer encoding: {encoding}"
-        )));
-    }
-    let width = framebuffer
-        .get("width")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| BridgeError::BadParams("PC-98 state framebuffer is missing width".into()))?;
-    let height = framebuffer
-        .get("height")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            BridgeError::BadParams("PC-98 state framebuffer is missing height".into())
-        })?;
-    let expected = framebuffer
-        .get("bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| BridgeError::BadParams("PC-98 state framebuffer is missing bytes".into()))?;
-    if expected == 0 || expected > 16 * 1024 * 1024 {
-        return Err(BridgeError::BadParams(format!(
-            "PC-98 state framebuffer byte count is invalid: {expected}"
-        )));
-    }
-    if width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        != Some(expected)
-    {
-        return Err(BridgeError::BadParams(format!(
-            "PC-98 state framebuffer geometry differs from byte count: {width}x{height}, bytes={expected}"
-        )));
-    }
-    let mut member_file = archive.by_name(FRAMEBUFFER_MEMBER)?;
-    if member_file.size() != expected {
-        return Err(BridgeError::BadParams(format!(
-            "PC-98 state framebuffer size differs: manifest={expected}, archive={}",
-            member_file.size()
-        )));
-    }
-    let output = target_root.join("framebuffer.rgb32");
-    let mut file = File::create(&output)?;
-    std::io::copy(&mut member_file, &mut file)?;
-    Ok(Some(output))
-}
-
-pub(super) fn read_state_regions<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    manifest: &Value,
-) -> BridgeResult<Vec<(String, Vec<u8>)>> {
-    let Some(regions) = manifest.get("regions").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-    if regions.len() > MEMORY_REGIONS.len() {
-        return Err(BridgeError::BadParams(
-            "too many PC-98 state regions".into(),
-        ));
-    }
-    let mut out = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for region in regions {
-        let memory_type = region
-            .get("memory_type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                BridgeError::BadParams("PC-98 state region missing memory_type".into())
-            })?;
-        if !seen.insert(memory_type) {
-            return Err(BridgeError::BadParams(format!(
-                "duplicate PC-98 state region: {memory_type}"
-            )));
-        }
-        let declared = region
-            .get("size")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| BridgeError::BadParams("PC-98 state region missing size".into()))?;
-        let known = memory_region(memory_type).ok_or_else(|| {
-            BridgeError::BadParams(format!("unsupported PC-98 state region: {memory_type}"))
-        })?;
-        if declared == 0 || declared > known.size as u64 {
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 state region size is invalid: {memory_type}={declared}"
-            )));
-        }
-        let file_name = region
-            .get("file")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::BadParams("PC-98 state region missing file".into()))?;
-        let expected_name = format!("{memory_type}.bin");
-        if file_name != expected_name {
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 state region member must be {expected_name}: {file_name}"
-            )));
-        }
-        let mut file = archive.by_name(file_name)?;
-        if file.size() != declared {
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 state region size differs: {memory_type} manifest={declared}, archive={}",
-                file.size()
-            )));
-        }
-        let mut bytes = Vec::new();
-        Read::by_ref(&mut file)
-            .take(declared + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != declared {
-            return Err(BridgeError::BadParams(format!(
-                "PC-98 state region read length differs: {memory_type}"
-            )));
-        }
-        out.push((memory_type.into(), bytes));
-    }
-    Ok(out)
-}
-
 pub(super) fn parse_register_probe_response(resp: &str) -> BridgeResult<Value> {
     if !resp.starts_with("HEX:") {
         return Err(BridgeError::Emulator(format!(
@@ -935,30 +701,13 @@ pub(super) fn parse_register_probe_response(resp: &str) -> BridgeResult<Value> {
             }
         }
     }
-    if let Some(regs_hex) = fields.get("REGS") {
-        out.insert("regs".into(), state_from_regs_hex(regs_hex));
-    }
+    let regs_hex = fields
+        .get("REGS")
+        .ok_or_else(|| BridgeError::Emulator("MAME register probe omitted registers".into()))?;
+    validate_register_packet(regs_hex)
+        .map_err(|error| BridgeError::Emulator(format!("invalid probe registers: {error}")))?;
+    out.insert("regs".into(), state_from_regs_hex(regs_hex));
     Ok(Value::Object(out))
-}
-
-pub(super) fn state_matches_real_mode_pc(current: &Value, target: &Value) -> bool {
-    let current_cs = current
-        .get("cpu.cs")
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let current_eip = current
-        .get("cpu.eip")
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let target_cs = target
-        .get("cpu.cs")
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let target_eip = target
-        .get("cpu.eip")
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::MAX);
-    (current_cs & 0xFFFF) == target_cs && (current_eip & 0xFFFF) == target_eip
 }
 
 pub(super) fn parse_dasm_lines<'a>(

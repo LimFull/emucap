@@ -622,14 +622,27 @@ fn live_foreign_lease_rejects_mutation_without_calling_inner_link() {
     );
     let mut link = ObservedLink::with_store(inner, store);
 
-    for method in ["write_memory", "execution_speed"] {
+    for method in ["write_memory", "execution_speed", "poll_events"] {
         assert!(matches!(
             link.call(method, serde_json::json!({"mode":"limited","percent":50})),
             Err(LinkError::Busy)
         ));
     }
+    assert!(matches!(
+        link.call_with_progress(
+            "poll_events",
+            serde_json::json!({}),
+            &mut |_| Ok(()),
+            &Default::default()
+        ),
+        Err(LinkError::Busy)
+    ));
     assert_eq!(link.continuity().lease.state, LeaseState::Occupied);
     assert_eq!(link.inner.outcomes.len(), 1, "inner mutation must not run");
+    assert!(
+        link.call("status", serde_json::json!({})).is_ok(),
+        "nondestructive observation remains available"
+    );
 
     let _ = holder.kill();
     let _ = holder.wait();
@@ -1092,6 +1105,7 @@ fn actual_broker_link_binds_local_generation_for_durable_ownership() {
     let store = RuntimeStore::new(temp.path().join("sessions"));
     let manifest = current(&store, 47926);
     let identity = manifest.launch_id.clone();
+    let session_token = "broker-continuity-test-token";
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let worker = std::thread::spawn(move || {
@@ -1102,7 +1116,37 @@ fn actual_broker_link_binds_local_generation_for_durable_ownership() {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
+        let authentication: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(authentication["method"], "broker_authenticate");
+        let client_nonce = authentication["params"]["client_nonce"].as_str().unwrap();
+        let server_nonce = crate::live::broker::new_auth_nonce();
+        let server_proof =
+            crate::live::broker::session_server_proof(session_token, client_nonce, &server_nonce);
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id":authentication["id"],"ok":true,"result":{
+            "protocol_version":crate::live::protocol::PROTOCOL_VERSION,
+            "server_nonce":server_nonce.clone(),
+            "server_proof":server_proof}})
+        )
+        .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         let attach: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(attach["method"], "attach");
+        let params = attach["params"].as_object().unwrap();
+        let binding = crate::live::broker::session_attach_binding(params);
+        let expected_proof = crate::live::broker::session_client_proof(
+            session_token,
+            client_nonce,
+            &server_nonce,
+            &binding,
+        );
+        assert!(crate::live::broker::auth_proof_matches(
+            &expected_proof,
+            params["auth_proof"].as_str().unwrap()
+        ));
         writeln!(stream,"{}",serde_json::json!({"id":attach["id"],"ok":true,"result":{
             "attached_name":"owned", "broker_registration_id":1,"methods":["pause"],"launch_id":identity}})).unwrap();
         line.clear();
@@ -1117,7 +1161,13 @@ fn actual_broker_link_binds_local_generation_for_durable_ownership() {
         )
         .unwrap();
     });
-    let native = crate::live::broker_link::connect(&address, None, Duration::from_secs(2)).unwrap();
+    let native = crate::live::broker_link::connect_with_token(
+        &address,
+        None,
+        session_token,
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let mut link = ObservedLink::with_store(native, store.clone());
     let key = temporal_key(&manifest.launch_id);
     link.begin_temporal_control(&key).unwrap();
@@ -1228,4 +1278,76 @@ fn broker_lease_wait_cannot_restart_a_temporal_dispatch_deadline() {
         "{result:?}"
     );
     assert!(closed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn poll_progress_requires_the_active_temporal_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47903);
+    let key = temporal_key(&current.launch_id);
+    let mut link = ObservedLink::with_store(
+        SequenceLink::new(
+            47903,
+            &current.launch_id,
+            [Outcome::Ok(
+                serde_json::json!({"state":"frozen", "count":3}),
+            )],
+        ),
+        store,
+    );
+    link.begin_temporal_control(&key).unwrap();
+    for owner in [
+        serde_json::Value::Null,
+        serde_json::json!({"runtime":"wrong"}),
+    ] {
+        assert!(
+            matches!(link.call("step_input_polls", serde_json::json!({"count":3, "_temporal_owner":owner})), Err(LinkError::Emulator {kind, ..}) if kind == "temporal_quarantined")
+        );
+    }
+    let result = link
+        .call(
+            "step_input_polls",
+            serde_json::json!({"count":3, "_temporal_owner":key}),
+        )
+        .unwrap();
+    assert_eq!(result["count"], 3);
+    link.finish_temporal_control(&key, true).unwrap();
+}
+
+#[test]
+fn owner_can_consume_events_without_advancing_guest_execution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47929);
+    let inner = SequenceLink::new(
+        47929,
+        &current.launch_id,
+        [
+            Outcome::Ok(serde_json::json!({"events":[{"kind":"breakpoint"}]})),
+            Outcome::Ok(serde_json::json!({"events":[]})),
+        ],
+    );
+    let mut link = ObservedLink::with_store(inner, store);
+    assert_eq!(
+        link.call("poll_events", serde_json::json!({})).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        link.call_with_progress(
+            "poll_events",
+            serde_json::json!({}),
+            &mut |_| Ok(()),
+            &Default::default()
+        )
+        .unwrap()["events"],
+        serde_json::json!([])
+    );
+    assert!(
+        is_read_only("poll_events"),
+        "temporal observation remains admissible"
+    );
 }

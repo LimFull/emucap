@@ -11,6 +11,8 @@ pub(super) const CAPABILITY_FIELDS: &[&str] = &[
     "breakpoint_kinds",
     "input_buttons",
     "input_axes",
+    "input_poll_capability",
+    "host_features",
     "contracts",
     "capability_notes",
     "execution_limits",

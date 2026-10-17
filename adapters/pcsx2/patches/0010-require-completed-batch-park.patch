@@ -1,6 +1,8 @@
---- a/pcsx2/PINE.cpp
-+++ b/pcsx2/PINE.cpp
-@@ -1184,8 +1184,8 @@
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index 8bf3154..c3e2f8d 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
+@@ -1182,8 +1182,8 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
  				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16 + total, buf_size)) goto error;
  				bool success = false;
  				Host::RunOnCPUThread([&]() {

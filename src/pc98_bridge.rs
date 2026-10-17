@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,6 +17,8 @@ use crate::gdb_rsp::{GdbBridgeEnv, GdbError, GdbTransport};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
 const MAX_READ_CHUNK: usize = 0x4000;
+const MAX_BREAKPOINT_SNAPSHOTS: usize = 16;
+const MAX_BREAKPOINT_SNAPSHOT_BYTES: u64 = 0x4000;
 const MAX_FIND_LEN: usize = 128 * 1024;
 const MAX_SYNC_TIMED_INPUT_FRAMES: u64 = 120;
 const MAX_POINTER_DELTA: i64 = 127;
@@ -28,7 +30,13 @@ const SAVE_ITEMS_DIR: &str = "saveitems";
 const SAVE_ITEMS_MANIFEST: &str = "saveitems/manifest.txt";
 const FRAMEBUFFER_MEMBER: &str = "screen/framebuffer.rgb32";
 const MAX_STATE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_STATE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_STATE_ARCHIVE_ENTRIES: u64 = 4104;
+const MAX_STATE_CENTRAL_DIRECTORY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SAVE_ITEM_MEMBERS: usize = 4096;
+const MAX_SAVE_ITEM_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_SAVE_ITEM_FILENAME_BYTES: usize = 255;
+const MAX_SAVE_ITEM_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_SAVE_ITEM_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SAVE_ITEM_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const METHODS: &[&str] = &[
@@ -268,7 +276,7 @@ pub struct Bridge<G> {
     frozen: bool,
     tracing: bool,
     trace_path: Option<PathBuf>,
-    events: Vec<Value>,
+    events: events::PendingEvents,
     bps: BTreeMap<u64, Breakpoint>,
     next_bp: u64,
     input_fields: Option<Vec<String>>,
@@ -294,7 +302,7 @@ impl<G: GdbTransport> Bridge<G> {
             frozen,
             tracing: false,
             trace_path: None,
-            events: Vec::new(),
+            events: events::PendingEvents::default(),
             bps: BTreeMap::new(),
             next_bp: 1,
             input_fields: None,
@@ -384,6 +392,7 @@ impl<G: GdbTransport> Bridge<G> {
 
 mod breakpoints;
 mod debug_runtime;
+mod events;
 mod execution;
 mod machine;
 mod media;

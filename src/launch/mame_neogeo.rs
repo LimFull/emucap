@@ -1,8 +1,7 @@
 //! Isolated MAME launcher for the Neo Geo MVS, AES, and CD adapters.
 
 use super::{
-    emu_home_dir, find_on_path, first_existing_file, spawn_detached, terminate_detached,
-    LaunchSpec, RuntimeEnv,
+    find_on_path, first_existing_file, spawn_detached, terminate_detached, LaunchSpec, RuntimeEnv,
 };
 use std::path::{Path, PathBuf};
 
@@ -322,9 +321,35 @@ fn rompath(content: &Path, bios: &Path) -> std::io::Result<String> {
     }
 }
 
-pub fn mame_spec(launch: &Launch<'_>, driver: &str, gdb_port: u16) -> std::io::Result<LaunchSpec> {
+pub fn mame_spec(
+    launch: &Launch<'_>,
+    driver: &str,
+    gdb_port: u16,
+    native_debug_token: &str,
+) -> std::io::Result<LaunchSpec> {
     let system = NeoGeoSystem::parse(launch.system)?;
-    let home = emu_home_dir(system.home_component(), launch.port);
+    if system == NeoGeoSystem::Aes {
+        let hash_path = resolve_aes_hash_path(launch.repo_root).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Neo Geo AES software list neogeo.xml not found; build adapters/mame-neogeo or set EMUCAP_NEOGEO_HASH_PATH",
+            )
+        })?;
+        let software = aes_software_name(launch.content)?;
+        validate_aes_software(&hash_path, &software)?;
+    }
+    let home = super::emu_generation_dir(system.home_component(), launch.port, launch.runtime)?;
+    mame_spec_in_home(launch, driver, gdb_port, native_debug_token, &home)
+}
+
+fn mame_spec_in_home(
+    launch: &Launch<'_>,
+    driver: &str,
+    gdb_port: u16,
+    native_debug_token: &str,
+    home: &Path,
+) -> std::io::Result<LaunchSpec> {
+    let system = NeoGeoSystem::parse(launch.system)?;
     let home_text = home.to_string_lossy();
     let pluginspath = launch.repo_root.join("adapters/mame-pc98/plugins");
     let mut args = vec![driver.into(), "-rompath".into()];
@@ -426,6 +451,7 @@ pub fn mame_spec(launch: &Launch<'_>, driver: &str, gdb_port: u16) -> std::io::R
         cwd: None,
     }
     .env("MAME_GDB_PORT", gdb_port.to_string())
+    .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_debug_token)
     .env("EMUCAP_MAME_PROFILE", system.plugin_profile())
     .env(
         "EMUCAP_CONTENT",
@@ -442,13 +468,24 @@ pub fn mame_spec(launch: &Launch<'_>, driver: &str, gdb_port: u16) -> std::io::R
     Ok(spec)
 }
 
-fn bridge_spec(launch: &Launch<'_>, gdb_port: u16) -> std::io::Result<LaunchSpec> {
+#[cfg(test)]
+fn bridge_spec(
+    launch: &Launch<'_>,
+    gdb_port: u16,
+    native_debug_token: &str,
+) -> std::io::Result<LaunchSpec> {
     let system = NeoGeoSystem::parse(launch.system)?;
-    let adapter_home = launch
-        .runtime
-        .and_then(|runtime| runtime.adapter_failure_path.parent())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| emu_home_dir(system.home_component(), launch.port));
+    let adapter_home =
+        super::emu_generation_dir(system.home_component(), launch.port, launch.runtime)?;
+    bridge_spec_in_home(launch, gdb_port, native_debug_token, &adapter_home)
+}
+
+fn bridge_spec_in_home(
+    launch: &Launch<'_>,
+    gdb_port: u16,
+    native_debug_token: &str,
+    adapter_home: &Path,
+) -> std::io::Result<LaunchSpec> {
     let mut spec = LaunchSpec::new(launch.bridge, launch.log_path)
         .arg(launch.port.to_string())
         .arg(launch.system)
@@ -460,7 +497,8 @@ fn bridge_spec(launch: &Launch<'_>, gdb_port: u16) -> std::io::Result<LaunchSpec
         .env(
             "EMUCAP_CONTENT",
             launch.content.to_string_lossy().into_owned(),
-        );
+        )
+        .env("EMUCAP_NATIVE_DEBUG_TOKEN", native_debug_token);
     if let Some(name) = launch.name {
         spec = spec.env("EMUCAP_NAME", name);
     }
@@ -491,12 +529,21 @@ pub fn launch(launch: &Launch<'_>) -> std::io::Result<Launched> {
         ));
     }
     let port = gdb_port(launch.port)?;
-    let home = emu_home_dir(system.home_component(), launch.port);
+    let native_debug_token = super::new_native_debug_token();
+    let home = super::emu_generation_dir(system.home_component(), launch.port, launch.runtime)?;
     for dir in ["cfg", "nvram", "inp", "sta", "snap", "diff", "comments"] {
         std::fs::create_dir_all(home.join(dir))?;
     }
-    let mame_pid = spawn_detached(&mame_spec(launch, &driver, port)?)?;
-    let bridge = match bridge_spec(launch, port)?.emulator_dependency(mame_pid) {
+    let mame_pid = spawn_detached(&mame_spec_in_home(
+        launch,
+        &driver,
+        port,
+        &native_debug_token,
+        &home,
+    )?)?;
+    let bridge = match bridge_spec_in_home(launch, port, &native_debug_token, &home)?
+        .emulator_dependency(mame_pid)
+    {
         Ok(spec) => spec,
         Err(error) => {
             let _ = terminate_detached(mame_pid);

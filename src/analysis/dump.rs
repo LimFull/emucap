@@ -35,20 +35,32 @@ const MAX_META_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REGIONS: usize = 256;
 const MAX_REGION_BYTES: u64 = 1024 * 1024 * 1024;
+/// Aggregate retained bytes per dump; checked before opening any region.
+pub const MAX_DUMP_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// 덤프 디렉토리(regions.json + <name>.bin)를 RegionSet으로 읽는다.
 pub fn load(dir: &Path) -> Result<RegionSet, DumpError> {
     let meta_path = dir.join("regions.json");
-    if std::fs::symlink_metadata(&meta_path).is_err() {
-        return Err(DumpError::MetaNotFound(meta_path));
-    }
-    let meta = crate::path_safety::read_bounded_regular_member(dir, "regions.json", MAX_META_BYTES)
-        .map_err(|_| DumpError::UnsafeMember(meta_path.clone()))?;
+    let root = crate::rooted_fs::RootedDirectory::open(dir)?;
+    let meta = match root.read_bounded_regular_member(Path::new("regions.json"), MAX_META_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DumpError::MetaNotFound(meta_path))
+        }
+        Err(_) => return Err(DumpError::UnsafeMember(meta_path)),
+    };
     let metas: Vec<RegionMeta> = serde_json::from_slice(&meta)?;
     if metas.len() > MAX_REGIONS {
         return Err(DumpError::SizeMismatch(format!(
             "region count exceeds {MAX_REGIONS}"
         )));
+    }
+    let mut total = 0_u64;
+    for meta in &metas {
+        total = total
+            .checked_add(meta.size)
+            .filter(|size| *size <= MAX_DUMP_BYTES)
+            .ok_or_else(|| DumpError::SizeMismatch("aggregate dump byte limit exceeded".into()))?;
     }
     let mut set = RegionSet::new();
     let mut names = std::collections::BTreeSet::new();
@@ -60,21 +72,22 @@ pub fn load(dir: &Path) -> Result<RegionSet, DumpError> {
         {
             return Err(DumpError::UnsafeMember(bin));
         }
-        let canonical = match crate::path_safety::regular_member_path(dir, &file_name) {
-            Ok(path) => path,
+        if m.size > MAX_REGION_BYTES {
+            return Err(DumpError::SizeMismatch(m.name));
+        }
+        let bytes = match root.read_bounded_regular_member(Path::new(&file_name), m.size) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(DumpError::BinNotFound(bin))
             }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(DumpError::SizeMismatch(m.name))
+            }
             Err(_) => return Err(DumpError::UnsafeMember(bin)),
         };
-        let actual = std::fs::metadata(&canonical)?.len();
-        if m.size > MAX_REGION_BYTES || actual != m.size {
-            return Err(DumpError::SizeMismatch(format!(
-                "{}: manifest={}, file={actual}, maximum={MAX_REGION_BYTES}",
-                m.name, m.size
-            )));
+        if bytes.len() as u64 != m.size {
+            return Err(DumpError::SizeMismatch(m.name));
         }
-        let bytes = std::fs::read(&canonical)?;
         set.insert(&m.name, m.base_address, bytes);
     }
     Ok(set)
@@ -83,11 +96,12 @@ pub fn load(dir: &Path) -> Result<RegionSet, DumpError> {
 /// 덤프 디렉토리의 `state.json`(레지스터/DMA/PPU 스냅샷)을 읽는다. 없으면 None.
 pub fn load_state_map(dir: &Path) -> Result<Option<BTreeMap<String, Value>>, DumpError> {
     let p = dir.join("state.json");
-    if std::fs::symlink_metadata(&p).is_err() {
-        return Ok(None);
-    }
-    let bytes = crate::path_safety::read_bounded_regular_member(dir, "state.json", MAX_STATE_BYTES)
-        .map_err(|_| DumpError::UnsafeMember(p))?;
+    let root = crate::rooted_fs::RootedDirectory::open(dir)?;
+    let bytes = match root.read_bounded_regular_member(Path::new("state.json"), MAX_STATE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(DumpError::UnsafeMember(p)),
+    };
     let map: BTreeMap<String, Value> = serde_json::from_slice(&bytes)?;
     Ok(Some(map))
 }

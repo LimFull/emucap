@@ -1,12 +1,22 @@
 use std::collections::VecDeque;
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[path = "transport_stream.rs"]
+mod transport_stream;
+use transport_stream::DeadlineStream;
+
+pub(super) const MAX_PENDING_EVENTS: usize = 1024;
+pub(super) const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 use serde_json::{json, Value};
 use tungstenite::http::Uri;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 
 use super::{BridgeError, BridgeResult, PPSSPP_SUBPROTOCOL};
+
+pub(crate) const PPSSPP_MANAGED_ORIGIN: &str = "https://emucap.invalid";
 
 pub trait WsTransport {
     /// Whether this transport can no longer preserve request/reply ordering for the current
@@ -80,11 +90,11 @@ pub trait WsTransport {
 
 /// Real transport: a `tungstenite` WebSocket connected to PPSSPP's debugger endpoint.
 pub struct TungsteniteWs {
-    socket: WebSocket<TcpStream>,
+    socket: WebSocket<DeadlineStream>,
     pending_events: VecDeque<Value>,
+    pending_bytes: usize,
     terminal: bool,
-    /// The default per-read socket timeout set at connect, restored after any `call_with_timeout`
-    /// widens it for a single slow exchange.
+    /// Whole-request budget used unless a call supplies its own timeout.
     default_timeout: Duration,
     /// Monotonic request identity. PPSSPP's direct responses and errors echo arbitrary `ticket`
     /// values; the emucap fork does the same for asynchronous CPU stepping/resume acknowledgements.
@@ -93,9 +103,27 @@ pub struct TungsteniteWs {
 
 impl TungsteniteWs {
     /// Connect to `ws://127.0.0.1:<port>/debugger` with the `debugger.ppsspp.org` subprotocol.
-    /// `timeout` bounds the initial TCP connect/handshake and every subsequent blocking read/write.
-    pub fn connect(port: u16, timeout: Duration) -> BridgeResult<Self> {
-        let stream = TcpStream::connect(("127.0.0.1", port)).map_err(|err| {
+    /// `timeout` bounds connect/handshake and each subsequent request exchange.
+    pub fn connect(port: u16, timeout: Duration, native_debug_token: &str) -> BridgeResult<Self> {
+        if native_debug_token.is_empty() {
+            return Err(BridgeError::BadParams(
+                "EMUCAP_NATIVE_DEBUG_TOKEN must be non-empty for PPSSPP debugger authentication"
+                    .into(),
+            ));
+        }
+        if timeout.is_zero() {
+            return Err(BridgeError::BadParams(
+                "WebSocket timeout must be positive".into(),
+            ));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| BridgeError::BadParams("WebSocket deadline overflow".into()))?;
+        let stream = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            timeout,
+        )
+        .map_err(|err| {
             BridgeError::Emulator(format!(
                 "connect PPSSPP debugger websocket at 127.0.0.1:{port}: {err}"
             ))
@@ -107,15 +135,31 @@ impl TungsteniteWs {
         let uri: Uri = format!("ws://127.0.0.1:{port}/debugger")
             .parse()
             .map_err(|err| BridgeError::Emulator(format!("invalid PPSSPP debugger URL: {err}")))?;
-        let request = ClientRequestBuilder::new(uri).with_sub_protocol(PPSSPP_SUBPROTOCOL);
-        let (socket, _response) = tungstenite::client(request, stream).map_err(|err| {
-            BridgeError::Emulator(format!(
-                "websocket handshake with PPSSPP debugger failed: {err}"
-            ))
-        })?;
+        let request = ClientRequestBuilder::new(uri)
+            .with_header("Origin", PPSSPP_MANAGED_ORIGIN)
+            .with_header("Authorization", format!("Bearer {native_debug_token}"))
+            .with_sub_protocol(PPSSPP_SUBPROTOCOL);
+        let stream = DeadlineStream {
+            stream,
+            deadline: Some(deadline),
+            poll_timeout: timeout,
+        };
+        let config = tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_MESSAGE_BYTES));
+        let (mut socket, _response) =
+            tungstenite::client::client_with_config(request, stream, Some(config)).map_err(
+                |err| {
+                    BridgeError::Emulator(format!(
+                        "websocket handshake with PPSSPP debugger failed: {err}"
+                    ))
+                },
+            )?;
+        socket.get_mut().deadline = None;
         Ok(Self {
             socket,
             pending_events: VecDeque::new(),
+            pending_bytes: 0,
             terminal: false,
             default_timeout: timeout,
             next_ticket: 1,
@@ -158,6 +202,7 @@ impl TungsteniteWs {
     /// reply or error for another ticket is queued, not attributed to the command now in flight.
     fn read_until_ticketed(&mut self, expect: &str, ticket: &str) -> BridgeResult<Value> {
         loop {
+            self.socket.get_ref().remaining()?;
             match self.socket.read()? {
                 Message::Text(text) => {
                     let value: Value = serde_json::from_str(text.as_str())?;
@@ -175,7 +220,7 @@ impl TungsteniteWs {
                     if seen == expect && ticket_matches {
                         return Ok(value);
                     }
-                    self.pending_events.push_back(value);
+                    self.queue_event(value, text.len())?;
                 }
                 Message::Close(_) => {
                     self.terminal = true;
@@ -188,63 +233,86 @@ impl TungsteniteWs {
         }
     }
 
+    /// Poll without an unbounded receive. On Windows each raw read first waits with WSAPoll;
+    /// other hosts use nonblocking mode. Tungstenite retains partial frames across polls.
+    fn read_available(&mut self) -> tungstenite::Result<Message> {
+        self.socket.get_ref().remaining()?;
+        let exchange_deadline = self.socket.get_ref().deadline;
+        let slice = Instant::now() + Duration::from_millis(25);
+        self.socket.get_mut().deadline =
+            Some(exchange_deadline.map_or(slice, |end| end.min(slice)));
+        #[cfg(windows)]
+        {
+            let result = self.socket.read();
+            self.socket.get_mut().deadline = exchange_deadline;
+            return result;
+        }
+        #[cfg(not(windows))]
+        {
+            if let Err(error) = self.socket.get_mut().set_nonblocking(true) {
+                self.terminal = true;
+                self.socket.get_mut().deadline = exchange_deadline;
+                return Err(error.into());
+            }
+            let result = self.socket.read();
+            self.socket.get_mut().deadline = exchange_deadline;
+            if let Err(error) = self.socket.get_mut().set_nonblocking(false) {
+                self.terminal = true;
+                return Err(error.into());
+            }
+            result
+        }
+    }
+
+    fn queue_event(&mut self, value: Value, bytes: usize) -> BridgeResult<()> {
+        if self.pending_events.len() >= MAX_PENDING_EVENTS
+            || bytes > MAX_PENDING_BYTES - self.pending_bytes
+        {
+            self.terminal = true;
+            let _ = self.socket.get_ref().shutdown(std::net::Shutdown::Both);
+            return Err(BridgeError::Emulator(
+                "PPSSPP pending event budget exceeded".into(),
+            ));
+        }
+        self.pending_bytes += bytes;
+        self.pending_events.push_back(value);
+        Ok(())
+    }
+
     fn with_socket_timeout<T>(
         &mut self,
         timeout: Duration,
         operation: impl FnOnce(&mut Self) -> BridgeResult<T>,
     ) -> BridgeResult<T> {
-        self.socket
-            .get_ref()
-            .set_read_timeout(Some(timeout))
-            .map_err(BridgeError::from)?;
-        if let Err(error) = self.socket.get_ref().set_write_timeout(Some(timeout)) {
-            let rollback = self
-                .socket
-                .get_ref()
-                .set_read_timeout(Some(self.default_timeout));
-            return match rollback {
-                Ok(()) => Err(BridgeError::from(error)),
-                Err(rollback_error) => {
-                    self.terminal = true;
-                    Err(BridgeError::Emulator(format!(
-                        "failed to set the WebSocket write timeout: {error}; additionally failed to restore the read timeout: {rollback_error}"
-                    )))
-                }
-            };
+        if timeout.is_zero() {
+            return Err(BridgeError::BadParams(
+                "WebSocket timeout must be positive".into(),
+            ));
         }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| BridgeError::BadParams("WebSocket deadline overflow".into()))?;
+        self.with_deadline(deadline, timeout, operation)
+    }
 
-        let outcome = operation(self);
-        let read_restore = self
-            .socket
-            .get_ref()
-            .set_read_timeout(Some(self.default_timeout));
-        let write_restore = self
-            .socket
-            .get_ref()
-            .set_write_timeout(Some(self.default_timeout));
-        let restore = match (read_restore, write_restore) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(BridgeError::from(error)),
-            (Err(read_error), Err(write_error)) => Err(BridgeError::Emulator(format!(
-                "failed to restore WebSocket read timeout: {read_error}; failed to restore write timeout: {write_error}"
-            ))),
-        };
-        let restore_failed = restore.is_err();
-        let combined =
-            crate::live::temporal::finish_with_cleanup(outcome, restore, |primary, cleanup| {
-                match primary {
-                    Some(primary) => BridgeError::Emulator(format!(
-                    "{primary}; additionally failed to restore the WebSocket timeout: {cleanup}"
-                )),
-                    None => BridgeError::Emulator(format!(
-                    "backend call completed but failed to restore the WebSocket timeout: {cleanup}"
-                )),
-                }
-            });
-        if restore_failed {
-            self.terminal = true;
+    fn with_deadline<T>(
+        &mut self,
+        deadline: Instant,
+        poll_timeout: Duration,
+        operation: impl FnOnce(&mut Self) -> BridgeResult<T>,
+    ) -> BridgeResult<T> {
+        if self.terminal {
+            return Err(BridgeError::Emulator("PPSSPP transport is terminal".into()));
         }
-        combined
+        let previous_deadline = self.socket.get_ref().deadline;
+        let previous_poll = self.socket.get_ref().poll_timeout;
+        self.socket.get_mut().deadline = Some(deadline);
+        self.socket.get_mut().poll_timeout = poll_timeout;
+        let result = operation(self);
+        // Apply socket options lazily on the next IO, never to a peer-closed descriptor.
+        self.socket.get_mut().deadline = previous_deadline;
+        self.socket.get_mut().poll_timeout = previous_poll;
+        result
     }
 }
 
@@ -294,7 +362,7 @@ impl WsTransport for TungsteniteWs {
         let ticket = self.mint_ticket();
         let cancel_ticket = self.mint_ticket();
         let operation = crate::live::temporal::fresh_identity();
-        let outcome = self.with_socket_timeout(Duration::from_millis(25), |transport| {
+        let outcome = self.with_deadline(deadline, Duration::from_millis(25), |transport| {
             transport.send_request(
                 "emucap.frameStep",
                 json!({"count":count,"ticket":ticket,"operation_id":operation}),
@@ -307,18 +375,20 @@ impl WsTransport for TungsteniteWs {
                 let now = std::time::Instant::now();
                 if cancel_deadline.is_none() && (cancellation.is_cancelled() || now >= deadline) {
                     host_deadline = now >= deadline;
+                    let grace = now + Duration::from_millis(2500);
+                    transport.socket.get_mut().deadline = Some(grace);
                     transport.send_request(
                         "emucap.frameStep.cancel",
                         json!({"ticket":cancel_ticket,"operation_id":operation}),
                     )?;
-                    cancel_deadline = Some(now + Duration::from_millis(2500));
+                    cancel_deadline = Some(grace);
                 }
                 if cancel_deadline.is_some_and(|until| now >= until) {
                     return Err(BridgeError::Emulator(
                         "frame cancellation stop was not verified within its deadline".into(),
                     ));
                 }
-                let message = match transport.socket.read() {
+                let message = match transport.read_available() {
                     Ok(message) => message,
                     Err(tungstenite::Error::Io(error))
                         if matches!(
@@ -326,7 +396,8 @@ impl WsTransport for TungsteniteWs {
                             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                         ) =>
                     {
-                        continue
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -373,7 +444,7 @@ impl WsTransport for TungsteniteWs {
                             }
                             cancel_ack = true;
                         } else {
-                            transport.pending_events.push_back(value);
+                            transport.queue_event(value, text.len())?;
                         }
                         if terminal.is_some() && (cancel_deadline.is_none() || cancel_ack) {
                             let mut value = terminal.take().unwrap();
@@ -418,14 +489,7 @@ impl WsTransport for TungsteniteWs {
         params: Value,
         expect_event: &str,
     ) -> BridgeResult<Value> {
-        let outcome = (|| {
-            let ticket = self.mint_ticket();
-            let mut obj = object_params(event, params)?;
-            obj.insert("ticket".into(), json!(ticket));
-            self.send_request(event, Value::Object(obj))?;
-            self.read_until_ticketed(expect_event, &ticket)
-        })();
-        self.finish_transport(outcome)
+        self.call_and_wait_for_with_timeout(event, params, expect_event, self.default_timeout)
     }
 
     fn call_with_timeout(
@@ -470,25 +534,36 @@ impl WsTransport for TungsteniteWs {
     }
 
     fn call_ticketed(&mut self, event: &str, params: Value, ticket: &str) -> BridgeResult<Value> {
-        let outcome = (|| {
+        let outcome = self.with_socket_timeout(self.default_timeout, |transport| {
             let mut obj = object_params(event, params)?;
             obj.insert("ticket".into(), json!(ticket));
-            self.send_request(event, Value::Object(obj))?;
-            self.read_until_ticketed(event, ticket)
-        })();
+            transport.send_request(event, Value::Object(obj))?;
+            transport.read_until_ticketed(event, ticket)
+        });
         self.finish_transport(outcome)
     }
 
     fn drain_events(&mut self) -> Vec<Value> {
+        let mut bytes = self.pending_bytes;
+        self.pending_bytes = 0;
         let mut out: Vec<Value> = self.pending_events.drain(..).collect();
-        if self.socket.get_mut().set_nonblocking(true).is_err() {
-            self.terminal = true;
+        if self.terminal {
             return out;
         }
-        loop {
-            match self.socket.read() {
+        let previous = self.socket.get_ref().deadline;
+        self.socket.get_mut().deadline = Some(Instant::now() + Duration::from_millis(25));
+        for _ in 0..MAX_PENDING_EVENTS {
+            if out.len() >= MAX_PENDING_EVENTS || bytes >= MAX_PENDING_BYTES {
+                break;
+            }
+            match self.read_available() {
                 Ok(Message::Text(text)) => {
                     if let Ok(value) = serde_json::from_str::<Value>(text.as_str()) {
+                        if text.len() > MAX_PENDING_BYTES - bytes {
+                            let _ = self.queue_event(value, text.len());
+                            break;
+                        }
+                        bytes += text.len();
                         out.push(value);
                     }
                 }
@@ -496,7 +571,7 @@ impl WsTransport for TungsteniteWs {
                     self.terminal = true;
                     break;
                 }
-                Ok(_) => continue,
+                Ok(_) => (),
                 Err(error) => {
                     if tungstenite_error_is_terminal(&error) {
                         self.terminal = true;
@@ -505,9 +580,7 @@ impl WsTransport for TungsteniteWs {
                 }
             }
         }
-        if self.socket.get_mut().set_nonblocking(false).is_err() {
-            self.terminal = true;
-        }
+        self.socket.get_mut().deadline = previous;
         out
     }
 }

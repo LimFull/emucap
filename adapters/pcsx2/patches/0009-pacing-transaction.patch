@@ -1,5 +1,7 @@
---- a/pcsx2/PINE.cpp
-+++ b/pcsx2/PINE.cpp
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index f3db4c7..8bf3154 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
 @@ -82,7 +82,7 @@
  #endif
  
@@ -9,7 +11,7 @@
  #define EMUCAP_EE_RAM_SIZE 0x02000000
  #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
  #define EMUCAP_MAX_FRAME_ADVANCE 5000
-@@ -1719,57 +1719,46 @@
+@@ -1717,57 +1717,46 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
  				break;
  			}
  			case MsgEmuCapPacing:
@@ -29,51 +31,15 @@
 -					nominal = static_cast<u32>(std::lround(VMManager::GetNominalSpeed() * 10000.0));
 -					target = VMManager::GetTargetSpeed();
 -					frame = g_FrameCount;
-+			case MsgEmuCapSetPacing:
-+			{
-+				const bool set = (command == MsgEmuCapSetPacing);
-+				if (!SafetyChecks(buf_cnt, set ? 4 : 0, ret_cnt, set ? 60 : 28, buf_size)) [[unlikely]]
-+					goto error;
-+				const u32 percent = set ? FromSpan<u32>(buf, buf_cnt) : 0;
-+				if (set)
-+					buf_cnt += 4;
-+				if (percent > 10000)
-+					goto error;
-+				bool applied = false;
-+				u32 outcome = 0;
-+				VMManager::EmuCapPacingSnapshot previous{}, final{};
-+				Host::RunOnCPUThread([&]() {
-+					if (!VMManager::HasValidVM())
-+						return;
-+					if (set)
-+						outcome = VMManager::ApplyEmuCapPacing(percent, previous, final);
-+					else
-+						final = VMManager::GetEmuCapPacingSnapshot();
-+					applied = true;
- 				}, true);
+-				}, true);
 -				static std::string s_pacing_key;
 -				static u64 s_pacing_revision = 0;
 -				const std::string key = fmt::format("{}|{}|{}", mode, nominal, target);
 -				if (key != s_pacing_key)
-+				if (!applied)
-+					goto error;
-+				auto write_policy = [&](const VMManager::EmuCapPacingSnapshot& policy) {
-+					u32 target_bits;
-+					std::memcpy(&target_bits, &policy.target, sizeof(target_bits));
-+					ToResultVector(ret_buffer, policy.mode, ret_cnt); ret_cnt += 4;
-+					ToResultVector(ret_buffer, policy.nominal, ret_cnt); ret_cnt += 4;
-+					ToResultVector(ret_buffer, target_bits, ret_cnt); ret_cnt += 4;
-+					ToResultVector(ret_buffer, policy.revision, ret_cnt); ret_cnt += 8;
-+					ToResultVector(ret_buffer, policy.frame, ret_cnt); ret_cnt += 8;
-+				};
-+				if (set)
- 				{
+-				{
 -					s_pacing_key = key;
 -					s_pacing_revision++;
-+					ToResultVector(ret_buffer, outcome, ret_cnt);
-+					ret_cnt += 4;
-+					write_policy(previous);
- 				}
+-				}
 -				u32 target_bits;
 -				std::memcpy(&target_bits, &target, sizeof(target_bits));
 -				ToResultVector(ret_buffer, mode, ret_cnt);
@@ -88,33 +54,67 @@
 -				ret_cnt += 8;
 -				break;
 -			}
--			case MsgEmuCapSetPacing:
--			{
+ 			case MsgEmuCapSetPacing:
+ 			{
 -				if (!VMManager::HasValidVM())
--					goto error;
++				const bool set = (command == MsgEmuCapSetPacing);
++				if (!SafetyChecks(buf_cnt, set ? 4 : 0, ret_cnt, set ? 60 : 28, buf_size)) [[unlikely]]
+ 					goto error;
 -				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
--					goto error;
++				const u32 percent = set ? FromSpan<u32>(buf, buf_cnt) : 0;
++				if (set)
++					buf_cnt += 4;
++				if (percent > 10000)
+ 					goto error;
 -				const u32 percent = FromSpan<u32>(buf, buf_cnt);
 -				buf_cnt += 4;
--				bool applied = false;
+ 				bool applied = false;
 -				Host::RunOnCPUThread([percent, &applied]() { applied = VMManager::SetEmucapSpeedPercent(percent); }, true);
--				if (!applied)
--					goto error;
++				u32 outcome = 0;
++				VMManager::EmuCapPacingSnapshot previous{}, final{};
++				Host::RunOnCPUThread([&]() {
++					if (!VMManager::HasValidVM())
++						return;
++					if (set)
++						outcome = VMManager::ApplyEmuCapPacing(percent, previous, final);
++					else
++						final = VMManager::GetEmuCapPacingSnapshot();
++					applied = true;
++				}, true);
+ 				if (!applied)
+ 					goto error;
++				auto write_policy = [&](const VMManager::EmuCapPacingSnapshot& policy) {
++					u32 target_bits;
++					std::memcpy(&target_bits, &policy.target, sizeof(target_bits));
++					ToResultVector(ret_buffer, policy.mode, ret_cnt); ret_cnt += 4;
++					ToResultVector(ret_buffer, policy.nominal, ret_cnt); ret_cnt += 4;
++					ToResultVector(ret_buffer, target_bits, ret_cnt); ret_cnt += 4;
++					ToResultVector(ret_buffer, policy.revision, ret_cnt); ret_cnt += 8;
++					ToResultVector(ret_buffer, policy.frame, ret_cnt); ret_cnt += 8;
++				};
++				if (set)
++				{
++					ToResultVector(ret_buffer, outcome, ret_cnt);
++					ret_cnt += 4;
++					write_policy(previous);
++				}
 +				write_policy(final);
  				break;
  			}
  			default:
---- a/pcsx2/VMManager.cpp
-+++ b/pcsx2/VMManager.cpp
-@@ -1493,6 +1493,7 @@
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index 4933b26..e6f49dc 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -1539,6 +1539,7 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
+ 		s_limiter_mode = LimiterModeType::Nominal;
  
- 	s_limiter_mode = LimiterModeType::Nominal;
  	s_target_speed = GetTargetSpeedForLimiterMode(s_limiter_mode);
 +	GetEmuCapPacingSnapshot();
  	s_use_vsync_for_timing = false;
  
  	s_cpu_implementation_changed = false;
-@@ -2219,11 +2220,28 @@
+@@ -2282,6 +2283,7 @@ void VMManager::UpdateTargetSpeed()
  		ResetFrameLimiter();
  		s_limiter_restarted = true;
  	}
@@ -122,10 +122,10 @@
  }
  
  float VMManager::GetNominalSpeed()
- {
+@@ -2289,6 +2291,22 @@ float VMManager::GetNominalSpeed()
  	return s_emucap_nominal_speed > 0.0f ? s_emucap_nominal_speed : EmuConfig.EmulationSpeed.NominalScalar;
-+}
-+
+ }
+ 
 +
 +VMManager::EmuCapPacingSnapshot VMManager::GetEmuCapPacingSnapshot()
 +{
@@ -140,15 +140,15 @@
 +	initialized = true;
 +	previous = current;
 +	return current;
- }
- 
- bool VMManager::SetEmucapSpeedPercent(u32 percent)
-@@ -2241,6 +2259,33 @@
- 	else
- 		SetLimiterMode(LimiterModeType::Nominal);
- 	return true;
 +}
 +
+ bool VMManager::SetEmucapSpeedPercent(u32 percent)
+ {
+ 	if (percent > 10000)
+@@ -2306,6 +2324,33 @@ bool VMManager::SetEmucapSpeedPercent(u32 percent)
+ 	return true;
+ }
+ 
 +u32 VMManager::ApplyEmuCapPacing(u32 percent, EmuCapPacingSnapshot& previous, EmuCapPacingSnapshot& final)
 +{
 +	previous = GetEmuCapPacingSnapshot();
@@ -174,12 +174,16 @@
 +	final = GetEmuCapPacingSnapshot();
 +	return final.mode == previous.mode && final.nominal == previous.nominal &&
 +		final.target == previous.target ? 1 : 2;
- }
- 
++}
++
  bool VMManager::IsTargetSpeedAdjustedToHost()
---- a/pcsx2/VMManager.h
-+++ b/pcsx2/VMManager.h
-@@ -202,6 +202,20 @@
+ {
+ 	return s_target_speed_synced_to_host;
+diff --git c/pcsx2/VMManager.h i/pcsx2/VMManager.h
+index a2102d2..545a8ac 100644
+--- c/pcsx2/VMManager.h
++++ i/pcsx2/VMManager.h
+@@ -208,6 +208,20 @@ namespace VMManager
  	/// Returns the nominal speed in effect: the agent speed when set, otherwise the configured one.
  	float GetNominalSpeed();
  

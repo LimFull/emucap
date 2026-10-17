@@ -75,6 +75,7 @@ impl Mupen64PlusHost {
                 return Err(error);
             }
         };
+        control::configure_state_pause(api.debug_set_run_state);
         let mut preparation = PreparationGuard::new(api, core_handle);
 
         let config = path_cstring(&runtime_home.join("config"))?;
@@ -107,7 +108,7 @@ impl Mupen64PlusHost {
             &runtime_home.join("screens"),
         )?;
 
-        let rom = std::fs::read(rom_path)?;
+        let rom = read_rom(rom_path)?;
         let rom_len = c_int::try_from(rom.len())
             .map_err(|_| N64Error::BadParams("N64 ROM is too large".into()))?;
         check_core("ROM_OPEN", unsafe {
@@ -117,12 +118,11 @@ impl Mupen64PlusHost {
         eprintln!("[mupen64plus-native] ROM opened");
 
         let display = display_requested();
-        let mut requested_plugins = Vec::with_capacity(3);
-        if display {
-            requested_plugins.push((M64PLUGIN_GFX, "mupen64plus-video-rice"));
-        }
-        requested_plugins.push((M64PLUGIN_INPUT, "mupen64plus-input-sdl"));
-        requested_plugins.push((M64PLUGIN_RSP, "mupen64plus-rsp-hle"));
+        let requested_plugins = [
+            (M64PLUGIN_GFX, "mupen64plus-video-rice"),
+            (M64PLUGIN_INPUT, "mupen64plus-input-sdl"),
+            (M64PLUGIN_RSP, "mupen64plus-rsp-hle"),
+        ];
 
         for (kind, stem) in requested_plugins {
             let path = platform_library(root, stem)?;
@@ -175,6 +175,12 @@ impl Mupen64PlusHost {
             eprintln!("[mupen64plus-native] attached plugin {stem}");
         }
 
+        check_core("CoreEmucapSetStateBoundaryCallback", unsafe {
+            (api.core_set_state_boundary_callback)(1, control::pause_on_state_boundary)
+        })?;
+        check_core("CoreEmucapSetPollCallback", unsafe {
+            (api.core_set_poll_callback)(1, poll::completed)
+        })?;
         check_core("DebugSetCallbacks", unsafe {
             (api.debug_set_callbacks)(
                 debug_init_callback,
@@ -199,7 +205,6 @@ impl Mupen64PlusHost {
             plugins,
             rom_path: rom_path.to_path_buf(),
             name: std::env::var("EMUCAP_NAME").ok(),
-            session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
             build: crate::build_identity::BUILD_HASH.to_string(),
             runtime_home: runtime_home.to_path_buf(),
@@ -209,7 +214,9 @@ impl Mupen64PlusHost {
             request_cancellation: Default::default(),
             producer_ownership: None,
             frame_clock_synchronized: false,
-            held_buttons: BTreeSet::new(),
+            controller: Default::default(),
+            input_baseline: None,
+            parent_input_baseline: None,
             breakpoints: BTreeMap::new(),
             next_breakpoint_id: 1,
             debug_events: VecDeque::new(),
@@ -218,5 +225,110 @@ impl Mupen64PlusHost {
             next_reset_seq: 1,
             started: false,
         })
+    }
+}
+
+pub(super) fn set_config_int(
+    api: &Api,
+    section: *mut c_void,
+    name: &'static [u8],
+    kind: c_int,
+    value: c_int,
+) -> N64Result<()> {
+    check_core("ConfigSetParameter", unsafe {
+        (api.config_set_parameter)(
+            section,
+            cstr(name).as_ptr(),
+            kind,
+            &value as *const c_int as *const c_void,
+        )
+    })
+}
+
+pub(super) fn set_config_string(
+    api: &Api,
+    section: *mut c_void,
+    name: &'static [u8],
+    value: &Path,
+) -> N64Result<()> {
+    let value = path_cstring(value)?;
+    check_core("ConfigSetParameter", unsafe {
+        (api.config_set_parameter)(
+            section,
+            cstr(name).as_ptr(),
+            M64TYPE_STRING,
+            value.as_ptr() as *const c_void,
+        )
+    })
+}
+
+// Mupen64Plus 2.6.0 CART_ROM_MAX_SIZE, enforced by M64CMD_ROM_OPEN.
+const MAX_ROM_BYTES: u64 = 0x4000000;
+
+fn read_rom(path: &Path) -> N64Result<Vec<u8>> {
+    // Explicit ROM paths may be symlinks. Inspect and read the same opened file.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let length = file.metadata()?.len();
+    if length > c_int::MAX as u64 {
+        return Err(N64Error::BadParams("N64 ROM is too large".into()));
+    }
+    crate::path_safety::read_bounded_opened_regular_file(file, MAX_ROM_BYTES).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            // Preserve the native size-rejection result without allocating its input.
+            N64Error::Core {
+                operation: "ROM_OPEN",
+                code: 4,
+            }
+        } else {
+            error.into()
+        }
+    })
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn rom_admission_bounds_actual_file_before_native_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("game.z64");
+        std::fs::write(&path, b"rom").unwrap();
+        assert_eq!(read_rom(&path).unwrap(), b"rom");
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_ROM_BYTES + 1).unwrap();
+        assert!(matches!(
+            read_rom(&path),
+            Err(N64Error::Core {
+                operation: "ROM_OPEN",
+                code: 4
+            })
+        ));
+        file.set_len(c_int::MAX as u64 + 1).unwrap();
+        assert!(matches!(read_rom(&path), Err(N64Error::BadParams(_))));
+        file.set_len(MAX_ROM_BYTES).unwrap();
+        assert_eq!(read_rom(&path).unwrap().len() as u64, MAX_ROM_BYTES);
+        assert!(read_rom(tmp.path()).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn explicit_rom_symlinks_remain_supported_and_special_files_reject() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("game.z64");
+        let link = tmp.path().join("selected.z64");
+        std::fs::write(&target, b"explicit ROM").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_rom(&link).unwrap(), b"explicit ROM");
+        let pipe = tmp.path().join("pipe");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_rom(&pipe).is_err());
     }
 }

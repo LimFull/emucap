@@ -3,13 +3,14 @@ import argparse
 import json
 from pathlib import Path
 import shutil
-import subprocess
 import tarfile
 import tempfile
 import tomllib
 import zipfile
 
 from package_native import run, sha
+from native_producer import MSVC
+from native_provenance import create_record, fetch, retain_parents
 
 ADAPTERS = ('mesen2', 'dolphin', 'ppsspp', 'mednafen', 'flycast', 'np2kai',
             'mupen64plus', 'openmsx', 'mame-pc98', 'mame-neogeo', 'pcsx2', 'desmume-nds', 'xemu')
@@ -57,11 +58,18 @@ def validate_package(directory, source, adapter, platform):
     sources = [name for name in record['artifacts'] if name.endswith('-source.tar.gz')]
     if len(sources) != 1: raise ValueError('missing corresponding native source archive')
     owner = 'mame-pc98' if adapter == 'mame-neogeo' else adapter
-    tracked = run('git', '-C', source, 'ls-files', f'adapters/{owner}', f'adapters/{adapter}').splitlines()
-    required = [p for p in tracked if Path(p).suffix not in ('.md', '.sh', '.ps1')]
-    with tarfile.open(directory / sources[0]) as archive:
+    paths = [f'adapters/{owner}', f'adapters/{adapter}']
+    if platform != 'windows' or adapter not in MSVC: paths.append('adapters/_common')
+    tracked = run('git', '-C', source, 'ls-files', *paths).splitlines()
+    required = [p for p in tracked if not p.endswith('.md')]
+    recipe_archive = runtime_name + '-recipes.tar.gz' if platform == 'windows' else sources[0]
+    expected_artifacts = {runtime.name, sources[0]}
+    if platform == 'windows': expected_artifacts.add(recipe_archive)
+    if set(record['artifacts']) != expected_artifacts:
+        raise ValueError('unexpected native package artifact set')
+    with tarfile.open(directory / recipe_archive) as archive:
         for rel in required:
-            path = sources[0][:-7] + '/recipes/' + rel
+            path = rel if platform == 'windows' else sources[0][:-7] + '/recipes/' + rel
             stream = archive.extractfile(path)
             if stream is None or stream.read() != (source / rel).read_bytes():
                 raise ValueError(f'package incompatible with release source: {rel}')
@@ -87,28 +95,28 @@ def main():
     validate_selection(selection)
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()): raise ValueError('release output must be empty')
-    records = []
+    records, parents = [], []
     for item in selection:
         adapter, platform, producer = item['adapter'], item['platform'], str(item['run'])
-        info = json.loads(run('gh', 'api', f'repos/{args.repo}/actions/runs/{producer}'))
-        # A matrix can contain unrelated failures; only completed package artifacts
-        # from successful packaging steps are selected and independently verified.
-        if info['status'] != 'completed' or info['event'] == 'pull_request':
-            raise ValueError('native producer must be a completed trusted run')
-        artifact = f'native-package-{adapter}-{platform}'
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            subprocess.run(['gh', 'run', 'download', producer, '--repo', args.repo,
-                            '--name', artifact, '--dir', temporary], check=True)
+            directory = Path(temporary) / 'package'
+            verified = fetch(args.repo, producer, 'package', adapter, platform, directory,
+                             args.source, attempt=item.get('attempt'))
             record = validate_package(directory, args.source, adapter, platform)
-            records.append(dict(record, platform=platform, workflow_run=int(producer)))
+            if (record['source_revision'] != verified.record['native']['source_revision']
+                    or record['packaging_revision'] != verified.record['producer']['revision']):
+                raise ValueError('native package record differs from authenticated producer')
+            records.append(dict(record, platform=platform, workflow_run=int(producer),
+                                provenance_sha256=verified.digest))
             for name in [*record['artifacts'], f"emucap-{record['version']}-{adapter}-{record['target']}.json"]:
                 merge_file(directory / name, args.output)
+            parents.extend(retain_parents(args.output, [verified]))
         print(f'verified {adapter}/{platform}', flush=True)
     index = dict(core_revision=run('git', '-C', args.source, 'rev-parse', 'HEAD'), packages=records)
     (args.output / 'NATIVE-PACKAGES.json').write_text(json.dumps(index, indent=2) + '\n')
-    checksums = ''.join(f'{sha(p)}  {p.name}\n' for p in sorted(args.output.iterdir()))
+    checksums = ''.join(f'{sha(p)}  {p.name}\n' for p in sorted(args.output.iterdir()) if p.is_file())
     (args.output / 'NATIVE-SHA256SUMS').write_text(checksums)
+    create_record(args.output, args.source, 'assembly', parents=parents)
 
 
 if __name__ == '__main__': main()

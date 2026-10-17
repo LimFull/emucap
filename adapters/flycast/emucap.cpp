@@ -4,8 +4,11 @@
 // timeslice 경계 park(emucap_park).
 // 빌드/주입은 adapters/flycast/build.sh. 광고 메서드는 런타임에 hello/status.methods로 확인한다.
 #include "emulator.h"
+#include "emucap_atomic_file.h"
 #include "emucap_failure.h"
+#include "emucap_front_auth.h"
 #include "emucap_input.h"
+#include "emucap_pattern.h"
 #include "emucap_native_failure.h"
 #include "emucap_pacing.h"
 #include "emucap_state.h"
@@ -49,6 +52,7 @@ static_assert(MT == 0 && EX == 1 && BR == 2 && LS == 3 && FE == 4 && CO == 5,
 #include <chrono>
 #include <mutex>
 #include <stdexcept>
+#include <limits>
 #ifdef _WIN32
 #include <winsock2.h>   // Windows 소켓(MinGW) — POSIX sys/socket.h 대체
 #include <ws2tcpip.h>   // inet_pton
@@ -75,6 +79,7 @@ static inline bool emucap_sock_wouldblock() { int e = ::WSAGetLastError(); retur
 static inline bool emucap_sock_eintr() { return ::WSAGetLastError() == WSAEINTR; }
 static inline void emucap_sock_wait_ms(unsigned ms) { ::Sleep(ms); }
 static inline void emucap_set_rcvtimeo_ms(int s, int ms) { DWORD t = (DWORD)ms; ::setsockopt((SOCKET)s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t)); }
+static inline void emucap_set_sndtimeo_ms(int s, int ms) { DWORD t = (DWORD)ms; ::setsockopt((SOCKET)s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t)); }
 #else
 static inline void emucap_net_init() {}
 static inline int  emucap_closesock(int s) { return ::close(s); }
@@ -83,9 +88,10 @@ static inline bool emucap_sock_wouldblock() { return errno == EAGAIN || errno ==
 static inline bool emucap_sock_eintr() { return errno == EINTR; }
 static inline void emucap_sock_wait_ms(unsigned ms) { ::usleep(ms * 1000); }
 static inline void emucap_set_rcvtimeo_ms(int s, int ms) { struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000; ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+static inline void emucap_set_sndtimeo_ms(int s, int ms) { struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000; ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)); }
 #endif
 
-// gui.cpp에 build.sh가 주입하는 래퍼. capture_raw는 GL 컨텍스트(UI 스레드)에서만 — renderer->GetLastFrame로
+// gui.cpp에 build.sh가 주입하는 래퍼. capture_raw는 렌더러 컨텍스트 소유 스레드에서만 — renderer->GetLastFrame로
 // 최신 프레임 raw RGB를 얻는다. encode_png는 GL 불필요(stbi) — 어느 스레드서나 raw→PNG 인코딩.
 void emucap_capture_raw(std::vector<unsigned char>& out, int& w, int& h);
 void emucap_encode_png(const unsigned char* raw, int w, int h, std::vector<unsigned char>& png);
@@ -123,12 +129,11 @@ uint64_t g_step_progress_ms = 0;
 // 입력 홀드: set_input은 emucap_service(emu 스레드)에서 쓰고, Maple GetInput 소비 지점이 읽는다.
 // 소유권+pressed mask 단일 atomic snapshot이며 빈 mask는 네이티브 입력권을 반환한다.
 EmucapFlycastInputOverride g_input_override;
-// screenshot(연속 버퍼): UI 스레드가 매 렌더마다 최신 프레임 raw를 g_fb_raw에 캡처(emucap_capture_latest),
-// emu 스레드는 screenshot 요청 시 그 버퍼를 PNG 인코딩해 즉시 응답한다. freeze(vblank-스핀)는 UI 렌더를
-// 막으므로 gui_runOnUiThread/지연 방식은 데드락 → 버퍼 방식이라야 frozen서도 동작(버퍼엔 freeze 직전
-// 프레임=frozen 상태가 남는다). cross-thread(UI 쓰기·emu 읽기)라 mutex로 보호.
+// The PVR owner publishes RGB after each successful Present, before acknowledging
+// the observation fence. Frozen screenshots encode this last presented image;
+// a vblank without Present does not create a new image. Load invalidates the cache.
 std::mutex g_fb_mtx;
-std::vector<u8> g_fb_raw;     // 최신 프레임 raw RGB(UI 스레드가 채움)
+std::vector<u8> g_fb_raw;     // last presented RGB (renderer owner)
 int g_fb_w = 0, g_fb_h = 0;
 bool g_fb_fresh = false;      // load_state 뒤 새 render capture가 오기 전 stale 성공을 막는다
 // exec breakpoint: PC가 BP 주소에 닿으면 인터프리터 Run() 루프(주입 훅)가 그 명령 실행 전에
@@ -317,12 +322,65 @@ void emucap_connect() {
 	addr.sin_port = htons(emucap_port());
 	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 	if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) { emucap_closesock(fd); return; }
+	const char* front_key = getenv("EMUCAP_SESSION_TOKEN");
+	const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+	if (!front_key || !front_key[0] || !launch_id || !launch_id[0]) {
+		emucap_closesock(fd);
+		return;
+	}
+	const auto auth_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	auto auth_budget = [&]() -> int {
+		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+			auth_deadline - std::chrono::steady_clock::now()).count();
+		return remaining <= 0 ? 0 : (int)std::min<long long>(remaining, 5000);
+	};
+	auto read_exact = [&](std::uint8_t* bytes, size_t size) {
+		size_t offset = 0;
+		while (offset < size) {
+			int budget = auth_budget();
+			if (!budget) return false;
+			emucap_set_rcvtimeo_ms(fd, budget);
+			ssize_t count = recv(fd, reinterpret_cast<char*>(bytes + offset), size - offset, 0);
+			if (count <= 0) {
+				if (count < 0 && emucap_sock_eintr()) continue;
+				return false;
+			}
+			offset += (size_t)count;
+		}
+		return true;
+	};
+	auto write_all = [&](const std::uint8_t* bytes, size_t size) {
+		size_t offset = 0;
+	#ifdef MSG_NOSIGNAL
+		constexpr int send_flags = MSG_NOSIGNAL;
+	#else
+		constexpr int send_flags = 0;
+	#endif
+		while (offset < size) {
+			int budget = auth_budget();
+			if (!budget) return false;
+			emucap_set_sndtimeo_ms(fd, budget);
+			ssize_t count = ::send(fd, reinterpret_cast<const char*>(bytes + offset), size - offset,
+				send_flags);
+			if (count <= 0) {
+				if (count < 0 && emucap_sock_eintr()) continue;
+				return false;
+			}
+			offset += (size_t)count;
+		}
+		return true;
+	};
+	if (!emucap_front_auth::Authenticate(front_key, launch_id, (std::uint16_t)emucap_port(),
+			read_exact, write_all)) {
+		emucap_closesock(fd);
+		return;
+	}
 
 	// ── 동기 핸드셰이크(프레임루프 타이밍과 분리) ─────────────────────────────────
 	// 서버는 accept 직후 hello 요청 한 줄을 보내고, 우리 응답을 blocking read_line(5s, src/live/tcp.rs
 	// handshake_stream)으로 기다린다. GD-ROM 부팅은 인터프리터에서 ~50s로 느려 그동안 프레임루프
 	// (vblank→emucap_service)가 굶는다. 핸드셰이크를 O_NONBLOCK + 프레임루프 service에만 맡기면(기존 경로)
-	// 그 5s 안에 완전한 hello를 못 주고받아 서버가 불완전한 identity(session_token 없음)로 핸드셰이크해
+	// 그 5s 안에 완전한 hello를 못 주고받아 서버가 불완전한 identity로 핸드셰이크해
 	// 자기 세션을 foreign으로 오판했다. 그래서 O_NONBLOCK *전에*, connect 호출자(emu 스레드)에서 hello를
 	// 원자적·동기적으로 완결한다 — 부팅이 아무리 느려도 핸드셰이크가 굶지 않고 완전한 identity가 즉시 간다.
 	// (별도 소켓 스레드를 만들지 않는다 — cross-thread 상태접근 금지가 이 service 모델의 이유. 핸드셰이크도
@@ -930,15 +988,14 @@ void handle_save_state(long id, const std::string& line) {
 		Serializer sizer;            // 1패스: 크기 산출
 		dc_serialize(sizer);
 		size_t sz = sizer.size();
+		if (!emucap_state_payload_size_valid(sz)) {
+			reply_err(id, "io_error", "state exceeds the 512 MiB managed artifact limit"); return;
+		}
 		std::vector<u8> buf(sz + EMUCAP_FLYCAST_STATE_HEADER);
 		emucap_state_header(buf, timing_unit, timing_memory);
 		Serializer ser(buf.data() + EMUCAP_FLYCAST_STATE_HEADER, sz);
 		dc_serialize(ser);           // 2패스: 실제 직렬화
-		FILE* f = fopen(path.c_str(), "wb");
-		if (!f) { reply_err(id, "io_error", "failed to open file"); return; }
-		size_t w = fwrite(buf.data(), 1, buf.size(), f);
-		fclose(f);
-		if (w != buf.size()) { reply_err(id, "io_error", "failed to write file"); return; }
+		EmucapAtomicFile::write(path, buf.data(), buf.size());
 	} catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
 	reply_ok(id, "{\"status\":\"completed\"}");
 }
@@ -947,14 +1004,9 @@ void handle_load_state(long id, const std::string& line) {
 	if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
 	bool replacing = false;
 	try {
-		FILE* f = fopen(path.c_str(), "rb");
-		if (!f) { reply_err(id, "io_error", "failed to open file"); return; }
-		fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-		if (sz <= 0) { fclose(f); reply_err(id, "io_error", "file is empty or invalid"); return; }
-		std::vector<u8> buf((size_t)sz);
-		size_t r = fread(buf.data(), 1, (size_t)sz, f);
-		fclose(f);
-		if ((long)r != sz) { reply_err(id, "io_error", "failed to read file"); return; }
+		std::vector<u8> buf;
+		try { buf = emucap_state_read(path.c_str()); }
+		catch (const std::invalid_argument& e) { reply_err(id, "bad_params", e.what()); return; }
 		u32 timing_unit, timing_memory;
 		if (!emucap_state_parse(buf, timing_unit, timing_memory) || !Sh4Interpreter::Instance) {
 			reply_err(id, "bad_params", "state lacks a valid interpreter timing continuation; create a checkpoint with this producer");
@@ -1002,6 +1054,14 @@ void rearm_breakpoints() {
 	g_emucap_bp_armed = !g_bp_addrs.empty();
 }
 void handle_set_breakpoint(long id, const std::string& line) {
+	if (g_bps.size() >= 128) {
+		reply_err(id, "bad_params", "breakpoint limit exceeded (128 active registrations)");
+		return;
+	}
+	if (g_bp_next_id == std::numeric_limits<long>::max()) {
+		reply_err(id, "bad_params", "breakpoint id space exhausted");
+		return;
+	}
 	// exec(PC) BP만 지원. read/write 워치포인트는 메모리 접근 훅이 필요 → 미지원(거부).
 	std::string kind = json_str(line, "kind");
 	if (!kind.empty() && kind != "exec" && kind != "pc") {
@@ -1010,8 +1070,9 @@ void handle_set_breakpoint(long id, const std::string& line) {
 	}
 	long start = 0;
 	if (!json_num(line, "start", start)) json_num(line, "address", start);  // start 우선, 없으면 address
-	long bid = g_bp_next_id++;
+	long bid = g_bp_next_id;
 	g_bps.push_back(EmuBp{bid, (uint32_t)start});
+	++g_bp_next_id;
 	rearm_breakpoints();
 	char buf[48];
 	snprintf(buf, sizeof(buf), "{\"id\":%ld,\"set\":true}", bid);
@@ -1034,7 +1095,7 @@ void handle_clear_breakpoint(long id, const std::string& line) {
 void handle_list_breakpoints(long id) {
 	std::string arr = "[";
 	for (size_t i = 0; i < g_bps.size(); i++) {
-		char b[80];
+		char b[128];
 		snprintf(b, sizeof(b), "%s{\"id\":%ld,\"kind\":\"exec\",\"start\":%u,\"end\":%u}",
 		         i ? "," : "", g_bps[i].id, (unsigned)g_bps[i].addr, (unsigned)g_bps[i].addr);
 		arr += b;
@@ -1072,9 +1133,11 @@ void handle_find_pattern(long id, const std::string& line) {
 	bool has_length = json_num(line, "length", length);
 	json_num(line, "max_matches", max_matches);
 	json_num(line, "align", align);
-	if (hex.empty() || hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string"); return; }
+	if (hex.empty() || hex.size() % 2 != 0 || hex.size() > 2 * 0x1000000ull ||
+        hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) { reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string"); return; }
 	if (align < 1) align = 1;
 	if (max_matches < 1) max_matches = 256;
+	if (max_matches > 4096) max_matches = 4096;
 	if (start < 0 || (uint64_t)start >= (uint64_t)r->size) {
 		char m[128];
 		snprintf(m, sizeof(m), "start exceeds %s region size 0x%X", r->mt, (unsigned)r->size);
@@ -1093,20 +1156,14 @@ void handle_find_pattern(long id, const std::string& line) {
 	for (uint64_t i = 0; i < scan_len; i++) buf[(size_t)i] = addrspace::read8((u32)(r->base + start + i));
 	std::string matches = "[";
 	long count = 0;
-	if (pat.size() <= scan_len) {
-		for (uint64_t off = 0; off + pat.size() <= scan_len; off++) {
-			if (align > 1 && (((uint64_t)start + off) % (uint64_t)align) != 0) continue;
-			bool m = true;
-			for (size_t k = 0; k < pat.size(); k++) if (buf[(size_t)off + k] != pat[k]) { m = false; break; }
-			if (!m) continue;
-			if (count < max_matches) {
-				// 오프셋은 region 0-based 기준(read_memory(memory_type, address=오프셋)과 같은 주소계).
-				char b[24]; snprintf(b, sizeof(b), "%s%llu", count ? "," : "", (unsigned long long)((uint64_t)start + off));
-				matches += b;
-				count++;
-			} else { truncated = true; break; }
-		}
-	}
+	emucap_pattern_matches(buf.data(), buf.size(), pat.data(), pat.size(), [&](size_t off) {
+        if (((uint64_t)start + off) % (uint64_t)align != 0) return true;
+        if (count >= max_matches) { truncated = true; return false; }
+        char b[24]; snprintf(b, sizeof(b), "%s%llu", count ? "," : "", (unsigned long long)((uint64_t)start + off));
+        matches += b;
+        ++count;
+        return true;
+    });
 	matches += "]";
 	char tail[112];
 	snprintf(tail, sizeof(tail), ",\"count\":%ld,\"truncated\":%s,\"scanned\":%llu,\"start\":%ld}",
@@ -1352,13 +1409,6 @@ void handle(const std::string& line) {
 			r += ",\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","
 			     "\"active_exceptions\":[\"flycast.execution.instruction-step-absent\","
 			     "\"flycast.call-stack.best-effort\",\"flycast.input-hold.port-zero-only\"]}}";
-			const char* tok = getenv("EMUCAP_SESSION_TOKEN");
-			if (tok && tok[0] && !r.empty() && r.back() == '}') {
-				std::string s(tok);
-				if (s.size() > 256) s.resize(256);
-				r.pop_back();
-				r += ",\"session_token\":\"" + json_escape(s) + "\"}";
-			}
 			const char* content = getenv("EMUCAP_CONTENT");
 			if (content && content[0] && !r.empty() && r.back() == '}') {
 				std::string s(content);
@@ -1500,9 +1550,7 @@ void handle(const std::string& line) {
 					"frame capture was disabled after a native adapter exception; inspect get_failure_context");
 				return;
 			}
-			// 연속 버퍼에서 즉시 PNG 인코딩(emu 스레드, GL 불필요). UI 스레드가 매 렌더마다 raw를 채워두므로
-			// frozen서도 동작한다(버퍼=freeze 직전 프레임=frozen 상태). gui_runOnUiThread/지연은 freeze 중
-			// UI 렌더가 막혀 데드락이라 쓰지 않는다.
+			// Renderer publication is ordered before the parked-owner fence.
 			std::vector<u8> raw; int w = 0, h = 0; bool fresh = false;
 			{
 				std::lock_guard<std::mutex> lk(g_fb_mtx);
@@ -1511,7 +1559,7 @@ void handle(const std::string& line) {
 			if (raw.empty() || w <= 0 || h <= 0) { reply_err(id, "no_frame", "no rendered frame is available"); return; }
 			if (!fresh) {
 				reply_err(id, "bad_state",
-					"no fresh rendered frame exists after load_state; advance one frame or resume before capture");
+					"no fresh rendered frame exists after load_state; advance until the guest presents a frame");
 				return;
 			}
 			std::vector<u8> png;
@@ -2039,16 +2087,10 @@ void emucap_trace_hook(uint32_t pc) {
 	}
 }
 
-// mainui_rend_frame(UI/GL 스레드)에서 매 렌더마다 호출 — 최신 프레임 raw를 버퍼에 캡처해 둔다. screenshot은
-// 이 버퍼를 emu 스레드에서 PNG 인코딩하므로(GL 불필요) frozen서도 동작한다(버퍼=freeze 직전=frozen 프레임).
-// freeze 중엔 UI 렌더가 멈춰 이 함수가 안 불리므로 버퍼는 정확히 frozen 프레임으로 고정된다.
+// Called on the renderer/context owner after successful Present. Never sample:
+// a skipped publication could leave a completed park with an older capture.
 void emucap_capture_latest() {
-	// GetLastFrame은 FBO 블릿 + glReadPixels(전 프레임)이라 매 렌더 호출은 비용이 크다 → N프레임마다만
-	// 캡처(버퍼는 ~N/60초 이내라 screenshot엔 충분, frozen 직전 프레임도 충분히 최신). running 시에만 도는
-	// 함수라(frozen 중엔 UI 렌더가 멈춤) 캡처 정지=비용 0.
 	if (g_capture_disabled.load()) return;
-	static unsigned tick = 0;
-	if ((tick++ & 3) != 0) return;   // 4프레임마다(약 15Hz)
 	try {
 		std::lock_guard<std::mutex> lk(g_fb_mtx);
 		emucap_capture_raw(g_fb_raw, g_fb_w, g_fb_h);

@@ -1,5 +1,95 @@
+diff --git c/pcsx2/GS/GS.cpp i/pcsx2/GS/GS.cpp
+index 8291c3b..1405b15 100644
+--- c/pcsx2/GS/GS.cpp
++++ i/pcsx2/GS/GS.cpp
+@@ -911,6 +911,12 @@ void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlac
+ 	}
+ }
+ 
++void GSRestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels)
++{
++	if (g_gs_renderer)
++		g_gs_renderer->RestoreSnapshot(width, height, std::move(pixels));
++}
++
+ bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
+ 	u32* width, u32* height, std::vector<u32>* pixels)
+ {
+diff --git c/pcsx2/GS/GS.h i/pcsx2/GS/GS.h
+index 892f406..20b0c62 100644
+--- c/pcsx2/GS/GS.h
++++ i/pcsx2/GS/GS.h
+@@ -106,6 +106,7 @@ void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float
+ 
+ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config);
+ void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlace);
++void GSRestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels);
+ bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
+ 	u32* width, u32* height, std::vector<u32>* pixels);
+ void GSJoinSnapshotThreads();
+diff --git c/pcsx2/GS/Renderers/Common/GSRenderer.cpp i/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 1d77040..751b759 100644
+--- c/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ i/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -63,6 +63,7 @@ GSRenderer::~GSRenderer() = default;
+ 
+ void GSRenderer::Reset(bool hardware_reset)
+ {
++	m_restored_snapshot.Clear();
+ 	// Clear the current display texture.
+ 	if (hardware_reset)
+ 		g_gs_device->ClearCurrent();
+@@ -579,6 +580,7 @@ void GSRenderer::EndPresentFrame()
+ 
+ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ {
++	m_restored_snapshot.Clear();
+ 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
+ 	{
+ 		if (GSConfig.SaveInfo)
+@@ -1036,6 +1038,8 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool
+ 	GSTexture* const current = g_gs_device->GetCurrent();
+ 	if (!current)
+ 	{
++		if (m_restored_snapshot.Copy(window_width, window_height, apply_aspect, crop_borders, width, height, pixels))
++			return true;
+ 		*width = 0;
+ 		*height = 0;
+ 		pixels->clear();
+diff --git c/pcsx2/GS/Renderers/Common/GSRenderer.h i/pcsx2/GS/Renderers/Common/GSRenderer.h
+index 5f6f8d4..8c1437d 100644
+--- c/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ i/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -4,12 +4,14 @@
+ #pragma once
+ 
+ #include "GS/GSState.h"
++#include "GSRestoredSnapshot.h"
+ #include <memory>
+ #include <string>
+ 
+ class GSRenderer : public GSState
+ {
+ private:
++	GSRestoredSnapshot m_restored_snapshot;
+ 	bool Merge(int field);
+ 	bool BeginPresentFrame(bool frame_skip);
+ 	void EndPresentFrame();
+@@ -54,6 +56,9 @@ public:
+ 	bool SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
+ 		u32* width, u32* height, std::vector<u32>* pixels);
+ 
++	void RestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels)
++	{ m_restored_snapshot.Set(width, height, std::move(pixels)); }
++
+ 	void QueueSnapshot(const std::string& path, const u32 gsdump_frames);
+ 	void StopGSDump();
+ 	void PresentCurrentFrame();
+diff --git c/pcsx2/GS/Renderers/Common/GSRestoredSnapshot.h i/pcsx2/GS/Renderers/Common/GSRestoredSnapshot.h
+new file mode 100644
+index 0000000..597e628
 --- /dev/null
-+++ b/pcsx2/GS/Renderers/Common/GSRestoredSnapshot.h
++++ i/pcsx2/GS/Renderers/Common/GSRestoredSnapshot.h
 @@ -0,0 +1,29 @@
 +// SPDX-License-Identifier: GPL-3.0+
 +#pragma once
@@ -30,98 +120,11 @@
 + std::uint32_t m_width = 0, m_height = 0;
 + std::vector<std::uint32_t> m_pixels;
 +};
---- a/pcsx2/GS/Renderers/Common/GSRenderer.h
-+++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
-@@ -4,12 +4,14 @@
- #pragma once
- 
- #include "GS/GSState.h"
-+#include "GSRestoredSnapshot.h"
- #include <memory>
- #include <string>
- 
- class GSRenderer : public GSState
- {
- private:
-+	GSRestoredSnapshot m_restored_snapshot;
- 	bool Merge(int field);
- 	bool BeginPresentFrame(bool frame_skip);
- 	void EndPresentFrame();
-@@ -59,6 +61,9 @@
- 	bool SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
- 		u32* width, u32* height, std::vector<u32>* pixels);
- 
-+	void RestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels)
-+	{ m_restored_snapshot.Set(width, height, std::move(pixels)); }
-+
- 	void QueueSnapshot(const std::string& path, const u32 gsdump_frames);
- 	void StopGSDump();
- 	void PresentCurrentFrame();
---- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
-+++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
-@@ -63,6 +63,7 @@
- 
- void GSRenderer::Reset(bool hardware_reset)
- {
-+	m_restored_snapshot.Clear();
- 	// Clear the current display texture.
- 	if (hardware_reset)
- 		g_gs_device->ClearCurrent();
-@@ -580,6 +581,7 @@
- 
- void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
- {
-+	m_restored_snapshot.Clear();
- 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
- 	{
- 		if (GSConfig.SaveInfo)
-@@ -1008,6 +1010,8 @@
- 	GSTexture* const current = g_gs_device->GetCurrent();
- 	if (!current)
- 	{
-+		if (m_restored_snapshot.Copy(window_width, window_height, apply_aspect, crop_borders, width, height, pixels))
-+			return true;
- 		*width = 0;
- 		*height = 0;
- 		pixels->clear();
---- a/pcsx2/GS/GS.h
-+++ b/pcsx2/GS/GS.h
-@@ -106,6 +106,7 @@
- 
- void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config);
- void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlace);
-+void GSRestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels);
- bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
- 	u32* width, u32* height, std::vector<u32>* pixels);
- void GSJoinSnapshotThreads();
---- a/pcsx2/GS/GS.cpp
-+++ b/pcsx2/GS/GS.cpp
-@@ -869,6 +869,12 @@
- 		if (!GSreopen(false, true, renderer, std::nullopt))
- 			pxFailRel("Failed to reopen GS for renderer switch.");
- 	}
-+}
-+
-+void GSRestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels)
-+{
-+	if (g_gs_renderer)
-+		g_gs_renderer->RestoreSnapshot(width, height, std::move(pixels));
- }
- 
- bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
---- a/pcsx2/MTGS.h
-+++ b/pcsx2/MTGS.h
-@@ -75,6 +75,7 @@
- 	void UpdateVSyncMode();
- 	void SetSoftwareRendering(bool software, GSInterlaceMode interlace, bool display_message = true);
- 	void ToggleSoftwareRendering();
-+	void RestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels);
- 	bool SaveMemorySnapshot(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
- 		u32* width, u32* height, std::vector<u32>* pixels);
- 	void SetRunIdle(bool enabled);
---- a/pcsx2/MTGS.cpp
-+++ b/pcsx2/MTGS.cpp
-@@ -1013,6 +1013,14 @@
+diff --git c/pcsx2/MTGS.cpp i/pcsx2/MTGS.cpp
+index 98b453c..d782b0b 100644
+--- c/pcsx2/MTGS.cpp
++++ i/pcsx2/MTGS.cpp
+@@ -1018,6 +1018,14 @@ void MTGS::ToggleSoftwareRendering()
  	SetSoftwareRendering(GSIsHardwareRenderer(), EmuConfig.GS.InterlaceMode);
  }
  
@@ -136,9 +139,23 @@
  bool MTGS::SaveMemorySnapshot(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
  	u32* width, u32* height, std::vector<u32>* pixels)
  {
---- a/pcsx2/SaveState.cpp
-+++ b/pcsx2/SaveState.cpp
-@@ -757,8 +757,9 @@
+diff --git c/pcsx2/MTGS.h i/pcsx2/MTGS.h
+index 19c125a..3556271 100644
+--- c/pcsx2/MTGS.h
++++ i/pcsx2/MTGS.h
+@@ -75,6 +75,7 @@ namespace MTGS
+ 	void UpdateVSyncMode();
+ 	void SetSoftwareRendering(bool software, GSInterlaceMode interlace, bool display_message = true);
+ 	void ToggleSoftwareRendering();
++	void RestoreSnapshot(u32 width, u32 height, std::vector<u32> pixels);
+ 	bool SaveMemorySnapshot(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
+ 		u32* width, u32* height, std::vector<u32>* pixels);
+ 	void SetRunIdle(bool enabled);
+diff --git c/pcsx2/SaveState.cpp i/pcsx2/SaveState.cpp
+index 239737c..a49ffa4 100644
+--- c/pcsx2/SaveState.cpp
++++ i/pcsx2/SaveState.cpp
+@@ -757,8 +757,9 @@ std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error)
  
  std::unique_ptr<SaveStateScreenshotData> SaveState_SaveScreenshot()
  {
@@ -150,7 +167,7 @@
  
  	u32 width, height;
  	std::vector<u32> pixels;
-@@ -863,11 +864,13 @@
+@@ -863,11 +864,13 @@ static bool SaveState_ReadScreenshot(zip_t* zf, u32* out_width, u32* out_height,
  		png_destroy_read_struct(&png_ptr, &info_ptr, nullptr);
  	});
  
@@ -165,7 +182,7 @@
  	});
  
  	png_read_info(png_ptr, info_ptr);
-@@ -877,13 +880,17 @@
+@@ -877,13 +880,17 @@ static bool SaveState_ReadScreenshot(zip_t* zf, u32* out_width, u32* out_height,
  	int bitDepth = 0;
  	int colorType = -1;
  	if (png_get_IHDR(png_ptr, info_ptr, &width, &height, &bitDepth, &colorType, nullptr, nullptr, nullptr) != 1 ||
@@ -185,20 +202,19 @@
  
  	*out_width = width;
  	*out_height = height;
-@@ -891,9 +898,9 @@
+@@ -891,9 +898,9 @@ static bool SaveState_ReadScreenshot(zip_t* zf, u32* out_width, u32* out_height,
  
  	for (u32 y = 0; y < height; y++)
  	{
 -		png_read_row(png_ptr, static_cast<png_bytep>(rowData.data()), nullptr);
--
--		const u8* row_ptr = rowData.data();
 +		png_read_row(png_ptr, static_cast<png_bytep>(rowData->data()), nullptr);
-+
+ 
+-		const u8* row_ptr = rowData.data();
 +		const u8* row_ptr = rowData->data();
  		u32* out_ptr = &out_pixels->at(y * width);
  		if (colorType == PNG_COLOR_TYPE_RGB)
  		{
-@@ -902,7 +909,6 @@
+@@ -902,7 +909,6 @@ static bool SaveState_ReadScreenshot(zip_t* zf, u32* out_width, u32* out_height,
  				u32 pixel = static_cast<u32>(*(row_ptr)++);
  				pixel |= static_cast<u32>(*(row_ptr)++) << 8;
  				pixel |= static_cast<u32>(*(row_ptr)++) << 16;
@@ -206,7 +222,7 @@
  				*(out_ptr++) = pixel | 0xFF000000u; // make opaque
  			}
  		}
-@@ -918,6 +924,7 @@
+@@ -918,6 +924,7 @@ static bool SaveState_ReadScreenshot(zip_t* zf, u32* out_width, u32* out_height,
  		}
  	}
  
@@ -214,7 +230,7 @@
  	return true;
  }
  
-@@ -1213,6 +1220,15 @@
+@@ -1203,6 +1210,15 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
  		return false;
  	}
  
@@ -230,7 +246,7 @@
  	PreLoadPrep();
  
  	if (!LoadInternalStructuresState(zf.get(), internal_index, error))
-@@ -1242,6 +1258,7 @@
+@@ -1232,6 +1248,7 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
  	}
  
  	PostLoadPrep();

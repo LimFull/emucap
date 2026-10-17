@@ -1,0 +1,14 @@
+--- a/src/api/vidext_sdl2_compat.h
++++ b/src/api/vidext_sdl2_compat.h
+@@ -441,7 +441,10 @@
+ #endif // !USE_GLES
+ 
+     /* Create a new window */
+-    window_flags = SDL_WINDOW_SHOWN;
++    /* Keep graphics task semantics in display:false without presenting a window. */
++    const char *emucap_display = SDL_getenv("EMUCAP_N64_DISPLAY");
++    window_flags = emucap_display && SDL_strcmp(emucap_display, "0") == 0
++        ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN;
+     if (flags & SDL_FULLSCREEN) {
+         window_flags |= SDL_WINDOW_FULLSCREEN;
+     }

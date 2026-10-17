@@ -1,62 +1,8 @@
-diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
---- a/Core/EmucapPacing.h
-+++ b/Core/EmucapPacing.h
-@@ -39,8 +39,26 @@
-     EmucapPacingSnapshot applied;
- };
- 
-+struct EmucapPacingApply {
-+    bool accepted;
-+    EmucapPacingSnapshot previous;
-+    EmucapPacingSnapshot applied;
-+};
-+
- class EmucapPacingOwner {
- public:
-+    EmucapPacingApply ApplySpeed(int percent) {
-+        std::lock_guard<std::mutex> guard(mutex_);
-+        const auto previous = policy_;
-+        if (percent < 0 || percent > 10000 || policy_.NetworkForced())
-+            return {false, previous, previous};
-+        policy_.percent = percent;
-+        policy_.fastForward = false;
-+        policy_.fpsLimit = FPSLimit::NORMAL;
-+        ++policy_.revision;
-+        return {true, previous, policy_};
-+
-+    }
-     EmucapPacingSnapshot Read() const {
-         std::lock_guard<std::mutex> guard(mutex_);
-         return policy_;
-diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
---- a/Core/HLE/sceDisplay.h
-+++ b/Core/HLE/sceDisplay.h
-@@ -37,6 +37,7 @@
- // emucap agent pacing: a percent of the PSP refresh used in place of the normal limit, 0 for
- // unlimited. Held keys, custom limits and fast-forward still take precedence.
- void __DisplaySetEmucapSpeed(int percent);
-+EmucapPacingApply __DisplayApplyEmucapSpeed(int percent);
- EmucapPacingSnapshot __DisplayGetEmucapPacing();
- void __DisplayInitializeEmucapPacing(bool fastForward);
- void __DisplaySetEmucapFastForward(bool value);
-diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
---- a/Core/HLE/sceDisplay.cpp
-+++ b/Core/HLE/sceDisplay.cpp
-@@ -411,6 +411,10 @@
-     emucapPacing.RestoreAdhoc(state, initialized, controlInitialized, next, connected, init, controlInit);
- }
- 
-+EmucapPacingApply __DisplayApplyEmucapSpeed(int percent) {
-+    return emucapPacing.ApplySpeed(percent);
-+}
-+
- void __DisplaySetEmucapSpeed(int percent) {
- 	emucapPacing.SetPercent(percent);
- }
 diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index b431638142..d5c7071ecf 100644
 --- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
-@@ -206,45 +206,50 @@
+@@ -205,45 +205,50 @@ void WebSocketSteppingState::CloseFrame() {
  // Response: percent (0 is unlimited), fast_forward, fps_limit (0 normal, 1/2 custom, 3 analog),
  // network_forced, revision (changes with any of these), vblank.
  void WebSocketSteppingState::Pacing(DebuggerRequest &req) {
@@ -146,3 +92,61 @@ diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebS
  }
  
  static DebugInterface *CPUFromRequest(DebuggerRequest &req, uint32_t *threadID = nullptr) {
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+index 28f305a866..5c2398c940 100644
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -41,8 +41,26 @@ struct EmucapPacingUpdate {
+     EmucapPacingSnapshot applied;
+ };
+ 
++struct EmucapPacingApply {
++    bool accepted;
++    EmucapPacingSnapshot previous;
++    EmucapPacingSnapshot applied;
++};
++
+ class EmucapPacingOwner {
+ public:
++    EmucapPacingApply ApplySpeed(int percent) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        const auto previous = policy_;
++        if (percent < 0 || percent > 10000 || policy_.NetworkForced())
++            return {false, previous, previous};
++        policy_.percent = percent;
++        policy_.fastForward = false;
++        policy_.fpsLimit = FPSLimit::NORMAL;
++        ++policy_.revision;
++        return {true, previous, policy_};
++
++    }
+     EmucapPacingSnapshot Read() const {
+         std::lock_guard<std::mutex> guard(mutex_);
+         return policy_;
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+index 30bf669114..b61d02d174 100644
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -440,6 +440,10 @@ void __DisplayRestoreEmucapAdhoc(int &state, bool &initialized, bool &controlIni
+     emucapPacing.RestoreAdhoc(state, initialized, controlInitialized, next, connected, init, controlInit);
+ }
+ 
++EmucapPacingApply __DisplayApplyEmucapSpeed(int percent) {
++    return emucapPacing.ApplySpeed(percent);
++}
++
+ void __DisplaySetEmucapSpeed(int percent) {
+ 	emucapPacing.SetPercent(percent);
+ }
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+index f22fbb404e..a3cce4448a 100644
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -42,6 +42,7 @@ double __DisplayGetFrameTimingLimit();
+ // emucap agent pacing: a percent of the PSP refresh used in place of the normal limit, 0 for
+ // unlimited. Held keys, custom limits and fast-forward still take precedence.
+ void __DisplaySetEmucapSpeed(int percent);
++EmucapPacingApply __DisplayApplyEmucapSpeed(int percent);
+ EmucapPacingSnapshot __DisplayGetEmucapPacing();
+ void __DisplayInitializeEmucapPacing(bool fastForward);
+ void __DisplaySetEmucapFastForward(bool value);

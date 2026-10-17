@@ -1,16 +1,8 @@
---- a/pcsx2/GS/GSState.h
-+++ b/pcsx2/GS/GSState.h
-@@ -126,6 +126,7 @@
- 	} m_tr;
- 
- protected:
-+	bool m_restored_display_pending[2] = {};
- 	static constexpr int INVALID_ALPHA_MINMAX = 500;
- 
- 	GSVertex m_v = {};
---- a/pcsx2/GS/GSState.cpp
-+++ b/pcsx2/GS/GSState.cpp
-@@ -148,6 +148,7 @@
+diff --git c/pcsx2/GS/GSState.cpp i/pcsx2/GS/GSState.cpp
+index e8b9f37..9d2f9db 100644
+--- c/pcsx2/GS/GSState.cpp
++++ i/pcsx2/GS/GSState.cpp
+@@ -151,6 +151,7 @@ std::string GSState::GetDrawDumpPath(const char* format, ...)
  
  void GSState::Reset(bool hardware_reset)
  {
@@ -18,7 +10,7 @@
  	Flush(GSFlushReason::RESET);
  
  	// FIXME: bios logo not shown cut in half after reset, missing graphics in GoW after first FMV
-@@ -2999,8 +3000,8 @@
+@@ -3560,8 +3561,8 @@ int GSState::Freeze(freezeData* fd, bool sizeonly)
  
  	Flush(GSFlushReason::SAVESTATE);
  
@@ -29,7 +21,7 @@
  
  	u8* data = fd->data;
  
-@@ -3223,6 +3224,7 @@
+@@ -3784,6 +3785,7 @@ int GSState::Defrost(const freezeData* fd)
  	g_perfmon.SetFrame(0);
  
  	ResetPCRTC();
@@ -37,46 +29,30 @@
  
  	return 0;
  }
---- a/pcsx2/GS/Renderers/HW/GSTextureCache.h
-+++ b/pcsx2/GS/Renderers/HW/GSTextureCache.h
-@@ -509,7 +509,7 @@
- 	Target* CreateTarget(GIFRegTEX0 TEX0, const GSVector2i& size, const GSVector2i& valid_size, float scale, int type, bool used = true, u32 fbmask = 0,
- 		bool is_frame = false, bool preload = GSConfig.PreloadFrameWithGSData, bool preserve_target = true,
- 		const GSVector4i draw_rc = GSVector4i::zero(), GSTextureCache::Source* src = nullptr);
--	Target* LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback);
-+	Target* LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback, bool restored_memory = false);
+diff --git c/pcsx2/GS/GSState.h i/pcsx2/GS/GSState.h
+index 1b45bc2..9bc672c 100644
+--- c/pcsx2/GS/GSState.h
++++ i/pcsx2/GS/GSState.h
+@@ -126,6 +126,7 @@ private:
+ 	} m_tr;
  
- 	/// Looks up a target in the cache, and only returns it if the BP/BW match exactly.
- 	Target* GetExactTarget(u32 BP, u32 BW, int type, u32 end_bp);
---- a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
-+++ b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
-@@ -3841,7 +3841,7 @@
- 	return hw_clear.value_or(false);
- }
+ protected:
++	bool m_restored_display_pending[2] = {};
+ 	static constexpr int INVALID_ALPHA_MINMAX = 500;
+ 	static constexpr int MAX_DRAW_BUFFERS = 3;
  
--GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback)
-+GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback, bool restored_memory)
- {
- 	Target* dst = LookupTarget(TEX0, size, scale, RenderTarget, true, 0, true);
- 	if (dst)
-@@ -3849,7 +3849,7 @@
- 
- 	// Didn't find a target, check if the frame was uploaded.
- 
--	bool can_create = is_feedback;
-+	bool can_create = is_feedback || restored_memory;
- 	GSVector2i new_size = size;
- 
- 	if (!is_feedback && GSRendererHW::GetInstance()->m_draw_transfers.size() > 0)
---- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
-+++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
-@@ -163,9 +163,12 @@
+diff --git c/pcsx2/GS/Renderers/HW/GSRendererHW.cpp i/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 98483f2..d4bd971 100644
+--- c/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ i/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -167,10 +167,13 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
  	TEX0.TBW = curFramebuffer.FBW;
  	TEX0.PSM = curFramebuffer.PSM;
  
 -	if (GSTextureCache::Target* rt = g_texture_cache->LookupDisplayTarget(TEX0, framebufferSize, GetTextureScaleFactor(), false))
 +	if (GSTextureCache::Target* rt = g_texture_cache->LookupDisplayTarget(TEX0, framebufferSize, GetTextureScaleFactor(), false, m_restored_display_pending[index]))
  	{
+ 		const u32 bp_adj = (TEX0.TBP0 < rt->m_TEX0.TBP0 && rt->UnwrappedEndBlock() > GS_MAX_BLOCKS) ? (TEX0.TBP0 + GS_MAX_BLOCKS) : TEX0.TBP0;
  		rt->Update();
 +		m_restored_display_pending[index] = false;
 +		if (i < 0)
@@ -84,3 +60,39 @@
  		t = rt->m_texture;
  		scale = rt->m_scale;
  
+diff --git c/pcsx2/GS/Renderers/HW/GSTextureCache.cpp i/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+index 440e279..8624a99 100644
+--- c/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
++++ i/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+@@ -3952,7 +3952,7 @@ bool GSTextureCache::PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, cons
+ 	return hw_clear.value_or(false);
+ }
+ 
+-GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback)
++GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback, bool restored_memory)
+ {
+ 	const u32 bp = TEX0.TBP0;
+ 
+@@ -4080,7 +4080,7 @@ GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, con
+ 
+ 	// Didn't find a target, check if the frame was uploaded.
+ 
+-	bool can_create = is_feedback;
++	bool can_create = is_feedback || restored_memory;
+ 	bool exact_match = false;
+ 	u32 exact_match_psm = 0;
+ 	GSVector2i new_size = size;
+diff --git c/pcsx2/GS/Renderers/HW/GSTextureCache.h i/pcsx2/GS/Renderers/HW/GSTextureCache.h
+index 605fe1d..4eae3e8 100644
+--- c/pcsx2/GS/Renderers/HW/GSTextureCache.h
++++ i/pcsx2/GS/Renderers/HW/GSTextureCache.h
+@@ -543,8 +543,7 @@ public:
+ 	Target* CreateTarget(GIFRegTEX0 TEX0, const GSVector2i& size, const GSVector2i& valid_size, float scale, int type, bool used = true,
+ 		u32 fbmask = 0, bool is_frame = false, bool preload = GSConfig.PreloadFrameWithGSData, bool preserve_target = true,
+ 		const GSVector4i draw_rc = GSVector4i::zero(), GSTextureCache::Source* src = nullptr);
+-
+-	Target* LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback);
++	Target* LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback, bool restored_memory = false);
+ 
+ 	Target* LookupDrawTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, int type, bool used = true, u32 fbmask = 0,
+ 		bool preload = GSConfig.PreloadFrameWithGSData, bool preserve_rgb = true, bool preserve_alpha = true,

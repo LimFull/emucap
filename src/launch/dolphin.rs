@@ -1,7 +1,7 @@
 //! Dolphin native-fork launch preparation for GameCube and Wii.
 //!
 //! Only builds carrying the sidecar produced by `adapters/dolphin/build.sh` or `build.ps1` are
-//! accepted. Each launch runs from an emucap-owned portable copy and uses a per-port `--user`
+//! accepted. Each launch runs from an emucap-owned portable copy and uses a generation-owned `--user`
 //! directory, leaving an installed Dolphin and its configuration untouched.
 
 use serde::{Deserialize, Serialize};
@@ -303,7 +303,7 @@ fn prepare_owned_directories(
     runtime_dir: &Path,
     user_dir: &Path,
 ) -> std::io::Result<()> {
-    let base = super::emu_home_base();
+    let base = super::emu_home_base()?;
     let reject_symlinks = || {
         for path in [home, runtime_dir, user_dir] {
             if super::has_symlink_component_under(&base, path) {
@@ -328,7 +328,23 @@ fn prepare_owned_directories(
 }
 
 pub fn prepare_runtime_binary(source_binary: &Path, port: u16) -> std::io::Result<PreparedRuntime> {
-    let home = super::emu_home_dir("dolphin", port);
+    prepare_runtime_binary_for_generation(source_binary, port, None)
+}
+
+fn prepare_runtime_binary_for_generation(
+    source_binary: &Path,
+    port: u16,
+    runtime: Option<super::RuntimeEnv<'_>>,
+) -> std::io::Result<PreparedRuntime> {
+    let home = super::emu_generation_dir("dolphin", port, runtime)?;
+    prepare_runtime_binary_in_home(source_binary, &home)
+}
+
+fn prepare_runtime_binary_in_home(
+    source_binary: &Path,
+    home: &Path,
+) -> std::io::Result<PreparedRuntime> {
+    let home = home.to_path_buf();
     let runtime_dir = home.join("runtime");
     let user_dir = home.join("user");
     prepare_owned_directories(&home, &runtime_dir, &user_dir)?;
@@ -370,16 +386,18 @@ pub fn prepare_runtime_binary(source_binary: &Path, port: u16) -> std::io::Resul
         let destination = runtime_dir.join(executable_name);
         super::copy_file_replace(source_binary, &destination)?;
         super::copy_adjacent_dlls(source_binary, &runtime_dir)?;
+        let source_dir = source_binary.parent().unwrap();
+        let system_data = source_dir.join("Sys");
+        if system_data.is_dir() {
+            super::copy_dir_replace(&system_data, &runtime_dir.join("Sys"))?;
+        }
         if source_binary
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
         {
-            let source_dir = source_binary.parent().unwrap();
-            for name in ["Sys", "QtPlugins"] {
-                let source = source_dir.join(name);
-                if source.is_dir() {
-                    super::copy_dir_replace(&source, &runtime_dir.join(name))?;
-                }
+            let plugins = source_dir.join("QtPlugins");
+            if plugins.is_dir() {
+                super::copy_dir_replace(&plugins, &runtime_dir.join("QtPlugins"))?;
             }
             let qt_config = source_dir.join("qt.conf");
             if qt_config.is_file() {
@@ -415,7 +433,8 @@ pub struct Launch<'a> {
 
 pub fn launch(launch: &Launch) -> std::io::Result<u32> {
     let host_build = read_build_metadata(launch.binary)?;
-    let portable = prepare_runtime_binary(launch.binary, launch.port)?;
+    let portable =
+        prepare_runtime_binary_for_generation(launch.binary, launch.port, launch.runtime)?;
     let opts = SpecOpts {
         content: launch.content,
         port: launch.port,

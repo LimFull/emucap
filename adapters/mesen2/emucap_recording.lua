@@ -554,9 +554,9 @@ local function read_movie(params, frames)
   end
   local file, open_error = io.open(params.path, "rb")
   if not file then return nil, "input_movie open failed: " .. tostring(open_error) end
-  local text = file:read("*a")
-  file:close()
-  if type(text) ~= "string" or #text ~= params.bytes or text:sub(-1) ~= "\n" then
+  local text = file:read(params.bytes + 1)
+  local closed = file:close()
+  if not closed or type(text) ~= "string" or #text ~= params.bytes or text:sub(-1) ~= "\n" then
     return nil, "input_movie size or terminal newline mismatch"
   end
 

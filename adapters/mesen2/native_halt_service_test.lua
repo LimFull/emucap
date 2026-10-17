@@ -11,18 +11,29 @@ local body = assert(source:match(
   "local function service_frozen_once%(%)\n(.-)\nend\n\n%-%- 최초 codeBreak"),
   "service_frozen_once body not found")
 
-local function count(pattern)
+local function count_in(source, pattern)
   local n = 0
-  for _ in body:gmatch(pattern) do n = n + 1 end
+  for _ in source:gmatch(pattern) do n = n + 1 end
   return n
 end
 
 assert(not body:match("while%s"), "native halt service must not contain a while loop")
 assert(not body:match("repeat%s"), "native halt service must not contain a repeat loop")
 assert(not body:match("emu%.step%(%s*1"), "instruction-stepping freeze loop must not return")
-assert(count("poll_line%(") == 1, "one callback must poll at most one request")
-assert(count("flush_tx%(") == 1, "one callback must flush TX at most once")
-assert(count("connect%(") == 1, "one callback must attempt reconnect at most once")
+local controlled, ordinary = body:match(
+  "(  if control and %(control:busy%(%) or control:owns_parent%(%)%) then\n.-\n  end)\n\n" ..
+  "(  %-%- 직전 explicit step.-)$")
+assert(controlled and ordinary,
+  "mutually exclusive controlled and ordinary service paths not found")
+assert(count_in(controlled, "poll_line%(") == 1,
+  "controlled service path must poll at most one request")
+assert(controlled:match("\n%s*return%s*\n%s*end$"),
+  "controlled service path must return before ordinary polling")
+local ordinary_polls = count_in(ordinary, "poll_line%(")
+assert(ordinary_polls == 1,
+  "ordinary service path must poll at most one request, found " .. ordinary_polls)
+assert(count_in(body, "flush_tx%(") == 1, "one callback must flush TX at most once")
+assert(count_in(body, "connect%(") == 1, "one callback must attempt reconnect at most once")
 assert(source:match("emu%.eventType%.codeBreakIdle"), "patched native idle event must be registered")
 assert(source:match("emu%.eventType%.codeBreakIdleSavestate"),
   "safe native halt savestate event must be registered")

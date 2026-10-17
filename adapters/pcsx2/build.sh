@@ -36,28 +36,67 @@ emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "PCSX2"
 SRC="$WORK/pcsx2"
 ORIGIN="${EMUCAP_PCSX2_SRC:-$PCSX2_REPO}"
 if [ ! -d "$SRC/.git" ]; then
-  git clone --filter=blob:none "$ORIGIN" "$SRC"
+  # Fetch the locked revision without making local shallow origins partial-clone promisors.
+  git init -q "$SRC"
+  git -C "$SRC" remote add origin "$ORIGIN"
 fi
-git -C "$SRC" fetch --depth 1 origin "$PCSX2_COMMIT"
+if ! git -C "$SRC" cat-file -e "$PCSX2_COMMIT^{commit}" 2>/dev/null; then
+  git -C "$SRC" fetch --depth 1 origin "$PCSX2_COMMIT"
+fi
+# A reused work tree still contains the previous locked patch stack. Restore that
+# stack against its own HEAD before switching revisions, then remove every file
+# introduced by the current locked patches. Build outputs remain untouched.
+if git -C "$SRC" rev-parse --verify HEAD >/dev/null 2>&1; then
+  git -C "$SRC" checkout -- .
+fi
+while IFS= read -r -d '' patch; do
+  while IFS= read -r added_file; do
+    case "$added_file" in
+      a/*|b/*|i/*|w/*) added_file="${added_file#*/}" ;;
+    esac
+    case "$added_file" in
+      /*|../*|*/../*|*/..|.)
+        echo "ERROR: patch adds a file outside the PCSX2 source tree: $added_file" >&2
+        exit 1
+        ;;
+      *) rm -f -- "$SRC/$added_file" ;;
+    esac
+  done < <(awk '/^--- \/dev\/null$/{getline; sub(/^\+\+\+ /, ""); print}' "$patch")
+done < <(find "$HERE/patches" -type f -name '*.patch' -print0 | LC_ALL=C sort -z)
 git -C "$SRC" checkout --detach "$PCSX2_COMMIT"
 git -C "$SRC" checkout -- \
   .github/workflows/scripts/windows/build-dependencies.bat \
-  3rdparty/winwil/include/wil/win32_helpers.h \
+  common/FileSystem.cpp \
+  cmake/BuildParameters.cmake \
   pcsx2/DebugTools/Breakpoints.cpp \
   pcsx2/DebugTools/Breakpoints.h \
+  pcsx2/GS/GS.cpp \
+  pcsx2/GS/GS.h \
+  pcsx2/GS/GSState.cpp \
+  pcsx2/GS/GSState.h \
+  pcsx2/GS/Renderers/Common/GSDevice.cpp \
+  pcsx2/GS/Renderers/Common/GSDevice.h \
+  pcsx2/GS/Renderers/Common/GSRenderer.cpp \
+  pcsx2/GS/Renderers/Common/GSRenderer.h \
   pcsx2/GS/Renderers/DX12/D3D12ShaderCache.h \
+  pcsx2/GS/Renderers/HW/GSRendererHW.cpp \
+  pcsx2/GS/Renderers/HW/GSTextureCache.cpp \
+  pcsx2/GS/Renderers/HW/GSTextureCache.h \
   pcsx2/Interpreter.cpp \
+  pcsx2/MTGS.cpp \
+  pcsx2/MTGS.h \
   pcsx2/PINE.cpp \
   pcsx2/PINE.h \
   pcsx2/Pcsx2Config.cpp \
-  pcsx2/SIO/Sio.cpp \
-  pcsx2/SIO/Sio.h \
   pcsx2/SIO/Pad/Pad.cpp \
   pcsx2/SIO/Pad/Pad.h \
+  pcsx2/SIO/Sio.cpp \
+  pcsx2/SIO/Sio.h \
+  pcsx2/SaveState.cpp \
   pcsx2/VMManager.cpp \
   pcsx2/VMManager.h \
-  pcsx2/x86/ix86-32/iR5900.cpp
-rm -f "$SRC/pcsx2/EmuCapFrameOperation.h"
+  pcsx2/x86/ix86-32/iR5900.cpp \
+  tests/ctest/common/filesystem_tests.cpp
 for patch in "$HERE"/patches/*.patch; do
   echo "applying $(basename "$patch")"
   git -C "$SRC" apply --check "$patch"
@@ -69,7 +108,9 @@ PATCHES_SRC="$WORK/pcsx2-patches"
 if [ ! -d "$PATCHES_SRC/.git" ]; then
   git clone --filter=blob:none --no-checkout "$PCSX2_PATCHES_REPO" "$PATCHES_SRC"
 fi
-git -C "$PATCHES_SRC" fetch --depth 1 origin "$PCSX2_PATCHES_COMMIT"
+if ! git -C "$PATCHES_SRC" cat-file -e "$PCSX2_PATCHES_COMMIT^{commit}" 2>/dev/null; then
+  git -C "$PATCHES_SRC" fetch --depth 1 origin "$PCSX2_PATCHES_COMMIT"
+fi
 git -C "$PATCHES_SRC" checkout --detach "$PCSX2_PATCHES_COMMIT"
 PATCHES_TREE="$(git -C "$PATCHES_SRC" rev-parse "$PCSX2_PATCHES_COMMIT:patches")"
 [ "$PATCHES_TREE" = "$PCSX2_PATCHES_TREE" ] || {
@@ -101,7 +142,7 @@ COMMON_ARGS=(
 )
 
 if [ "$(uname)" = "Darwin" ]; then
-  if ! xcrun --find metal >/dev/null 2>&1; then
+  if ! xcrun metal --version >/dev/null 2>&1; then
     echo "ERROR: Xcode's Metal Toolchain is required; run: xcodebuild -downloadComponent MetalToolchain" >&2
     exit 1
   fi
@@ -110,11 +151,26 @@ if [ "$(uname)" = "Darwin" ]; then
   unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
   export CC=/usr/bin/clang
   export CXX=/usr/bin/clang++
+  # Xcode 27 no longer accepts an 11.0 deployment target. Keep the dependency
+  # graph and the emulator bundle on one explicit target, and include it in the
+  # cache identity so a portable build can select another supported target.
+  PCSX2_MACOS_DEPLOYMENT_TARGET="${EMUCAP_PCSX2_MACOS_DEPLOYMENT_TARGET:-12.0}"
   DEPS="${EMUCAP_PCSX2_DEPS:-$WORK/deps-macos-x64}"
-  if [ ! -f "$DEPS/lib/cmake/Qt6/Qt6Config.cmake" ]; then
+  DEPS_SCRIPT="$SRC/.github/workflows/scripts/macos/build-dependencies.sh"
+  DEPS_SCRIPT_SHA256="$(shasum -a 256 -b "$DEPS_SCRIPT" | awk '{print $1}')"
+  DEPS_KEY="$PCSX2_COMMIT:$DEPS_SCRIPT_SHA256:$PCSX2_MACOS_DEPLOYMENT_TARGET"
+  DEPS_STAMP="$DEPS/.emucap-pcsx2-dependencies"
+  if [ ! -f "$DEPS/lib/cmake/Qt6/Qt6Config.cmake" ] ||
+     [ ! -f "$DEPS_STAMP" ] ||
+     [ "$(cat "$DEPS_STAMP" 2>/dev/null || true)" != "$DEPS_KEY" ]; then
     echo "building PCSX2's pinned x86_64 macOS dependencies"
-    BUILD_FFMPEG="${EMUCAP_PCSX2_BUILD_FFMPEG:-1}" \
-      "$SRC/.github/workflows/scripts/macos/build-dependencies.sh" "$DEPS"
+    (
+      cd "$WORK"
+      MACOSX_DEPLOYMENT_TARGET="$PCSX2_MACOS_DEPLOYMENT_TARGET" \
+        BUILD_FFMPEG="${EMUCAP_PCSX2_BUILD_FFMPEG:-1}" "$DEPS_SCRIPT" "$DEPS"
+    )
+    printf '%s\n' "$DEPS_KEY" >"$DEPS_STAMP.tmp"
+    mv "$DEPS_STAMP.tmp" "$DEPS_STAMP"
   fi
   LINK_FFMPEG=OFF
   if [ -e "$DEPS/lib/libavcodec.dylib" ] &&
@@ -125,6 +181,7 @@ if [ "$(uname)" = "Darwin" ]; then
   fi
   COMMON_ARGS+=(
     -DCMAKE_PREFIX_PATH="$DEPS"
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$PCSX2_MACOS_DEPLOYMENT_TARGET"
     -DCMAKE_OSX_ARCHITECTURES=x86_64
     -DCMAKE_APPLE_SILICON_PROCESSOR=x86_64
     -DDISABLE_ADVANCE_SIMD=ON
@@ -144,11 +201,6 @@ case "$(uname -s)" in
     cmake --build "$BUILD" --target pcsx2-qt -j "$JOBS"
     ;;
 esac
-if [ "$(uname)" = "Darwin" ]; then
-  # Relinking restores dependency-prefix paths. Redeploy the bundle before signing
-  # so its executable and plugins load the same Qt libraries.
-  cmake --build "$BUILD" --target pcsx2-postprocess-bundle -j "$JOBS"
-fi
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin emucap-pcsx2-bridge
 
 PCSX2_BIN=
@@ -185,6 +237,16 @@ PACKAGED_PATCHES_SHA256="$(shasum -a 256 "$PACKAGED_PATCHES" | awk '{print $1}')
 }
 
 METADATA="$(dirname "$PCSX2_BIN")/emucap-pcsx2-build.json"
+if [ "$(uname)" = "Darwin" ] && [[ "$PCSX2_BIN" == *.app/Contents/MacOS/* ]]; then
+  PCSX2_APP="$(dirname "$(dirname "$(dirname "$PCSX2_BIN")")")"
+  # Relinking restores dependency-prefix paths. Replace bundled libraries too:
+  # macdeployqt otherwise retains older files already present in the bundle.
+  rm -f -- "$METADATA"
+  "$DEPS/bin/macdeployqt" "$PCSX2_APP" -no-strip -always-overwrite
+fi
+
+# macdeployqt inspects every file already present beside the executable. Publish
+# build metadata only after deployment, then include it in the final signature.
 {
   printf '{\n'
   printf '  "upstream": "%s",\n' "$PCSX2_REPO"
@@ -199,7 +261,6 @@ METADATA="$(dirname "$PCSX2_BIN")/emucap-pcsx2-build.json"
 } >"$METADATA"
 
 if [ "$(uname)" = "Darwin" ] && [[ "$PCSX2_BIN" == *.app/Contents/MacOS/* ]]; then
-  PCSX2_APP="$(dirname "$(dirname "$(dirname "$PCSX2_BIN")")")"
   codesign \
     --force \
     --deep \

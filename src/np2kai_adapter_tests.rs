@@ -56,7 +56,14 @@ fn frame_counts_accept_hex_and_reject_unbounded_work() {
 
 #[test]
 fn state_identity_uses_a_stable_format_name() {
-    let identity = StateIdentity {
+    let identity = test_state_identity();
+    let encoded = serde_json::to_value(identity).unwrap();
+    assert_eq!(encoded["format"], "np2kai-libretro-state");
+    assert!(encoded.to_string().find("v1").is_none());
+}
+
+fn test_state_identity() -> StateIdentity {
+    StateIdentity {
         format: "np2kai-libretro-state".into(),
         system: "pc98".into(),
         target_os: "test".into(),
@@ -69,10 +76,85 @@ fn state_identity_uses_a_stable_format_name() {
         build_profile: "license-clean-libretro".into(),
         frontend_build: "b".into(),
         state_sha256: "s".into(),
-    };
-    let encoded = serde_json::to_value(identity).unwrap();
-    assert_eq!(encoded["format"], "np2kai-libretro-state");
-    assert!(encoded.to_string().find("v1").is_none());
+    }
+}
+
+#[test]
+fn state_file_admission_accepts_variable_sizes_within_the_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("valid.state");
+    fs::write(&state, b"state").unwrap();
+    fs::write(
+        state_sidecar(&state),
+        serde_json::to_vec(&test_state_identity()).unwrap(),
+    )
+    .unwrap();
+    let (bytes, identity) = operations::read_state_artifacts(&state, 5).unwrap();
+    assert_eq!(bytes, b"state");
+    assert_eq!(identity, test_state_identity());
+
+    assert!(matches!(
+        operations::read_state_artifacts(&state, 4),
+        Err(Np2kaiError::BadParams(message)) if message.contains("state file")
+    ));
+    // Serialization length belongs to the saved device state, not the live machine.
+    assert_eq!(
+        operations::read_state_artifacts(&state, 6).unwrap().0,
+        b"state"
+    );
+    let empty = root.path().join("empty.state");
+    fs::write(&empty, b"").unwrap();
+    assert!(matches!(
+        operations::read_state_artifacts(&empty, MAX_STATE_BYTES),
+        Err(Np2kaiError::BadParams(message)) if message.contains("empty")
+    ));
+
+    let oversized = root.path().join("oversized.state");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(MAX_STATE_BYTES + 1)
+        .unwrap();
+    assert!(operations::read_state_artifacts(&oversized, MAX_STATE_BYTES).is_err());
+
+    let oversized_sidecar_state = root.path().join("oversized-sidecar.state");
+    fs::write(&oversized_sidecar_state, b"x").unwrap();
+    std::fs::File::create(state_sidecar(&oversized_sidecar_state))
+        .unwrap()
+        .set_len(MAX_STATE_SIDECAR_BYTES + 1)
+        .unwrap();
+    assert!(matches!(
+        operations::read_state_artifacts(&oversized_sidecar_state, 1),
+        Err(Np2kaiError::BadParams(message)) if message.contains("state sidecar")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn state_file_admission_rejects_symlinks_and_special_files() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target.state");
+    fs::write(&target, b"state").unwrap();
+    let linked = root.path().join("linked.state");
+    symlink(&target, &linked).unwrap();
+    assert!(operations::read_state_artifacts(&linked, 5).is_err());
+
+    let state = root.path().join("sidecar-link.state");
+    fs::write(&state, b"state").unwrap();
+    let identity = root.path().join("identity.json");
+    fs::write(
+        &identity,
+        serde_json::to_vec(&test_state_identity()).unwrap(),
+    )
+    .unwrap();
+    symlink(&identity, state_sidecar(&state)).unwrap();
+    assert!(matches!(
+        operations::read_state_artifacts(&state, 5),
+        Err(Np2kaiError::BadParams(message)) if message.contains("state sidecar")
+    ));
+
+    assert!(operations::read_state_artifacts(Path::new("/dev/zero"), 5).is_err());
 }
 
 #[test]
@@ -117,6 +199,62 @@ fn snapshot_and_register_parameters_use_shared_debug_names() {
     assert!(debug::parse_snapshots(Some(&json!(["tvram:0x3fff:2"]))).is_err());
     assert_eq!(debug::normalize_register("cpu.sp").unwrap(), ("esp", 4));
     assert!(debug::normalize_register("made_up").is_err());
+}
+
+#[test]
+fn snapshot_admission_is_bounded() {
+    let exact = (0..debug::MAX_BREAKPOINT_SNAPSHOTS)
+        .map(|_| Value::String("tvram:0:0x400".into()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        debug::parse_snapshots(Some(&Value::Array(exact)))
+            .unwrap()
+            .len(),
+        debug::MAX_BREAKPOINT_SNAPSHOTS
+    );
+
+    let too_many = (0..=debug::MAX_BREAKPOINT_SNAPSHOTS)
+        .map(|_| Value::String("tvram:0:1".into()))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        debug::parse_snapshots(Some(&Value::Array(too_many))),
+        Err(Np2kaiError::BadParams(message)) if message.contains("at most 16")
+    ));
+    assert!(matches!(
+        debug::parse_snapshots(Some(&json!(["tvram:$0:0x2001", "tvram:0:8193"]))),
+        Err(Np2kaiError::BadParams(message)) if message.contains("byte total")
+    ));
+}
+
+#[test]
+fn pending_event_queue_evicts_oldest_and_accounts_for_all_drops() {
+    let mut pending = VecDeque::new();
+    let mut host_dropped = 0;
+    for sequence in 0..=MAX_PENDING_EVENTS {
+        debug::enqueue_pending_event(
+            &mut pending,
+            &mut host_dropped,
+            json!({"breakpoint_id": sequence % 2, "sequence": sequence}),
+        );
+    }
+    assert_eq!(pending.len(), MAX_PENDING_EVENTS);
+    assert_eq!(pending.front().unwrap()["sequence"], 1);
+    assert_eq!(host_dropped, 1);
+
+    let selected = debug::take_pending_events(&mut pending, Some(1));
+    assert_eq!(selected.len(), MAX_PENDING_EVENTS / 2);
+    assert!(selected.iter().all(|event| event["breakpoint_id"] == 1));
+    assert_eq!(pending.len(), MAX_PENDING_EVENTS / 2);
+    assert!(pending.iter().all(|event| event["breakpoint_id"] == 0));
+
+    assert_eq!(debug::take_combined_event_drops(&mut host_dropped, 7), 8);
+    assert_eq!(host_dropped, 0);
+    host_dropped = u64::MAX;
+    assert_eq!(
+        debug::take_combined_event_drops(&mut host_dropped, 1),
+        u64::MAX
+    );
+    assert_eq!(host_dropped, 0);
 }
 
 #[test]
@@ -309,6 +447,7 @@ fn live_np2kai_host() -> LiveNp2kaiFixture {
     let host = Np2kaiHost::open(
         &hdi,
         &core,
+        field("core_sha256"),
         &firmware,
         runtime.path(),
         field("commit"),
@@ -338,4 +477,27 @@ fn file_identity_hashing_fits_a_small_host_thread_stack() {
         .join()
         .unwrap();
     assert_eq!(observed, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_state_output_does_not_follow_predictable_partial_or_destination_links() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("state.bin");
+    let victim = root.path().join("victim");
+    fs::write(&victim, b"keep").unwrap();
+    let old_partial = root
+        .path()
+        .join(format!(".state.bin.partial-{}", std::process::id()));
+    symlink(&victim, &old_partial).unwrap();
+    atomic_write(&destination, b"new").unwrap();
+    atomic_write(&destination, b"replacement").unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    fs::remove_file(&destination).unwrap();
+    symlink(&victim, &destination).unwrap();
+    assert!(atomic_write(&destination, b"bad").is_err());
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    assert!(atomic_write(root.path(), b"bad").is_err());
 }

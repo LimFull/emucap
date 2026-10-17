@@ -22,25 +22,45 @@ fn main() -> anyhow::Result<()> {
         Some(raw) => Some(parse_endpoint(raw).context("invalid ARM7 GDB endpoint")?),
         None => None,
     };
+    let bridge_env = GdbBridgeEnv::from_process_env();
+    bridge_env
+        .session_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow!("EMUCAP_SESSION_TOKEN must be set and non-empty for the emucap control session")
+        })?;
+    let native_debug_token = std::env::var("EMUCAP_NATIVE_DEBUG_TOKEN")
+        .context("EMUCAP_NATIVE_DEBUG_TOKEN is required for DeSmuME GDB authentication")?;
+    if native_debug_token.is_empty() {
+        return Err(anyhow!(
+            "EMUCAP_NATIVE_DEBUG_TOKEN must be non-empty for DeSmuME GDB authentication"
+        ));
+    }
 
     eprintln!(
         "[desmume-nds-rust] connecting arm9={arm9_host}:{arm9_port} emucap=127.0.0.1:{emucap_port}"
     );
-    let arm9 = GdbRspClient::connect(
+    let mut arm9 = GdbRspClient::connect(
         &arm9_host,
         arm9_port,
         Duration::from_secs(5),
         Duration::from_secs(30),
     )
     .with_context(|| format!("connect ARM9 GDB stub at {arm9_host}:{arm9_port}"))?;
+    arm9.authenticate(&native_debug_token)
+        .context("authenticate ARM9 GDB stub")?;
 
     let arm7 = match &arm7_endpoint {
         Some((host, port)) => {
             eprintln!("[desmume-nds-rust] connecting arm7={host}:{port}");
-            Some(
+            let mut client =
                 GdbRspClient::connect(host, *port, Duration::from_secs(5), Duration::from_secs(30))
-                    .with_context(|| format!("connect ARM7 GDB stub at {host}:{port}"))?,
-            )
+                    .with_context(|| format!("connect ARM7 GDB stub at {host}:{port}"))?;
+            client
+                .authenticate(&native_debug_token)
+                .context("authenticate ARM7 GDB stub")?;
+            Some(client)
         }
         None => {
             eprintln!("[desmume-nds-rust] no ARM7 endpoint; arm7 memory/cpu routing disabled");
@@ -48,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let mut bridge = NdsBridge::new(arm9, arm7, GdbBridgeEnv::from_process_env());
+    let mut bridge = NdsBridge::new(arm9, arm7, bridge_env);
     let dependency =
         ProcessDependency::from_process_env().context("load emulator process dependency")?;
 
@@ -115,5 +135,17 @@ fn parse_endpoint(raw: &str) -> anyhow::Result<(String, u16)> {
     if host.is_empty() {
         return Err(anyhow!("GDB host is empty"));
     }
-    Ok((host.into(), parse_port(port)?))
+    let address = host
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| anyhow!("GDB host must be a numeric loopback address, got {host:?}"))?;
+    if !address.is_loopback() {
+        return Err(anyhow!(
+            "GDB host must be loopback so the native debugger credential is never sent off-host"
+        ));
+    }
+    Ok((address.to_string(), parse_port(port)?))
 }
+
+#[cfg(test)]
+#[path = "emucap-desmume-nds-bridge/tests.rs"]
+mod tests;

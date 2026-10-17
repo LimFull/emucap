@@ -1,0 +1,61 @@
+--- a/src/main/savestates.c
++++ b/src/main/savestates.c
+@@ -1567,6 +1567,20 @@
+     return ret;
+ }
+ 
++/* Installed before execution. Called only by the emulation thread after a
++ * safe state job, independently of the asynchronous persistence worker. */
++static void (*emucap_state_boundary_callback)(void);
++EXPORT m64p_error CALL CoreEmucapSetStateBoundaryCallback(unsigned int version, void (*callback)(void))
++{
++    if (version != 1) return M64ERR_INPUT_INVALID;
++    emucap_state_boundary_callback = callback;
++    return M64ERR_SUCCESS;
++}
++void savestates_emucap_boundary(void)
++{
++    if (emucap_state_boundary_callback) emucap_state_boundary_callback();
++}
++
+ static void savestates_save_m64p_work(struct work_struct *work)
+ {
+     gzFile f;
+--- a/src/main/savestates.h
++++ b/src/main/savestates.h
+@@ -48,6 +48,7 @@
+ int savestates_load(void);
+ int savestates_prepare_load(const char *path);
+ int savestates_save(void);
++void savestates_emucap_boundary(void);
+ 
+ void savestates_select_slot(unsigned int s);
+ unsigned int savestates_get_slot(void);
+--- a/src/device/r4300/interrupt.c
++++ b/src/device/r4300/interrupt.c
+@@ -545,6 +545,7 @@
+         if (savestates_get_job() == savestates_job_load)
+         {
+             savestates_load();
++            savestates_emucap_boundary();
+             return;
+         }
+ 
+@@ -660,6 +661,7 @@
+         if (savestates_get_job() == savestates_job_save)
+         {
+             savestates_save();
++            savestates_emucap_boundary();
+             return;
+         }
+     }
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -44,6 +44,7 @@
+ CoreEmucapPacing;
+ CoreEmucapInput;
+ CoreEmucapSetPollCallback;
++CoreEmucapSetStateBoundaryCallback;
+ DebugBreakpointCommand;
+ DebugBreakpointLookup;
+ DebugBreakpointTriggeredBy;

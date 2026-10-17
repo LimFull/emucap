@@ -6,6 +6,7 @@ use super::{
 };
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use std::path::PathBuf;
 
 struct Host {
     caps: Capabilities,
@@ -15,6 +16,7 @@ struct Host {
     cancel_at_observation: Option<(usize, super::link::RequestCancellation)>,
     observations: usize,
     wrong_artifact: bool,
+    replace_export_with_directory: Option<PathBuf>,
 }
 fn halt() -> Value {
     json!({"cpu":"main", "kind":"main_cpu_instruction", "boundary":"instruction_boundary", "pc":33000,"program_bank":128,
@@ -58,6 +60,9 @@ impl EmulatorLink for Host {
                 self.captures += 1;
                 if self.timeout {
                     return Err(LinkError::Timeout);
+                }
+                if let Some(path) = self.replace_export_with_directory.take() {
+                    std::fs::create_dir(path).unwrap();
                 }
                 Ok(
                     json!({"state":"frozen","boundary":"instruction_boundary","format":"mesen-savestate",
@@ -106,6 +111,7 @@ fn fixture() -> (tempfile::TempDir, RuntimeStore, Host) {
             cancel_at_observation: None,
             observations: 0,
             wrong_artifact: false,
+            replace_export_with_directory: None,
         },
     )
 }
@@ -147,6 +153,23 @@ fn instruction_receipt_needs_no_recording_and_survives_loss_of_live_host() {
     std::fs::write(&dest, b"substitution").unwrap();
     assert!(snapshot::verify_in_store(&store, "anchor", Some(path), None).is_err());
 }
+
+#[test]
+fn existing_snapshot_key_can_be_observed_after_its_optional_export_parent_is_removed() {
+    let (d, store, mut host) = fixture();
+    let export_parent = d.path().join("export");
+    std::fs::create_dir(&export_parent).unwrap();
+    let destination = export_parent.join("state.mss");
+    let path = destination.to_str().unwrap();
+    let saved = value(snapshot::save_in_store(&mut host, path, "retained", &store).unwrap());
+    assert_eq!(saved["status"], "completed");
+    std::fs::remove_file(&destination).unwrap();
+    std::fs::remove_dir(&export_parent).unwrap();
+
+    let observed = value(snapshot::save_in_store(&mut host, path, "retained", &store).unwrap());
+    assert_eq!(observed["status"], "verified");
+    assert_eq!(host.captures, 1);
+}
 #[test]
 fn unsafe_halt_and_uncertain_capture_do_not_replace_or_retry() {
     let (d, store, mut host) = fixture();
@@ -170,7 +193,7 @@ fn unsafe_halt_and_uncertain_capture_do_not_replace_or_retry() {
 fn issued_pair_survives_export_failure_and_detects_corruption() {
     let (d, store, mut host) = fixture();
     let dest = d.path().join("destination-directory");
-    std::fs::create_dir(&dest).unwrap();
+    host.replace_export_with_directory = Some(dest.clone());
     let result = value(
         snapshot::save_in_store(&mut host, dest.to_str().unwrap(), "export-failed", &store)
             .unwrap(),

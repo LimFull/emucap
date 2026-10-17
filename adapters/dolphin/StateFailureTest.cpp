@@ -74,6 +74,37 @@ int main()
     assert(failed.HasError());
   }
 
+  // Truncated reads fail before advancing outside the supplied buffer. A failed read
+  // cannot turn into a successful Measure pass or expose an external payload.
+  for (size_t length = 0; length < sizeof(u32); ++length)
+  {
+    cursor = storage.data();
+    PointerWrap truncated(&cursor, length, PointerWrap::Mode::Read);
+    value = 17;
+    truncated.Do(value);
+    assert(truncated.HasError() && value == 17 && cursor == storage.data());
+    assert(!truncated.GetRemainingReadBytes());
+    assert(!truncated.DoExternal(value));
+    assert(cursor == storage.data());
+  }
+  value = std::numeric_limits<u32>::max();
+  cursor = storage.data();
+  PointerWrap write_count(&cursor, storage.size(), PointerWrap::Mode::Write);
+  write_count.Do(value);
+  cursor = storage.data();
+  PointerWrap external(&cursor, storage.size(), PointerWrap::Mode::Read);
+  assert(!external.DoExternal(value) && external.HasError());
+  assert(cursor == storage.data() + sizeof(value));
+  cursor = storage.data();
+  PointerWrap empty_payload(&cursor, storage.size(), PointerWrap::Mode::Write);
+  value = 0;
+  assert(empty_payload.DoExternal(value) == storage.data() + sizeof(value));
+  cursor = storage.data();
+  PointerWrap reader(&cursor, sizeof(value), PointerWrap::Mode::Read);
+  assert(reader.GetRemainingReadBytes()->size() == sizeof(value));
+  assert(reader.DoExternal(value) == storage.data() + sizeof(value));
+  assert(!reader.HasError() && reader.GetRemainingReadBytes()->empty());
+
   std::array<char, 4> result{9, 9, 9, 9};
   const MathUtil::Rectangle<int> rect{0, 0, 1, 1};
   Readback unavailable(false);

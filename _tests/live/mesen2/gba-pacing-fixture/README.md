@@ -12,7 +12,7 @@ reachable without changing the producer's safe-save rules.
 | `0x02000000` | VBlank count, little-endian u32 |
 | `0x02000004` | Fields with A held, little-endian u32 |
 
-For `tap(a, press_frames=p, after_frames=q)`, counter deltas are `(p+1+q, p)`.
+For `tap(a, press_frames=p, after_frames=q)`, counter deltas are `(p+q, p)`.
 Without input the second delta is zero. Counters wrap modulo 2^32.
 
 A user-supplied GBA ROM supplies the boot header only. The entry instruction, title,

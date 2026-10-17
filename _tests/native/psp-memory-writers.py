@@ -57,12 +57,12 @@ support = r'''
 using u32=uint32_t; using u64=uint64_t; using s64=int64_t; using u8=uint8_t;
 enum {CORE_RUNNING_CPU,CORE_STEPPING_CPU,CORE_RUNTIME_ERROR,CORE_POWERDOWN};
 int coreState=CORE_STEPPING_CPU;
-namespace CoreTiming { u64 GetTicks(){return 0;} }
+namespace CoreTiming { u64 GetTicks(void * = nullptr){return 0;} }
 u64 usToCycles(int n){return n;}
 struct PointerWrap { int Section(const char*,int,int){return 2;} };
 template<class T> void Do(PointerWrap&,T&){}
 #define ERROR_LOG_REPORT(...) ((void)0)
-struct Mips { void InvalidateICache(u32,int){assert(false && "fence must not consume results");} } mips;
+struct Mips { void InvalidateICache(u32,int){assert(false && "fence must not consume results");} void InvalidateICacheRangeImmediate(u32 a,int n){InvalidateICache(a,n);} } mips;
 auto currentMIPS=&mips;
 struct FileSystem {
  std::mutex mutex; std::condition_variable cv; bool entered=false,released=false;

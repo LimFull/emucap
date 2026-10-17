@@ -9,7 +9,10 @@ pub(crate) fn make_stop(
     link: &mut (dyn EmulatorLink + Send),
     args: &StopArgs,
 ) -> serde_json::Value {
-    make_stop_with_store(link, args, &RuntimeStore::discover())
+    match RuntimeStore::discover() {
+        Ok(store) => make_stop_with_store(link, args, &store),
+        Err(error) => serde_json::json!({"stopped": false, "error": error.to_string()}),
+    }
 }
 
 fn make_stop_with_store(

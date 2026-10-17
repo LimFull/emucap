@@ -34,7 +34,11 @@ pub fn save_state_for_recording(
     link: &mut dyn EmulatorLink,
     path: &str,
 ) -> Result<ToolOutput, LinkError> {
-    save_state_in_store(link, path, RuntimeStore::discover())
+    save_state_in_store(
+        link,
+        path,
+        RuntimeStore::discover().map_err(|error| LinkError::Protocol(error.to_string()))?,
+    )
 }
 
 pub(crate) fn save_state_in_store(
@@ -64,7 +68,9 @@ pub(crate) fn save_state_in_store(
         .map_err(|error| LinkError::Protocol(format!("runtime identity read failed: {error}")))?
         .ok_or_else(|| LinkError::Protocol("runtime generation is missing".into()))?;
     if identity.launch_id.as_deref() != Some(current.launch_id.as_str())
-        || identity.content.as_deref() != Some(current.content.as_str())
+        || identity.content.as_deref().is_none_or(|content| {
+            !crate::content_identity::same_content_path(&current.content, content)
+        })
     {
         return Err(LinkError::Protocol(
             "save_state receipt requires an exactly bound live generation".into(),

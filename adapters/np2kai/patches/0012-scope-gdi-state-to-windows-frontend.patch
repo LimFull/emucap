@@ -1,0 +1,20 @@
+--- a/wab/cirrus_vga.c
++++ b/wab/cirrus_vga.c
+@@ -5474,7 +5474,7 @@
+ 	}
+ }
+ 
+-#if defined(_WIN32)
++#if defined(NP2_WIN)
+ static HPALETTE cirrusvga_hPalette = NULL;
+ static HPALETTE cirrusvga_oldPalette = NULL;
+ #endif
+@@ -5492,7 +5492,7 @@
+ #endif
+ 	int i, j, width, height, bpp;
+ 	uint32_t_ line_offset = 0;
+-#if defined(_WIN32)
++#if defined(NP2_WIN)
+ 	LOGPALETTE * lpPalette;
+ 	HDC hdc = np2wabwnd.hDCBuf;
+ #endif

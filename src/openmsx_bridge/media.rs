@@ -61,7 +61,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         if self.session.media.kind != MediaKind::Disk || self.disk_ejected {
             return Ok(json!({"device":"diska", "mounted":false}));
         }
-        let mut scratch = StateScratch::new(&self.session)?;
+        let mut scratch = StateScratch::new(&self.runtime_home)?;
         self.control.command(&format!(
             "diskmanipulator savedsk diska {}",
             tcl_utf8_value(&scratch.disk())?
@@ -119,7 +119,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
                     ));
                 }
             }
-            let scratch = StateScratch::new(&self.session)?;
+            let scratch = StateScratch::new(&self.runtime_home)?;
             fs::write(scratch.disk(), &bytes)?;
             inserted = json!({"path":scratch.disk(), "source_path":path, "sha1":digest,
                 "size":bytes.len(), "identity_scope":"inserted bytes"});

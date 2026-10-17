@@ -16,6 +16,11 @@ fn request(label: &str, length: u64) -> InitialSnapshotRequest {
 #[test]
 fn authenticated_member_sink_accepts_exact_ordered_binary_members() {
     let server = MemberSinkServer::spawn("capture-test", &[request("wram", 4)], 1000).unwrap();
+    let _silent_peer = TcpStream::connect(&server.endpoint).unwrap();
+    let mut wrong_peer = TcpStream::connect(&server.endpoint).unwrap();
+    wrong_peer
+        .write_all(b"{\"token\":\"wrong\",\"capture_id\":\"capture-test\"}\n")
+        .unwrap();
     let mut stream = TcpStream::connect(&server.endpoint).unwrap();
     writeln!(
         stream,

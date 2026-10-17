@@ -1,0 +1,134 @@
+diff --git a/Core/WebServer.cpp b/Core/WebServer.cpp
+index 03a068285f..188b8df4a0 100644
+--- a/Core/WebServer.cpp
++++ b/Core/WebServer.cpp
+@@ -18,6 +18,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <condition_variable>
++#include <cstdlib>
+ #include <mutex>
+ #include <thread>
+ #include <string_view>
+@@ -62,6 +63,7 @@ static WebServerFlags serverFlags;
+ // See WebServerSetRequireExactPort(). Atomic because it's set from whichever thread parsed the
+ // command line, and read from the server thread.
+ static std::atomic<bool> serverRequireExactPort;
++static bool serverLoopbackOnly;
+ 
+ std::mutex g_webServerLock;
+ static Path g_uploadPath;  // TODO: Supply this through registration instead.
+@@ -524,6 +526,43 @@ static void HandleFallback(const http::ServerRequest &request) {
+ 	request.Out()->Push(payload);
+ }
+ 
++static bool EmucapDebuggerRequestAuthenticated(const http::ServerRequest &request) {
++	static constexpr char AUTH_PREFIX[] = "Bearer ";
++	static constexpr char MANAGED_ORIGIN[] = "https://emucap.invalid";
++	static constexpr size_t MAX_TOKEN_BYTES = 512;
++
++	const char *expected = getenv("EMUCAP_NATIVE_DEBUG_TOKEN");
++	if (expected == nullptr || expected[0] == '\0') {
++		return false;
++	}
++	size_t expectedLen = 0;
++	while (expectedLen <= MAX_TOKEN_BYTES && expected[expectedLen] != '\0') {
++		expectedLen++;
++	}
++	if (expectedLen == 0 || expectedLen > MAX_TOKEN_BYTES) {
++		return false;
++	}
++
++	std::string origin;
++	std::string authorization;
++	if (!request.GetHeader("origin", &origin) || origin != MANAGED_ORIGIN ||
++		!request.GetHeader("authorization", &authorization)) {
++		return false;
++	}
++	const size_t prefixLen = sizeof(AUTH_PREFIX) - 1;
++	if (authorization.size() != prefixLen + expectedLen ||
++		authorization.compare(0, prefixLen, AUTH_PREFIX) != 0) {
++		return false;
++	}
++
++	unsigned int difference = 0;
++	for (size_t i = 0; i < expectedLen; i++) {
++		difference |= static_cast<unsigned char>(authorization[prefixLen + i]) ^
++			static_cast<unsigned char>(expected[i]);
++	}
++	return difference == 0;
++}
++
+ static void ForwardDebuggerRequest(const http::ServerRequest &request) {
+ 	SetCurrentThreadName("ForwardDebuggerRequest");
+ 
+@@ -539,7 +578,11 @@ static void ForwardDebuggerRequest(const http::ServerRequest &request) {
+ 
+ 		// Yes - proceed with the socket.
+ 		if (strcasecmp(upgrade.c_str(), "websocket") == 0) {
+-			HandleDebuggerRequest(request);
++			if (EmucapDebuggerRequestAuthenticated(request)) {
++				HandleDebuggerRequest(request);
++			} else {
++				request.WriteHttpResponseHeader("1.1", 403, 0, "text/plain", "Cache-Control: no-store\r\n");
++			}
+ 		} else {
+ 			RedirectToDebugger(request);
+ 		}
+@@ -837,8 +880,16 @@ static void WebServerThread() {
+ 	// (the debugger's confinement wins over disc reach). The loopback decision must NOT depend on
+ 	// DISCS: with DEBUGGER|DISCS both set, that would flip to a wildcard bind and re-expose /debugger. emucap
+ 	// only ever enables DEBUGGER (headless main), so disc sharing is moot here; this is defense in depth.
+-	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) != 0;
++	const bool loopbackOnly = serverLoopbackOnly;
+ 	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
++		// A managed debugger port is an identity boundary: falling back to an
++		// ephemeral port would let an unrelated listener on the requested port
++		// receive the bridge's bearer credential. Fail the process before the
++		// managed launcher can release that credential to the wrong listener.
++		if (loopbackOnly && g_Config.iRemoteISOPort != 0) {
++			ERROR_LOG(Log::FileSystem, "Unable to listen on requested debugger port %d", g_Config.iRemoteISOPort);
++			std::exit(EXIT_FAILURE);
++		}
+ 		if (serverRequireExactPort) {
+ 			// Someone asked for this specific port (--debugger=PORT) - see
+ 			// WebServerSetRequireExactPort(). Coming up on a different one would just look like
+@@ -863,7 +914,7 @@ static void WebServerThread() {
+ 	g_Config.iRemoteISOPort = http->Port();
+ 	UpdateStatus(ServerStatus::RUNNING);
+ 
+-	RegisterServer(http->Port());
++	if (!loopbackOnly) RegisterServer(http->Port());
+ 	double lastRegister = time_now_d();
+ 
+ 	// NOTICE rather than INFO on purpose: with --debugger=0 the port is picked for us, and this
+@@ -881,7 +932,7 @@ static void WebServerThread() {
+ 		constexpr double webServerSliceSeconds = 0.2f;
+ 		http->RunSlice(webServerSliceSeconds);
+ 		double now = time_now_d();
+-		if (now > lastRegister + 540.0) {
++		if (!loopbackOnly && now > lastRegister + 540.0) {
+ 			RegisterServer(http->Port());
+ 			lastRegister = now;
+ 		}
+@@ -907,6 +958,12 @@ bool StartWebServer(WebServerFlags flags) {
+ 	std::lock_guard<std::mutex> guard(serverStatusLock);
+ 	switch (serverStatus) {
+ 	case ServerStatus::RUNNING:
++		// The listener cannot be safely rebound in place. Never add the debugger to
++		// a server whose immutable initial bind is reachable beyond loopback.
++		if ((flags & WebServerFlags::DEBUGGER) && !serverLoopbackOnly) {
++			WARN_LOG(Log::HTTP, "Refusing to add debugger to a non-loopback web server");
++			return false;
++		}
+ 		if (((int)serverFlags & (int)flags) == (int)flags) {
+ 			// Already running with these flags.
+ 			return false;
+@@ -921,6 +978,7 @@ bool StartWebServer(WebServerFlags flags) {
+ 	case ServerStatus::STOPPED:
+ 		serverStatus = ServerStatus::STARTING;
+ 		serverFlags = flags;
++		serverLoopbackOnly = flags & WebServerFlags::DEBUGGER;
+ 		serverThread = std::thread(&WebServerThread);
+ 		return true;
+ 

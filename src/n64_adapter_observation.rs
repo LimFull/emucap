@@ -285,7 +285,7 @@ impl Mupen64PlusHost {
         outcome.map_err(|error| {
             if unchanged_rejection { return error; }
             CONTROL_UNVERIFIED.store(true, Ordering::Release);
-            let domain = if self.display { "n64.rendered_frame" } else { "n64.vi" };
+            let domain = "n64.rendered_frame";
             N64Error::BadState(format!("execution_speed unverified: {error}; last verified policy: {}; pre-command frame: {frame_before}; current frame: {}; frame domain: {domain}; native transaction: {native_result:?}; guest progress may have occurred", before.public(), self.public_frame()))
         })
     }
@@ -345,7 +345,7 @@ impl Mupen64PlusHost {
                 "stop_epoch": epoch,
                 "memory_mapping_epoch": epoch,
                 "clocks": [{
-                    "domain": if self.display { "n64.rendered_frame" } else { "n64.vi" },
+                    "domain": "n64.rendered_frame",
                     "value": frame,
                 }],
             },

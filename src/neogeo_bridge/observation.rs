@@ -214,16 +214,22 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     /// Arms a plugin host deadline for a paced frame wait and returns the socket timeout covering
-    /// it; without pacing support the fixed per-frame estimate applies.
+    /// it. Readback/deadline support is independent of permission to mutate pacing settings.
     pub(super) fn frame_wait_timeout(&mut self, frames: u64) -> BridgeResult<Duration> {
         let fixed = FRAME_OPERATION_STARTUP_MS
             .saturating_add(frames.saturating_mul(FRAME_OPERATION_BUDGET_MS));
-        if !mame::supports_pacing(&self.mame_features()) {
+        let features = self.mame_features();
+        if !mame::supports_pacing_readback(&features)
+            && !mame::supports_operation_deadline(&features)
+        {
             return Ok(Duration::from_millis(fixed));
         }
-        let per_frame = self
-            .native_pacing()?
-            .frame_budget_ms(FRAME_OPERATION_BUDGET_MS);
+        let per_frame = if mame::supports_pacing_readback(&features) {
+            self.native_pacing()?
+                .frame_budget_ms(FRAME_OPERATION_BUDGET_MS)
+        } else {
+            FRAME_OPERATION_BUDGET_MS
+        };
         let budget = crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64 - 5_000;
         let deadline = FRAME_OPERATION_STARTUP_MS
             .saturating_add(frames.saturating_mul(per_frame))

@@ -53,7 +53,15 @@ pub struct Case {
 }
 
 pub const CASE_FORMAT_VERSION: u32 = 1;
-const MAX_CASE_JSON_BYTES: u64 = 1024 * 1024;
+pub const MAX_CASE_JSON_BYTES: u64 = 1024 * 1024;
+pub const MAX_SUITE_CASES: usize = 256;
+pub const MAX_SUITE_ENTRIES: usize = 1024;
+pub const MAX_SUITE_CASE_JSON_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SUITE_MOVIE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_REGRESSION_MOVIE_BYTES: u64 = 1024 * 1024;
+pub const MAX_REGRESSION_MOVIE_ROWS: usize = 5_000;
+pub const MAX_REGRESSION_ADVANCES: u64 = crate::live::temporal::MAX_SYNC_ADVANCE_COUNT;
+pub const MAX_DETERMINISM_ADVANCES: u64 = MAX_REGRESSION_ADVANCES * 5;
 
 /// 한 케이스의 판정 결과. 신호(pass/fail)와 무효(나머지)를 구분. 미래 무효 사유는 변형 추가.
 #[derive(Debug, Clone, PartialEq)]
@@ -199,14 +207,19 @@ pub fn save_case(dir: &Path, case: &Case) -> std::io::Result<()> {
 
 /// dir/case.json을 읽는다.
 pub fn load_case(dir: &Path) -> Result<Case, String> {
+    load_case_with_size(dir).map(|(case, _)| case)
+}
+
+fn load_case_with_size(dir: &Path) -> Result<(Case, u64), String> {
     let path = dir.join("case.json");
     let bytes =
         crate::path_safety::read_bounded_regular_member(dir, "case.json", MAX_CASE_JSON_BYTES)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+    let byte_len = u64::try_from(bytes.len()).map_err(|_| "case.json is too large".to_string())?;
     let case: Case =
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     validate_case_file_references(&case)?;
-    Ok(case)
+    Ok((case, byte_len))
 }
 
 /// 스위트 디렉토리의 하위 디렉토리마다 case.json을 로드한다(디렉토리명 = 케이스 폴더).
@@ -215,7 +228,12 @@ pub fn load_suite(suite_dir: &Path) -> Result<Vec<(PathBuf, Case)>, String> {
     let entries =
         std::fs::read_dir(suite_dir).map_err(|e| format!("{}: {e}", suite_dir.display()))?;
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for entry in entries {
+    for (entry_index, entry) in entries.enumerate() {
+        if entry_index >= MAX_SUITE_ENTRIES {
+            return Err(format!(
+                "regression suite exceeds {MAX_SUITE_ENTRIES} directory entries"
+            ));
+        }
         let entry = entry.map_err(|e| e.to_string())?;
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         if file_type.is_symlink() {
@@ -230,6 +248,9 @@ pub fn load_suite(suite_dir: &Path) -> Result<Vec<(PathBuf, Case)>, String> {
         let case_path = entry.path().join("case.json");
         match std::fs::symlink_metadata(&case_path) {
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                if dirs.len() >= MAX_SUITE_CASES {
+                    return Err(format!("regression suite exceeds {MAX_SUITE_CASES} cases"));
+                }
                 dirs.push(entry.path())
             }
             Ok(_) => {}
@@ -238,8 +259,17 @@ pub fn load_suite(suite_dir: &Path) -> Result<Vec<(PathBuf, Case)>, String> {
         }
     }
     dirs.sort();
+    let mut total_case_bytes = 0u64;
     for d in dirs {
-        let case = load_case(&d)?;
+        let (case, case_bytes) = load_case_with_size(&d)?;
+        total_case_bytes = total_case_bytes
+            .checked_add(case_bytes)
+            .ok_or_else(|| "regression suite case byte count overflow".to_string())?;
+        if total_case_bytes > MAX_SUITE_CASE_JSON_BYTES {
+            return Err(format!(
+                "regression suite case JSON exceeds {MAX_SUITE_CASE_JSON_BYTES} aggregate bytes"
+            ));
+        }
         out.push((d, case));
     }
     Ok(out)

@@ -24,8 +24,7 @@ void emucap_pace_samples(uint32_t samples);
 // display rate, so the renderers' swap-interval choice treats it like Flycast fast-forward.
 bool emucap_vsync_released();
 
-// mainui_rend_frame(UI/GL 스레드)에서 매 렌더마다 호출. 최신 프레임 raw를 버퍼에 떠 둬서 screenshot이
-// emu 스레드에서 즉시 PNG로 인코딩(GL 불필요)할 수 있게 한다 → freeze 중에도 screenshot 동작.
+// PVR/context owner: publish each successful Present before the observation fence.
 void emucap_capture_latest();
 
 // Frozen park — the vblank service requests it and the sh4_interpreter Run() loop (injected) parks

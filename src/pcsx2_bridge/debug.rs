@@ -1,5 +1,6 @@
 use super::*;
 
+const MAX_BREAKPOINTS: usize = 128;
 const MAX_BREAKPOINT_SPAN: u64 = 0x1_0000;
 const MAX_BREAKPOINT_ACCESS_WIDTH: u32 = 16;
 const BREAKPOINT_REGISTER_COUNT: usize = 34;
@@ -49,6 +50,11 @@ impl Pcsx2Breakpoint {
 
 impl<T: PineTransport> Pcsx2Bridge<T> {
     pub(super) fn set_breakpoint(&mut self, params: &Value) -> BridgeResult<Value> {
+        if self.breakpoints.len() >= MAX_BREAKPOINTS {
+            return Err(Pcsx2BridgeError::BadParams(format!(
+                "PS2 supports at most {MAX_BREAKPOINTS} retained breakpoint registrations"
+            )));
+        }
         let kind = match params.get("kind").and_then(Value::as_str).unwrap_or("exec") {
             "exec" => "exec",
             "read" => "read",

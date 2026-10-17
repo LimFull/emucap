@@ -20,7 +20,10 @@ pub(super) fn launch_mame(
     };
     let headless = pc98_headless(a);
     let sound = a.sound.unwrap_or(false);
-    let log = adapter_log_path("mame-pc98", port, "mame-pc98.log");
+    let log = match adapter_log_path(port, runtime, "mame-pc98.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let spec = emucap::launch::mame::Launch {
         binary: &binary,
         repo_root: &root,
@@ -91,6 +94,7 @@ pub(super) fn launch_np2kai(
             "firmware_root":launched.firmware.display().to_string(),
             "runtime_home":launched.runtime_home.display().to_string(),
             "mounted_content":launched.mounted_content.display().to_string(),
+            "runtime_content":launched.mounted_content.display().to_string(),
             "source_content_sha256":launched.source_content_sha256,
             "host_build":launched.identity,
             "next_action":"launch returns after the adapter connects"

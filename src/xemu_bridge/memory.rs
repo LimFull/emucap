@@ -2,25 +2,67 @@ use super::*;
 use std::fs;
 
 impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
+    fn gdb_remaining(&mut self, deadline: std::time::Instant) -> XemuResult<Duration> {
+        match deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|value| !value.is_zero())
+        {
+            Some(remaining) => Ok(remaining),
+            None => {
+                self.control_unverified = true;
+                Err(XemuBridgeError::Emulator(
+                    "GDB demultiplexing deadline expired".into(),
+                ))
+            }
+        }
+    }
+
     pub(super) fn gdb_command(&mut self, command: &str) -> XemuResult<String> {
-        self.drain_gdb_stops(true)?;
-        let mut response = self.gdb.send(command)?;
+        let deadline = std::time::Instant::now() + self.gdb.get_timeout()?;
+        self.drain_gdb_stops_until(true, deadline)?;
+        let remaining = self.gdb_remaining(deadline)?;
+        let mut response = self.gdb.send_with_timeout(command, remaining)?;
+        let mut stops = 0;
         while is_stop_packet(&response) {
             self.note_stop(response, true)?;
-            response = self.gdb.recv_reply()?;
+            stops += 1;
+            if stops > 1024 {
+                self.control_unverified = true;
+                return Err(XemuBridgeError::Emulator(
+                    "GDB asynchronous stop budget exceeded".into(),
+                ));
+            }
+            let remaining = self.gdb_remaining(deadline)?;
+            response = self.gdb.recv_reply_with_timeout(remaining)?;
         }
         Ok(response)
     }
 
     pub(super) fn drain_gdb_stops(&mut self, report: bool) -> XemuResult<bool> {
+        let deadline = std::time::Instant::now() + self.gdb.get_timeout()?;
+        self.drain_gdb_stops_until(report, deadline)
+    }
+
+    fn drain_gdb_stops_until(
+        &mut self,
+        report: bool,
+        deadline: std::time::Instant,
+    ) -> XemuResult<bool> {
         let before = self.events.len();
-        while let Some(packet) = self.gdb.recv_nonblocking()? {
-            if !is_stop_packet(&packet) {
-                return Err(XemuBridgeError::Emulator(format!(
-                    "unexpected asynchronous GDB packet: {packet}"
-                )));
+        let mut count = 0;
+        loop {
+            let remaining = self.gdb_remaining(deadline)?;
+            let Some(packet) = self.gdb.recv_nonblocking_with_timeout(remaining)? else {
+                break;
+            };
+            if !is_stop_packet(&packet) || count == 1024 {
+                self.control_unverified = true;
+                return Err(XemuBridgeError::Emulator(
+                    "unexpected or excessive asynchronous GDB packets".into(),
+                ));
             }
             self.note_stop(packet, report)?;
+            count += 1;
         }
         Ok(self.events.len() > before)
     }
@@ -50,7 +92,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         }
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
-            self.drain_gdb_stops(true)?;
+            self.drain_gdb_stops_until(true, deadline)?;
             if self.debug_stop_observed {
                 return Ok(());
             }

@@ -35,9 +35,12 @@ constexpr size_t BUFMAX=0x8000;
 ''' + helpers + '\n' + extract('static bool emucap_running_safe_packet(') + r'''
 std::string request(const char *text) {
     const uint8_t *packet=(const uint8_t*)text;
-    char buffer[BUFMAX]; uint8_t *out_ptr=(uint8_t*)buffer; int send_size=0;
+    // Production reserves buffer[0] for the RSP '$' prefix.  Compile with
+    // fortify enabled so a handler that advertises BUFMAX bytes from buffer+1
+    // fails here exactly as it would in DeSmuME.
+    char buffer[BUFMAX]{}; uint8_t *out_ptr=(uint8_t*)buffer+1; int send_size=0;
 ''' + epoch + '\n if(false) {}\n' + handlers + r'''
-    return std::string(buffer,send_size);
+    return std::string((char *)out_ptr,send_size);
 }
 int main() {
     emucap_pacing.ObserveNative(false);
@@ -66,5 +69,6 @@ with tempfile.TemporaryDirectory(prefix='emucap-nds-transaction-') as tmp:
     root=Path(tmp)
     (root/'EmucapPacing.h').write_text((args.source.parent/'EmucapPacing.h').read_text())
     (root/'probe.cpp').write_text(code)
-    subprocess.run(['c++','-std=c++17','-pthread','-fsanitize=address,undefined',str(root/'probe.cpp'),'-o',str(root/'probe')],check=True)
+    subprocess.run(['c++','-std=c++17','-O2','-D_FORTIFY_SOURCE=2','-pthread',
+                    '-fsanitize=address,undefined',str(root/'probe.cpp'),'-o',str(root/'probe')],check=True)
     subprocess.run([str(root/'probe')],check=True)

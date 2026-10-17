@@ -32,6 +32,21 @@ pub struct MediaGraphIdentity {
     pub files: Vec<MediaFileIdentity>,
 }
 
+// Reapply limits to the opened hashing handle: validation may have observed
+// another file at the same name.
+fn admit_hashed_member(total: u64, size: u64) -> io::Result<u64> {
+    let next = total
+        .checked_add(size)
+        .filter(|value| *value <= MAX_GRAPH_BYTES);
+    if size == 0 || size > MAX_MEMBER_BYTES || next.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "media hashing exceeds member or graph byte limit",
+        ));
+    }
+    Ok(next.unwrap())
+}
+
 pub fn read_descriptor(path: &Path, kind: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
     let mut file = crate::path_safety::open_regular_file_no_follow(path).map_err(|error| {
         io::Error::new(
@@ -297,6 +312,7 @@ pub fn graph_identity(
                 .map_err(|error| member_error(kind, reference, error))?;
         let before = file.metadata()?;
         let size = before.len();
+        total_size = admit_hashed_member(total_size, size)?;
         let name = reference.declared_name.as_bytes();
         graph_hash.update((name.len() as u64).to_le_bytes());
         graph_hash.update(name);
@@ -332,9 +348,6 @@ pub fn graph_identity(
                 ),
             ));
         }
-        total_size = total_size.checked_add(size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "media graph size overflow")
-        })?;
         files.push(MediaFileIdentity {
             declared_name: reference.declared_name.clone(),
             path: canonical,

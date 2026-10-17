@@ -1,0 +1,176 @@
+diff --git a/Core/Debugger/WebSocket/GameSubscriber.cpp b/Core/Debugger/WebSocket/GameSubscriber.cpp
+index c77146cd5b..167d47f53a 100644
+--- a/Core/Debugger/WebSocket/GameSubscriber.cpp
++++ b/Core/Debugger/WebSocket/GameSubscriber.cpp
+@@ -102,13 +102,8 @@ void WebSocketGameReset(DebuggerRequest &req) {
+ 	// and we are not on it here.
+ 	System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
+ 
+-	// emucap: block until this ticket's reboot actually completes so the client's ack means "rebooted"
+-	// (and reflects whether it succeeded), not merely "reset queued" — otherwise game.reset would look
+-	// successful while nothing happened or while the reboot failed and the core stopped. The reboot's
+-	// PSP_Shutdown takes the WS lifecycle lock (its STOPPING notification), which the dispatch is
+-	// holding for us right now, so we drop it for the wait and reacquire before returning (else the
+-	// blocked handler would deadlock the reboot). No-op in GUI builds — the mode is never enabled and
+-	// the UI pump handles the reset itself.
++	// Wait outside the CPU task queue so the run loop can complete this ticket's reboot.
++	// GUI reset continues through its own UI pump.
+ 	if (Core_HeadlessResetMode()) {
+ 		bool rebooted = false;
+ 		bool completed = Core_WaitHeadlessReset(resetTicket, 30.0, &rebooted);
+@@ -175,12 +170,13 @@ static bool CheckSpeedControlAllowed(DebuggerRequest &req) {
+ }
+ 
+ static void WriteSpeedState(JsonWriter &json) {
+-	json.writeBool("fastForward", PSP_CoreParameter().fastForward);
+-	if (PSP_CoreParameter().fpsLimit == FPSLimit::DEBUGGER)
+-		json.writeInt("percent", FpsToPercent(PSP_CoreParameter().debuggerFpsLimit));
++	const auto pacing = __DisplayGetEmucapPacing();
++	json.writeBool("fastForward", pacing.fastForward);
++	if (pacing.fpsLimit == FPSLimit::DEBUGGER)
++		json.writeInt("percent", FpsToPercent(pacing.debuggerFpsLimit));
+ 	else
+ 		json.writeNull("percent");
+-	json.writeInt("limitFps", __DisplayGetFrameTimingLimit());
++	json.writeFloat("limitFps", __DisplayGetFrameTimingLimit());
+ }
+ 
+ // Request the current emulation speed (game.speed.get)
+@@ -246,19 +242,9 @@ void WebSocketGameSpeedSet(DebuggerRequest &req) {
+ 	// Route the writes to the CPU thread instead of poking at them directly from this WebSocket
+ 	// handler thread - see Core_RunOnCPUThread() in Core.h.
+ 	Core_RunOnCPUThread([&] {
+-		if (hasFastForward)
+-			PSP_CoreParameter().fastForward = fastForward;
+-
+-		if (clearPercent) {
+-			// Only stand down from a limit we set ourselves - the user may have an alternative
+-			// speed of their own active, and that isn't ours to cancel.
+-			if (PSP_CoreParameter().fpsLimit == FPSLimit::DEBUGGER)
+-				PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
+-			PSP_CoreParameter().debuggerFpsLimit = 0;
+-		} else if (hasPercent) {
+-			PSP_CoreParameter().debuggerFpsLimit = PercentToFps((int)percent);
+-			PSP_CoreParameter().fpsLimit = FPSLimit::DEBUGGER;
+-		}
++		if (!CheckSpeedControlAllowed(req)) return;
++		if (!__DisplayApplyDebuggerSpeed(hasFastForward, fastForward, hasPercent, clearPercent, PercentToFps((int)percent)))
++			return req.Fail("Speed control is not allowed while connected to a network game");
+ 
+ 		JsonWriter &json = req.Respond();
+ 		WriteSpeedState(json);
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index 71bcade92e..ea7859ac65 100644
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -38,7 +38,8 @@
+ using namespace MIPSAnalyst;
+ 
+ struct WebSocketSteppingState;
+-// All subscriber admission, polling and destruction runs under lifecycleLock.
++// Connection threads share frame ownership; the CPU never takes this mutex.
++static std::recursive_mutex emucapFrameOwnerMutex;
+ static WebSocketSteppingState *emucapFrameOwner = nullptr;
+ 
+ struct WebSocketSteppingState : public DebuggerSubscriber {
+@@ -93,6 +94,7 @@ DebuggerSubscriber *WebSocketSteppingInit(DebuggerEventHandlerMap &map) {
+ // Keep the WebSocket dispatcher available while an exact VBlank operation runs.
+ // The originating connection owns both the deferred reply and its cancellation.
+ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
++	std::lock_guard<std::recursive_mutex> ownerGuard(emucapFrameOwnerMutex);
+ 	if (emucapFrameOwner)
+ 		return req.Fail("another frame advance owns native control");
+ 	if (!currentDebugMIPS->isAlive() || !Core_EmucapMemoryParked())
+@@ -120,6 +122,7 @@ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
+ }
+ 
+ void WebSocketSteppingState::RequestFrameStop(const char *reason) {
++	std::lock_guard<std::recursive_mutex> ownerGuard(emucapFrameOwnerMutex);
+ 	if (frameStopping_)
+ 		return;
+ 	frameStopping_ = true;
+@@ -132,6 +135,7 @@ void WebSocketSteppingState::RequestFrameStop(const char *reason) {
+ }
+ 
+ void WebSocketSteppingState::CancelFrame(DebuggerRequest &req) {
++	std::lock_guard<std::recursive_mutex> ownerGuard(emucapFrameOwnerMutex);
+ 	std::string operation;
+ 	if (!req.ParamString("operation_id", &operation))
+ 		return;
+@@ -143,6 +147,7 @@ void WebSocketSteppingState::CancelFrame(DebuggerRequest &req) {
+ }
+ 
+ void WebSocketSteppingState::Broadcast(net::WebSocketServer *ws) {
++	std::lock_guard<std::recursive_mutex> ownerGuard(emucapFrameOwnerMutex);
+ 	if (emucapFrameOwner != this)
+ 		return;
+ 	auto result = Core_EmucapWaitFrameStep(0);
+@@ -183,6 +188,7 @@ void WebSocketSteppingState::Broadcast(net::WebSocketServer *ws) {
+ }
+ 
+ void WebSocketSteppingState::CloseFrame() {
++	std::lock_guard<std::recursive_mutex> ownerGuard(emucapFrameOwnerMutex);
+ 	if (emucapFrameOwner != this)
+ 		return;
+ 	RequestFrameStop("connection_lost");
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+index 5c2398c940..86c1e922a1 100644
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -49,6 +49,21 @@ struct EmucapPacingApply {
+ 
+ class EmucapPacingOwner {
+ public:
++    bool ApplyDebuggerSpeed(bool hasFastForward, bool fastForward, bool hasPercent, bool clearPercent, int fps) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        if (policy_.NetworkForced()) return false;
++        if (hasFastForward) policy_.fastForward = fastForward;
++        if (clearPercent) {
++            if (policy_.fpsLimit == FPSLimit::DEBUGGER) policy_.fpsLimit = FPSLimit::NORMAL;
++            policy_.debuggerFpsLimit = 0;
++        } else if (hasPercent) {
++            policy_.debuggerFpsLimit = fps;
++            policy_.fpsLimit = FPSLimit::DEBUGGER;
++        }
++        ++policy_.revision;
++        return true;
++    }
++
+     EmucapPacingApply ApplySpeed(int percent) {
+         std::lock_guard<std::mutex> guard(mutex_);
+         const auto previous = policy_;
+@@ -57,6 +72,7 @@ class EmucapPacingOwner {
+         policy_.percent = percent;
+         policy_.fastForward = false;
+         policy_.fpsLimit = FPSLimit::NORMAL;
++        policy_.debuggerFpsLimit = 0;
+         ++policy_.revision;
+         return {true, previous, policy_};
+ 
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+index b61d02d174..1d4b12e1f5 100644
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -440,6 +440,10 @@ void __DisplayRestoreEmucapAdhoc(int &state, bool &initialized, bool &controlIni
+     emucapPacing.RestoreAdhoc(state, initialized, controlInitialized, next, connected, init, controlInit);
+ }
+ 
++bool __DisplayApplyDebuggerSpeed(bool hasFastForward, bool fastForward, bool hasPercent, bool clearPercent, int fps) {
++    return emucapPacing.ApplyDebuggerSpeed(hasFastForward, fastForward, hasPercent, clearPercent, fps);
++}
++
+ EmucapPacingApply __DisplayApplyEmucapSpeed(int percent) {
+     return emucapPacing.ApplySpeed(percent);
+ }
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+index a3cce4448a..84220b91c0 100644
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -43,6 +43,7 @@ double __DisplayGetFrameTimingLimit();
+ // unlimited. Held keys, custom limits and fast-forward still take precedence.
+ void __DisplaySetEmucapSpeed(int percent);
+ EmucapPacingApply __DisplayApplyEmucapSpeed(int percent);
++bool __DisplayApplyDebuggerSpeed(bool hasFastForward, bool fastForward, bool hasPercent, bool clearPercent, int fps);
+ EmucapPacingSnapshot __DisplayGetEmucapPacing();
+ void __DisplayInitializeEmucapPacing(bool fastForward);
+ void __DisplaySetEmucapFastForward(bool value);

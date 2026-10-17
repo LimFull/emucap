@@ -74,7 +74,7 @@ fn check_boundary(
 }
 
 pub fn save(link: &mut dyn EmulatorLink, path: &str, key: &str) -> Result<ToolOutput, LinkError> {
-    save_in_store(link, path, key, &RuntimeStore::discover())
+    save_in_store(link, path, key, &RuntimeStore::discover().map_err(error)?)
 }
 pub(crate) fn save_in_store(
     link: &mut dyn EmulatorLink,
@@ -113,14 +113,14 @@ pub fn save_with_cancellation(
         .map_err(error)?
         .ok_or_else(|| error("runtime generation missing"))?;
     if identity.launch_id.as_deref() != Some(&current.launch_id)
-        || identity.content.as_deref() != Some(&current.content)
+        || identity.content.as_deref().is_none_or(|content| {
+            !crate::content_identity::same_content_path(&current.content, content)
+        })
         || link.continuity().runtime_binding.state != super::continuity::RuntimeBindingState::Bound
     {
         return Err(error("snapshot requires exact runtime binding"));
     }
-    snapshot_store::validate_destination(runtime, Path::new(path)).map_err(error)?;
-    let (store, fresh) = Store::open(runtime, key, true).map_err(error)?;
-    if !fresh {
+    let observe_existing = |store: &Store| -> Result<ToolOutput, LinkError> {
         let previous = store
             .request()
             .map_err(|e| error(format!("snapshot key is indeterminate: {e}")))?;
@@ -129,7 +129,17 @@ pub fn save_with_cancellation(
                 "snapshot_key conflicts with its reserved launch or destination",
             ));
         }
-        return Ok(ToolOutput::Json(observe(&store, None, None)?));
+        Ok(ToolOutput::Json(observe(store, None, None)?))
+    };
+    match Store::open(runtime, key, false) {
+        Ok((store, _)) => return observe_existing(&store),
+        Err(open_error) if open_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(open_error) => return Err(error(open_error)),
+    }
+    let export = snapshot_store::Export::prepare(runtime, Path::new(path)).map_err(error)?;
+    let (store, fresh) = Store::open(runtime, key, true).map_err(error)?;
+    if !fresh {
+        return observe_existing(&store);
     }
     let source = super::evidence_identity::runtime_identity(
         &identity,
@@ -147,7 +157,7 @@ pub fn save_with_cancellation(
         ),
     };
     store.reserve(&request).map_err(error)?;
-    let result = capture_and_publish(link, &store, &request, &budget);
+    let result = capture_and_publish(link, &store, &request, &export, &budget);
     let mut outcome = match result {
         Ok(value) => value,
         Err(e) => json!({"status":"failed", "snapshot_key":key,
@@ -163,6 +173,7 @@ fn capture_and_publish(
     link: &mut dyn EmulatorLink,
     store: &Store,
     request: &Request,
+    export: &snapshot_store::Export,
     budget: &Budget,
 ) -> Result<Value, LinkError> {
     let loaded = budget.call(link, "get_rom_info")?;
@@ -210,7 +221,7 @@ fn capture_and_publish(
     budget.check()?;
     store.publish(&receipt, &bytes).map_err(error)?;
     budget.check()?;
-    snapshot_store::export(Path::new(&request.destination), &bytes).map_err(error)?;
+    export.publish(&bytes).map_err(error)?;
     check_boundary(link, &receipt.body.halt, &request.source.launch_id, budget)?;
     Ok(
         json!({"status":"completed", "state":"frozen", "boundary":"instruction_boundary", "path":request.destination,
@@ -273,7 +284,12 @@ pub fn verify(
     path: Option<&str>,
     expected_launch: Option<&str>,
 ) -> Result<ToolOutput, LinkError> {
-    verify_in_store(&RuntimeStore::discover(), key, path, expected_launch)
+    verify_in_store(
+        &RuntimeStore::discover().map_err(error)?,
+        key,
+        path,
+        expected_launch,
+    )
 }
 pub(crate) fn verify_in_store(
     runtime: &RuntimeStore,

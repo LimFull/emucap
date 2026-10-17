@@ -100,7 +100,13 @@ pub fn observe_runtime(
     let Some(port) = link.endpoint_port() else {
         return observation;
     };
-    let store = RuntimeStore::discover();
+    let store = match RuntimeStore::discover() {
+        Ok(store) => store,
+        Err(_) => {
+            observation.runtime_metadata_valid = false;
+            return observation;
+        }
+    };
     let current = match store.read_current(port) {
         Ok(current) => current,
         Err(_) => {

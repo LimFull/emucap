@@ -30,6 +30,8 @@ emu = { file = function() return socket end,
 for _, name in ipairs({"reset", "stop", "pre_save", "post_load", "frame"}) do
   emu["add_machine_" .. name .. "_notifier"] = function(f) callbacks[name] = f; return f end
 end
+local fixture = dofile(root .. "/_tests/adapters/pc98/control_io_fixture.lua")
+fixture.install(emu, socket)
 dofile(root .. "/adapters/mame-pc98/plugins/emucap_gdbstub/init.lua").startplugin()
 local function upvalue(f, name, value, write)
   for i = 1, 100 do
@@ -74,7 +76,7 @@ assert(machine.paused and resumed == 1)
 -- Ordinary pause also defers publication; an existing debugger stop stays in place.
 machine.paused = false
 writes = {}
-handle("\x03")
+fixture.call(handle, "\x03")
 assert(machine.paused and #writes == 0)
 set(callbacks.periodic, "service_frozen_socket", function() end)
 callbacks.periodic()
@@ -82,21 +84,21 @@ assert(writes[1]:match("^%$S05#"))
 set(callbacks.periodic, "service_frozen_socket", service)
 debugger.execution_state = "stop"
 writes = {}
-handle("\x03")
+fixture.call(handle, "\x03")
 assert(writes[1]:match("^%$S05#") and goes == 2)
 -- The native reply is forwarded without scheduling a frame or changing the halt.
 local path = ("test.sta"):gsub(".", function(c) return string.format("%02x", c:byte()) end)
 for _, result in ipairs({"completed", "unsafe_halt", "load_failed_rolled_back"}) do
   outcome = result
   writes = {}
-  handle("qEmucap,loadsync," .. path)
+  fixture.call(handle, "qEmucap,loadsync," .. path)
   assert(writes[2]:find("STATE:" .. result, 1, true) and goes == 2)
 end
 assert(native_calls == 3)
 outcome = "load_failed_unverified"
-handle("qEmucap,loadsync," .. path)
+fixture.call(handle, "qEmucap,loadsync," .. path)
 local before = goes
-handle("c")
+fixture.call(handle, "c")
 assert(goes == before, "uncertain restore accepted resume")
 -- Socket failure after an uncertain load must preserve the owned pause.
 set(service, "running", false)

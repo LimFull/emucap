@@ -6,6 +6,7 @@ use emucap::gdb_rsp::{GdbBridgeEnv, GdbRspClient};
 use emucap::live::reconnect::{serve_reconnecting_controlled, BridgeReply, ProcessDependency};
 use emucap::qmp::QmpClient;
 use emucap::xemu_bridge::{XemuBridge, XemuMachineIdentity, XemuStateEnvironment};
+use emucap::xemu_native_auth::{connect_authenticated, XemuNativeEndpoint};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -19,24 +20,36 @@ fn main() -> anyhow::Result<()> {
     let screen_root = std::env::var_os("EMUCAP_XEMU_SCREEN_ROOT")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("EMUCAP_XEMU_SCREEN_ROOT is required"))?;
+    let native_token = std::env::var("EMUCAP_NATIVE_DEBUG_TOKEN")
+        .context("EMUCAP_NATIVE_DEBUG_TOKEN is required for xemu native authentication")?;
 
     eprintln!(
         "[xemu-rust] connecting qmp={qmp_host}:{qmp_port} gdb={gdb_host}:{gdb_port} emucap=127.0.0.1:{emucap_port}"
     );
-    let qmp = QmpClient::connect(
+    let native_timeout = Duration::from_secs(5);
+    let connect_wait = Duration::from_secs(30);
+    let qmp_stream = connect_authenticated(
         &qmp_host,
         qmp_port,
-        Duration::from_secs(5),
-        Duration::from_secs(30),
+        &native_token,
+        XemuNativeEndpoint::Qmp,
+        native_timeout,
+        connect_wait,
     )
-    .with_context(|| format!("connect xemu QMP at {qmp_host}:{qmp_port}"))?;
-    let gdb = GdbRspClient::connect(
+    .with_context(|| format!("authenticate xemu QMP at {qmp_host}:{qmp_port}"))?;
+    let qmp = QmpClient::from_authenticated_stream(qmp_stream, native_timeout)
+        .with_context(|| format!("initialize xemu QMP at {qmp_host}:{qmp_port}"))?;
+    let gdb_stream = connect_authenticated(
         &gdb_host,
         gdb_port,
-        Duration::from_secs(5),
-        Duration::from_secs(30),
+        &native_token,
+        XemuNativeEndpoint::Gdb,
+        native_timeout,
+        connect_wait,
     )
-    .with_context(|| format!("connect xemu GDB at {gdb_host}:{gdb_port}"))?;
+    .with_context(|| format!("authenticate xemu GDB at {gdb_host}:{gdb_port}"))?;
+    let gdb = GdbRspClient::from_authenticated_stream(gdb_stream, native_timeout)
+        .context("initialize authenticated xemu GDB stream")?;
     let controlled_start = std::env::var("EMUCAP_START_FROZEN").ok().as_deref() == Some("1");
     let machine_identity =
         XemuMachineIdentity::from_process_env().map_err(|error| anyhow!(error))?;

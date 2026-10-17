@@ -195,6 +195,8 @@ cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_live
 cp "$HERE/emucap_video_format.h" "$SRC/src/video/"
 cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
   "$SRC/src/ngp/"
+cp "$HERE/../_common/emucap_pattern.h" "$SRC/src/drivers/"
+cp "$HERE/../_common/emucap_front_auth.h" "$SRC/src/drivers/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알리게 한다 —
 # 사용자가 `git rev-parse --short HEAD`와 대조해 재빌드 필요 여부를 확인한다(build-time 임베드라 재빌드
@@ -236,10 +238,10 @@ git -C "$HERE" diff --quiet HEAD -- \
     patches/0035-preserve-device-peek-latches.patch \
     patches/0036-reject-pcfx-track-read-failure.patch \
     patches/0037-support-current-mingw-crt.patch \
-  emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_video_restore.h emucap_atomic_file.h emucap_state_file.h emucap_snapshot.h emucap_frame_output.h emucap_frame_call.h emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_live_input.h emucap_input_request.h emucap_rx.h emucap_control_wire.h emucap_control_identity.h emucap_native_control.h emucap_control_owner.h emucap_owned.inl emucap_owned_advance.h emucap_pcfx.h emucap_psx.h emucap_ngp.h \
+  emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_video_restore.h emucap_atomic_file.h emucap_state_file.h emucap_snapshot.h emucap_frame_output.h emucap_frame_call.h emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_live_input.h emucap_input_request.h emucap_rx.h emucap_control_wire.h emucap_control_identity.h emucap_native_control.h emucap_control_owner.h emucap_owned.inl emucap_owned_advance.h emucap_pcfx.h emucap_psx.h emucap_ngp.h ../_common/emucap_front_auth.h \
   emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
-  emucap_pacing.h ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
+  emucap_pacing.h ../_common/emucap_pattern.h ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 PATCHSET_SHA256="$({
@@ -279,12 +281,13 @@ PATCHSET_SHA256="$({
     patches/0035-preserve-device-peek-latches.patch \
     patches/0036-reject-pcfx-track-read-failure.patch \
     patches/0037-support-current-mingw-crt.patch \
-    emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_video_restore.h emucap_atomic_file.h emucap_state_file.h emucap_snapshot.h emucap_frame_output.h emucap_frame_call.h emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_live_input.h emucap_input_request.h emucap_rx.h emucap_control_wire.h emucap_control_identity.h emucap_native_control.h emucap_control_owner.h emucap_owned.inl emucap_owned_advance.h emucap_pcfx.h emucap_psx.h emucap_ngp.h \
+    emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_video_restore.h emucap_atomic_file.h emucap_state_file.h emucap_snapshot.h emucap_frame_output.h emucap_frame_call.h emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_live_input.h emucap_input_request.h emucap_rx.h emucap_control_wire.h emucap_control_identity.h emucap_native_control.h emucap_control_owner.h emucap_owned.inl emucap_owned_advance.h emucap_pcfx.h emucap_psx.h emucap_ngp.h ../_common/emucap_front_auth.h \
     emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
     emucap_pacing.h emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
   done
   for path in \
+    ../_common/emucap_pattern.h \
     ../_common/emucap_native_failure.cpp \
     ../_common/emucap_native_failure.h; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
@@ -839,7 +842,7 @@ fi
 # autotools는 LIBS를 링크 커맨드에 붙이므로 configure 전에 주입한다.
 case "$(uname -s 2>/dev/null || echo unknown)" in
   MINGW*|MSYS*|CYGWIN*)
-    export LIBS="-lws2_32 ${LIBS:-}"
+    export LIBS="-ladvapi32 -lws2_32 ${LIBS:-}"
     # Upstream's non-Unicode Windows driver targets Windows 9x and rejects NT.
     export CPPFLAGS="-DUNICODE -D_UNICODE ${CPPFLAGS:-}"
     # Keep C++ RTTI and exception support in the executable. Cross-DLL type-info
@@ -852,6 +855,12 @@ esac
 # 6. emucap sources를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
 perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) emucap_recording.\$(OBJEXT) emucap_native_failure.\$(OBJEXT) /' \
   src/drivers/Makefile
+# The shared authenticated-front header uses C++17. Keep upstream Mednafen on its
+# pinned C++11 dialect and raise only the translation unit that includes it.
+cat >>src/drivers/Makefile <<'EOF'
+EMUCAP_CXX := $(subst -std=gnu++11,-std=gnu++17,$(CXX))
+emucap.$(OBJEXT): CXX = $(EMUCAP_CXX)
+EOF
 # Upstream ships the TLCS disassembler sources but does not build them. Keep each source as a
 # separate object because their file-local decoder names intentionally overlap.
 perl -0777 -pi -e 's{libngp_a_OBJECTS = \$\(am_libngp_a_OBJECTS\)}{libngp_a_OBJECTS = \$(am_libngp_a_OBJECTS) \\\n ngp/TLCS-900h/TLCS900h_disassemble_extra.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_src.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_dst.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_reg.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble.\$(OBJEXT)}' \

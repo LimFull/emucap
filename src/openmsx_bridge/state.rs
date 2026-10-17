@@ -20,7 +20,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         }
         self.require_runtime_identity("save_state")?;
         if self.session.media.kind == super::MediaKind::Disk {
-            let scratch = super::disk_state::StateScratch::new(&self.session)?;
+            let scratch = super::disk_state::StateScratch::new(&self.runtime_home)?;
             let machine = tcl_utf8_value(&scratch.machine())?;
             let disk = tcl_utf8_value(&scratch.disk())?;
             self.control.command(&format!(
@@ -57,7 +57,11 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         }
         // Validate payloads before changing anything in the native machine.
         let mut scratch = if self.session.media.kind == super::MediaKind::Disk {
-            Some(super::disk_state::prepare(&path, &self.session)?)
+            Some(super::disk_state::prepare(
+                &path,
+                &self.session,
+                &self.runtime_home,
+            )?)
         } else {
             None
         };

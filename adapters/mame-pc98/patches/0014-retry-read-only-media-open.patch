@@ -1,0 +1,12 @@
+--- a/src/emu/diimage.cpp
++++ b/src/emu/diimage.cpp
+@@ -856,7 +856,8 @@
+ 		{
+ 			// open the file
+ 			err.first = load_image_by_path(*iter, path);
+-			if (err.first && (err.first != std::errc::no_such_file_or_directory) && (err.first != std::errc::permission_denied))
++			if (err.first && (err.first != std::errc::no_such_file_or_directory) &&
++				(err.first != std::errc::permission_denied) && (err.first != std::errc::read_only_file_system))
+ 				break;
+ 		}
+ 

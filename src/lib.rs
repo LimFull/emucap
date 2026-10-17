@@ -31,11 +31,16 @@ pub mod path_safety;
 pub mod pc98_bridge;
 pub mod pcsx2_bridge;
 pub mod ppsspp_bridge;
+pub(crate) mod private_fs;
 pub mod qmp;
 pub mod rom;
+pub(crate) mod rooted_fs;
 pub mod toc;
 pub mod track;
+#[cfg(windows)]
+pub(crate) mod windows_socket;
 pub mod xemu_bridge;
+pub mod xemu_native_auth;
 
 #[cfg(test)]
 pub(crate) mod test_env;
@@ -48,6 +53,9 @@ mod input_movie_tests;
 
 #[cfg(test)]
 mod path_safety_tests;
+
+#[cfg(test)]
+mod rooted_fs_tests;
 
 #[cfg(test)]
 #[path = "mcp_stdio_tests.rs"]

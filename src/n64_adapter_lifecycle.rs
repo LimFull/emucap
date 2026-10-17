@@ -28,7 +28,7 @@ impl AdapterReadiness {
 }
 
 pub(super) fn readiness_for(
-    display: bool,
+    _display: bool,
     debugger_ready: bool,
     initial_released: bool,
     execution_terminal: bool,
@@ -40,7 +40,7 @@ pub(super) fn readiness_for(
         AdapterReadiness::WaitingForDebugger
     } else if !initial_released {
         AdapterReadiness::WaitingForInitialRelease
-    } else if display && !rendered_frame_seen {
+    } else if !rendered_frame_seen {
         AdapterReadiness::WaitingForFirstRenderedFrame
     } else {
         AdapterReadiness::Ready
@@ -75,14 +75,7 @@ impl Drop for Mupen64PlusHost {
             }
             return;
         }
-        for button in self.held_buttons.iter() {
-            if let Some(key) = control::input_key(button) {
-                unsafe {
-                    let _ = (self.api.core_do_command)(M64CMD_SEND_SDL_KEYUP, key, ptr::null_mut());
-                }
-            }
-        }
-        self.held_buttons.clear();
+        let _ = self.publish_controller(Default::default());
         if self.started && !EXECUTION_TERMINAL.load(Ordering::Acquire) {
             unsafe {
                 let _ = (self.api.core_do_command)(M64CMD_STOP, 0, ptr::null_mut());
@@ -107,6 +100,7 @@ impl Drop for Mupen64PlusHost {
 
 pub(super) fn reset_observation_state() {
     reset_frame_gate();
+    poll::reset();
     DEBUG_READY.store(false, Ordering::Release);
     INITIAL_RELEASED.store(false, Ordering::Release);
     EXECUTION_TERMINAL.store(false, Ordering::Release);

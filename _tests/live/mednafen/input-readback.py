@@ -67,8 +67,8 @@ def main():
         assert native_final['valid'] and native_final['parked'], final
         assert native_final['context'] == 'frame_boundary', final
         assert native_final['generation'] == native_origin['generation'], final
-        # Public tap includes one release-edge frame before its trailing frames.
-        assert native_final['completed_frames'] - native_origin['completed_frames'] == 2 + 1 + 2, final
+        # Releasing transient input changes ownership without hidden guest progress.
+        assert native_final['completed_frames'] - native_origin['completed_frames'] == 2 + 2, final
         binary = ROOT / 'adapters/mednafen/work/mednafen/src/mednafen'
         (out / 'artifacts.json').write_text(json.dumps({str(binary): hashlib.sha256(binary.read_bytes()).hexdigest(),
             'sidecar': json.loads(Path(str(binary) + '.emucap-build.json').read_text())}, indent=2))

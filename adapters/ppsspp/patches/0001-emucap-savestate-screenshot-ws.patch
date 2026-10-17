@@ -1,21 +1,21 @@
-diff --git c/CMakeLists.txt i/CMakeLists.txt
-index 4dfcc74d53..242db31a7b 100644
---- c/CMakeLists.txt
-+++ i/CMakeLists.txt
-@@ -2220,6 +2220,8 @@ add_library(${CoreLibName} ${CoreLinkType}
- 	Core/Debugger/WebSocket/MemorySubscriber.h
- 	Core/Debugger/WebSocket/ReplaySubscriber.cpp
- 	Core/Debugger/WebSocket/ReplaySubscriber.h
-+	Core/Debugger/WebSocket/SaveStateSubscriber.cpp
-+	Core/Debugger/WebSocket/SaveStateSubscriber.h
- 	Core/Debugger/WebSocket/SteppingBroadcaster.cpp
- 	Core/Debugger/WebSocket/SteppingBroadcaster.h
- 	Core/Debugger/WebSocket/SteppingSubscriber.cpp
-diff --git c/Core/Debugger/WebSocket.cpp i/Core/Debugger/WebSocket.cpp
-index 6e12abe5db..e282588150 100644
---- c/Core/Debugger/WebSocket.cpp
-+++ i/Core/Debugger/WebSocket.cpp
-@@ -61,6 +61,7 @@
+diff --git a/Core/CMakeLists.txt b/Core/CMakeLists.txt
+index 31726d525c..b4e6147640 100644
+--- a/Core/CMakeLists.txt
++++ b/Core/CMakeLists.txt
+@@ -203,6 +203,8 @@ if(NOT LIBRETRO)
+ 		Debugger/WebSocket/MemorySubscriber.h
+ 		Debugger/WebSocket/ReplaySubscriber.cpp
+ 		Debugger/WebSocket/ReplaySubscriber.h
++		Debugger/WebSocket/SaveStateSubscriber.cpp
++		Debugger/WebSocket/SaveStateSubscriber.h
+ 		Debugger/WebSocket/SteppingBroadcaster.cpp
+ 		Debugger/WebSocket/SteppingBroadcaster.h
+ 		Debugger/WebSocket/SteppingSubscriber.cpp
+diff --git a/Core/Debugger/WebSocket.cpp b/Core/Debugger/WebSocket.cpp
+index e0d9ecf999..7ef4abc281 100644
+--- a/Core/Debugger/WebSocket.cpp
++++ b/Core/Debugger/WebSocket.cpp
+@@ -69,6 +69,7 @@
  #include "Core/Debugger/WebSocket/MemoryInfoSubscriber.h"
  #include "Core/Debugger/WebSocket/MemorySubscriber.h"
  #include "Core/Debugger/WebSocket/ReplaySubscriber.h"
@@ -23,7 +23,7 @@ index 6e12abe5db..e282588150 100644
  #include "Core/Debugger/WebSocket/SteppingSubscriber.h"
  #include "Core/Debugger/WebSocket/ClientConfigSubscriber.h"
  
-@@ -78,6 +79,7 @@ static const std::vector<SubscriberInit> subscribers({
+@@ -89,6 +90,7 @@ static const std::vector<SubscriberInit> subscribers({
  	&WebSocketMemoryInfoInit,
  	&WebSocketMemoryInit,
  	&WebSocketReplayInit,
@@ -31,12 +31,12 @@ index 6e12abe5db..e282588150 100644
  	&WebSocketSteppingInit,
  	&WebSocketClientConfigInit,
  });
-diff --git c/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp i/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
-index 972ac82334..4b940cb94c 100644
---- c/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
-+++ i/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
-@@ -22,15 +22,21 @@
- #endif
+diff --git a/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp b/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
+index 89e7e14033..1ebc3cda60 100644
+--- a/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
++++ b/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
+@@ -20,15 +20,21 @@
+ #include <zlib.h>
  #include "Common/Data/Encoding/Base64.h"
  #include "Common/StringUtils.h"
 +#include "Common/TimeUtil.h"
@@ -57,7 +57,7 @@ index 972ac82334..4b940cb94c 100644
  	map["gpu.buffer.renderColor"] = &WebSocketGPUBufferRenderColor;
  	map["gpu.buffer.renderDepth"] = &WebSocketGPUBufferRenderDepth;
  	map["gpu.buffer.renderStencil"] = &WebSocketGPUBufferRenderStencil;
-@@ -285,6 +291,55 @@ void WebSocketGPUBufferScreenshot(DebuggerRequest &req) {
+@@ -287,6 +293,55 @@ void WebSocketGPUBufferScreenshot(DebuggerRequest &req) {
  	});
  }
  
@@ -113,10 +113,10 @@ index 972ac82334..4b940cb94c 100644
  // Retrieve current color render buffer (gpu.buffer.renderColor)
  //
  // Parameters:
-diff --git c/Core/Debugger/WebSocket/GPUBufferSubscriber.h i/Core/Debugger/WebSocket/GPUBufferSubscriber.h
+diff --git a/Core/Debugger/WebSocket/GPUBufferSubscriber.h b/Core/Debugger/WebSocket/GPUBufferSubscriber.h
 index 00b93d74c0..6ba1a960e6 100644
---- c/Core/Debugger/WebSocket/GPUBufferSubscriber.h
-+++ i/Core/Debugger/WebSocket/GPUBufferSubscriber.h
+--- a/Core/Debugger/WebSocket/GPUBufferSubscriber.h
++++ b/Core/Debugger/WebSocket/GPUBufferSubscriber.h
 @@ -22,6 +22,7 @@
  DebuggerSubscriber *WebSocketGPUBufferInit(DebuggerEventHandlerMap &map);
  
@@ -125,11 +125,11 @@ index 00b93d74c0..6ba1a960e6 100644
  void WebSocketGPUBufferRenderColor(DebuggerRequest &req);
  void WebSocketGPUBufferRenderDepth(DebuggerRequest &req);
  void WebSocketGPUBufferRenderStencil(DebuggerRequest &req);
-diff --git c/Core/Debugger/WebSocket/SaveStateSubscriber.cpp i/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+diff --git a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
 new file mode 100644
 index 0000000000..53bb7b2dac
 --- /dev/null
-+++ i/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
 @@ -0,0 +1,135 @@
 +// Copyright (c) 2018- PPSSPP Project.
 +
@@ -266,11 +266,11 @@ index 0000000000..53bb7b2dac
 +void WebSocketSaveStateLoad(DebuggerRequest &req) {
 +	RunSaveStateOperation(req, false, BreakReason::SavestateLoad);
 +}
-diff --git c/Core/Debugger/WebSocket/SaveStateSubscriber.h i/Core/Debugger/WebSocket/SaveStateSubscriber.h
+diff --git a/Core/Debugger/WebSocket/SaveStateSubscriber.h b/Core/Debugger/WebSocket/SaveStateSubscriber.h
 new file mode 100644
 index 0000000000..47d4b438c1
 --- /dev/null
-+++ i/Core/Debugger/WebSocket/SaveStateSubscriber.h
++++ b/Core/Debugger/WebSocket/SaveStateSubscriber.h
 @@ -0,0 +1,25 @@
 +// Copyright (c) 2018- PPSSPP Project.
 +
@@ -297,22 +297,17 @@ index 0000000000..47d4b438c1
 +
 +void WebSocketSaveStateSave(DebuggerRequest &req);
 +void WebSocketSaveStateLoad(DebuggerRequest &req);
-diff --git c/headless/Headless.cpp i/headless/Headless.cpp
-index 293878d511..9e2c0a735d 100644
---- c/headless/Headless.cpp
-+++ i/headless/Headless.cpp
-@@ -229,7 +229,13 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
- 	bool passed = true;
- 	double deadline = time_now_d() + opt.timeout;
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+index 6ca38a18a2..55300abbc3 100644
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -509,7 +509,8 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
+ 	double emulatedElapsed = 0.0;
+ 	double lastEmulatedTime = CoreTiming::GetGlobalTimeUs() / 1000000.0;
  	coreState = coreParameter.startBreak ? CORE_STEPPING_CPU : CORE_RUNNING_CPU;
--	while (coreState == CORE_RUNNING_CPU || coreState == CORE_STEPPING_CPU)
-+	// emucap fork: also keep the run loop alive while the GPU is GE-stepping (CORE_STEPPING_GE)
-+	// or resuming from it (CORE_RUNNING_GE). The WebSocket debugger enters GE stepping to capture
-+	// the output framebuffer (emucap.screenshot); Core_RunLoopUntil services the GE step and
-+	// switches back to CORE_RUNNING_CPU once resumed. Without these states in the condition, the
-+	// loop would exit and shut the emulator down the moment a screenshot enters GE stepping.
+-	while (coreState == CORE_RUNNING_CPU || coreState == CORE_STEPPING_CPU) {
 +	while (coreState == CORE_RUNNING_CPU || coreState == CORE_STEPPING_CPU ||
-+		coreState == CORE_STEPPING_GE || coreState == CORE_RUNNING_GE)
- 	{
- 		int blockTicks = (int)usToCycles(1000000 / 10);
- 		PSP_RunLoopFor(blockTicks);
++		coreState == CORE_STEPPING_GE || coreState == CORE_RUNNING_GE) {
+ 		// Savestate loads/saves are queued and applied here, same as EmuScreen::render does in the
+ 		// app. Without this, --state silently did nothing at all.
+ 		SaveState::Process();

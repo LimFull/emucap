@@ -157,6 +157,73 @@ fn log_artifact_missing_file_errors() {
 }
 
 #[test]
+fn log_artifact_rejects_oversized_regular_file_without_mutating_ledger() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let gen = FixedGen(std::cell::Cell::new(0));
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
+    let artifact = dir.path().join("oversized.bin");
+    let file = std::fs::File::create(&artifact).unwrap();
+    file.set_len(ops::MAX_TRACK_ARTIFACT_BYTES + 1).unwrap();
+
+    assert!(ops::log_artifact(root, "sha-a", &run.id, &gen, "dump", &artifact, None,).is_err());
+    assert!(store::load_run(root, "sha-a", &run.id)
+        .unwrap()
+        .artifacts
+        .is_empty());
+}
+
+#[test]
+fn artifact_hash_streaming_counter_rejects_bytes_past_the_limit() {
+    assert!(ops::hash_reader_bounded(std::io::Cursor::new(vec![0u8; 8]), 8).is_ok());
+    let error = ops::hash_reader_bounded(std::io::Cursor::new(vec![0u8; 9]), 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[cfg(unix)]
+#[test]
+fn log_artifact_rejects_symlink_without_mutating_ledger() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let gen = FixedGen(std::cell::Cell::new(0));
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
+    let target = dir.path().join("target.bin");
+    let artifact = dir.path().join("artifact.bin");
+    std::fs::write(&target, b"evidence").unwrap();
+    symlink(&target, &artifact).unwrap();
+
+    assert!(ops::log_artifact(root, "sha-a", &run.id, &gen, "dump", &artifact, None,).is_err());
+    assert!(store::load_run(root, "sha-a", &run.id)
+        .unwrap()
+        .artifacts
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn log_artifact_rejects_fifo_without_blocking_or_mutating_ledger() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let gen = FixedGen(std::cell::Cell::new(0));
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
+    let artifact = dir.path().join("artifact.fifo");
+    let fifo_path = CString::new(artifact.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo_path is a valid NUL-terminated path and the mode is owner-only.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+    assert!(ops::log_artifact(root, "sha-a", &run.id, &gen, "dump", &artifact, None,).is_err());
+    assert!(store::load_run(root, "sha-a", &run.id)
+        .unwrap()
+        .artifacts
+        .is_empty());
+}
+
+#[test]
 fn log_finding_writes_finding_file() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();

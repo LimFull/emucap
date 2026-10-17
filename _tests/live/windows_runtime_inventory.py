@@ -7,9 +7,11 @@ checks deployment bytes and profile paths; it does not establish game execution.
 import argparse
 import json
 from pathlib import Path
+import sys
 import tomllib
 
-from qualification_batch import prepare, sha
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qualification_batch import prepare, sha  # noqa: E402
 
 
 def relative_path(root, member):

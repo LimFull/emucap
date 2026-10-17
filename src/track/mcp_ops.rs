@@ -50,6 +50,7 @@ impl std::error::Error for TrackingToolError {}
 impl From<store::TrackError> for TrackingToolError {
     fn from(error: store::TrackError) -> Self {
         let code = match &error {
+            store::TrackError::ResourceLimit { .. } => "resource_limit",
             store::TrackError::Invalid(_) => "invalid_identifier",
             store::TrackError::Parse { .. }
             | store::TrackError::Corrupt(_)
@@ -105,6 +106,15 @@ impl From<index::IndexError> for TrackingToolError {
     }
 }
 
+impl From<query::QueryError> for TrackingToolError {
+    fn from(error: query::QueryError) -> Self {
+        match error {
+            query::QueryError::Track(error) => error.into(),
+            query::QueryError::Sqlite(error) => Self::new("tracking_io_error", error.to_string()),
+        }
+    }
+}
+
 pub type TrackingResult<T> = Result<T, TrackingToolError>;
 
 /// run_finish의 status 문자열을 RunStatus로 파싱한다(done|aborted|error).
@@ -146,12 +156,62 @@ pub fn start_run(
     description: Option<String>,
     tags: Vec<String>,
 ) -> TrackingResult<Value> {
-    // Reject an unsafe identity before superseding any existing run.
+    let plan = prepare_start_run(root, rom_sha1, connection_ref)?;
+    start_run_prepared(plan, gen, now, goal, description, tags)
+}
+
+pub struct PreparedRunStart {
+    root: std::path::PathBuf,
+    rom_sha1: String,
+    connection_ref: Option<String>,
+    stale: Vec<(String, String)>,
+}
+
+/// Complete scan admission before the caller supersedes its in-memory active run.
+pub fn prepare_start_run(
+    root: &Path,
+    rom_sha1: &str,
+    connection_ref: Option<String>,
+) -> TrackingResult<PreparedRunStart> {
     store::validate_ledger_id("rom_sha1", rom_sha1)?;
-    // 원장 위생(#56): 같은 connection의 디스크 고아 running을 aborted(superseded)로. best-effort —
-    // 실패해도 새 run 진행(서버 재시작으로 in-memory가 사라져도 같은-connection 고아를 정리).
-    if let Some(cref) = connection_ref.as_deref() {
-        let _ = ops::finish_stale_running(root, cref, RunStatus::Aborted, now);
+    let stale = if let Some(cref) = connection_ref.as_deref() {
+        match store::walk_runs(root) {
+            Ok(runs) => runs
+                .into_iter()
+                .filter(|run| {
+                    run.status == RunStatus::Running && run.connection_ref.as_deref() == Some(cref)
+                })
+                .map(|run| (run.rom_sha1, run.id))
+                .collect(),
+            Err(error @ store::TrackError::ResourceLimit { .. }) => return Err(error.into()),
+            Err(_) => Vec::new(), // Preserve best-effort cleanup for existing corrupt records.
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(PreparedRunStart {
+        root: root.to_owned(),
+        rom_sha1: rom_sha1.into(),
+        connection_ref,
+        stale,
+    })
+}
+
+pub fn start_run_prepared(
+    plan: PreparedRunStart,
+    gen: &dyn IdGen,
+    now: &str,
+    goal: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+) -> TrackingResult<Value> {
+    let root = plan.root.as_path();
+    let rom_sha1 = plan.rom_sha1.as_str();
+    let connection_ref = plan.connection_ref;
+    for (rom, id) in plan.stale {
+        if ops::finish_run(root, &rom, &id, RunStatus::Aborted, now).is_err() {
+            break; // Preserve the existing best-effort cleanup's first-error boundary.
+        }
     }
     let run = ops::create_run(
         root,
@@ -326,7 +386,10 @@ pub fn log_artifact(
 ) -> TrackingResult<Value> {
     // 상대경로는 MCP 서버 cwd가 아니라 *작업 repo* 루트 기준으로 해소(최소놀람·재현성).
     let resolved = resolve_artifact_path(raw_path, git_root);
-    if !resolved.exists() {
+    if matches!(
+        std::fs::symlink_metadata(&resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
         let base = git_root
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "current working directory".into());
@@ -426,21 +489,19 @@ pub fn query_runs(root: &Path, filter: RunFilter) -> TrackingResult<Value> {
     let conn = index::open_index(&root.join("index.sqlite")).map_err(TrackingToolError::from)?;
     // fast-read는 lenient reindex: 손상/이질 JSON 하나가 query 전체를 죽이지 않게 skip하되 노출한다.
     let (_, skipped) = index::reindex_lenient(root, &conn).map_err(TrackingToolError::from)?;
-    let rows = query::query_runs(&conn, &filter)
-        .map_err(|error| TrackingToolError::new("tracking_error", error.to_string()))?;
-    let arr: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "rom_sha1": r.rom_sha1,
-                "goal": r.goal,
-                "status": r.status,
-                "repro_status": r.repro_status,
-            })
-        })
-        .collect();
-    Ok(serde_json::json!({ "runs": arr, "skipped": skipped.len() }))
+    let rows = query::query_runs(&conn, &filter).map_err(TrackingToolError::from)?;
+    #[derive(serde::Serialize)]
+    struct QueryResponse<'a> {
+        runs: &'a [query::RunRow],
+        skipped: usize,
+    }
+    let response = QueryResponse {
+        runs: &rows,
+        skipped: skipped.len(),
+    };
+    super::budget::check_result(&response)?;
+    serde_json::to_value(response)
+        .map_err(|error| TrackingToolError::new("tracking_error", error.to_string()))
 }
 
 /// 저장된 run.json 내용과 ledger_path를 반환한다.

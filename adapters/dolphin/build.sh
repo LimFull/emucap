@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Build the pinned Dolphin fork used by the native GameCube/Wii adapter.
 set -euo pipefail
+if [ "${EMUCAP_DOLPHIN_REQUIRE_GUI:-0}" = 1 ] && [ "${EMUCAP_DOLPHIN_BUILD_GUI:-1}" = 0 ]; then
+  echo "ERROR: GUI is required but disabled" >&2
+  exit 1
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
@@ -18,9 +22,44 @@ emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "Dolphin"
 SRC="$WORK/dolphin-src"
 ORIGIN="${EMUCAP_DOLPHIN_SRC:-$DOLPHIN_REPO}"
 if [ ! -d "$SRC/.git" ]; then
-  git clone --filter=blob:none "$ORIGIN" "$SRC"
+  # Fetch only the locked revision. Local shallow origins must not become partial-clone
+  # promisors: nested lazy fetches can recurse while Git prepares the checkout.
+  git init -q "$SRC"
+  git -C "$SRC" remote add origin "$ORIGIN"
 fi
 git -C "$SRC" fetch --depth 1 origin "$DOLPHIN_COMMIT"
+# A reused work tree contains the previous patch stack. Restore it against its
+# current HEAD before changing revisions, then remove only files introduced by
+# repository-owned patches or copied adapter sources. Build outputs remain.
+if git -C "$SRC" rev-parse --verify HEAD >/dev/null 2>&1; then
+  git -C "$SRC" checkout -- .
+fi
+while IFS= read -r -d '' patch; do
+  while IFS= read -r added_file; do
+    case "$added_file" in
+      a/*|b/*|i/*|w/*) added_file="${added_file#*/}" ;;
+    esac
+    case "$added_file" in
+      /*|../*|*/../*|*/..|.)
+        echo "ERROR: patch adds a file outside the Dolphin source tree: $added_file" >&2
+        exit 1
+        ;;
+      *) rm -f -- "$SRC/$added_file" ;;
+    esac
+  done < <(awk '/^--- \/dev\/null$/{getline; sub(/^\+\+\+ /, ""); print}' "$patch")
+done < <(find "$HERE/patches" -type f -name '*.patch' -print0 | LC_ALL=C sort -z)
+git -C "$SRC" clean -fdq -- \
+  Source/Core/Core/EmuCap.cpp \
+  Source/Core/Core/EmuCap.h \
+  Source/Core/Core/EmuCapInput.cpp \
+  Source/Core/Core/EmuCapInput.h \
+  Source/Core/Core/EmuCapTemporal.h \
+  Source/Core/Core/EmuCapOwner.h \
+  Source/Core/Core/EmuCapWire.h \
+  Source/Core/Core/EmuCapOwned.inl \
+  Source/Core/Core/EmuCapPacing.h \
+  Source/Core/Core/EmuCapAudio.h \
+  Source/Core/Core/EmuCapFrontAuth.h
 git -C "$SRC" checkout --detach "$DOLPHIN_COMMIT"
 
 # These top-level submodules are Windows- or Android-only. Desktop Unix builds use the remaining
@@ -103,8 +142,7 @@ git -C "$SRC" checkout -- \
   Source/Core/DolphinNoGUI/Platform.h \
   Source/Core/DolphinNoGUI/PlatformHeadless.cpp \
   Source/Core/DolphinNoGUI/MainNoGUI.cpp \
-  Source/Core/DolphinQt/Settings.cpp \
-  Source/Core/DolphinLib.props
+  Source/Core/DolphinQt/Settings.cpp
 git -C "$SRC" clean -fdq -- \
   Source/Core/Core/EmuCap.cpp \
   Source/Core/Core/EmuCap.h \
@@ -115,7 +153,8 @@ git -C "$SRC" clean -fdq -- \
   Source/Core/Core/EmuCapWire.h \
   Source/Core/Core/EmuCapOwned.inl \
   Source/Core/Core/EmuCapPacing.h \
-  Source/Core/Core/EmuCapAudio.h
+  Source/Core/Core/EmuCapAudio.h \
+  Source/Core/Core/EmuCapFrontAuth.h
 cp "$HERE/EmuCap.cpp" "$SRC/Source/Core/Core/EmuCap.cpp"
 cp "$HERE/EmuCap.h" "$SRC/Source/Core/Core/EmuCap.h"
 cp "$HERE/EmuCapInput.cpp" "$SRC/Source/Core/Core/EmuCapInput.cpp"
@@ -126,6 +165,7 @@ cp "$HERE/EmuCapWire.h" "$SRC/Source/Core/Core/EmuCapWire.h"
 cp "$HERE/EmuCapOwned.inl" "$SRC/Source/Core/Core/EmuCapOwned.inl"
 cp "$HERE/EmuCapPacing.h" "$SRC/Source/Core/Core/EmuCapPacing.h"
 cp "$HERE/EmuCapAudio.h" "$SRC/Source/Core/Core/EmuCapAudio.h"
+cp "$HERE/../_common/emucap_front_auth.h" "$SRC/Source/Core/Core/EmuCapFrontAuth.h"
 for patch in "$HERE"/patches/*.patch; do
   echo "applying $(basename "$patch")"
   git -C "$SRC" apply --check "$patch"
@@ -155,13 +195,13 @@ COMMON_ARGS=(
 # configures from a fresh cache. Unchanged compile commands keep their objects.
 HEADLESS_BUILD="$SRC/build-emucap-headless"
 rm -f "$HEADLESS_BUILD/CMakeCache.txt"
-cmake -S "$SRC" -B "$HEADLESS_BUILD" "${COMMON_ARGS[@]}" -DENABLE_HEADLESS=ON -DENABLE_QT=OFF
+cmake -S "$SRC" -B "$HEADLESS_BUILD" "${COMMON_ARGS[@]}" -DENABLE_HEADLESS=ON -DENABLE_NOGUI=ON -DENABLE_QT=OFF
 cmake --build "$HEADLESS_BUILD" --target dolphin-nogui -j "$JOBS"
 
 PATCHSET_SHA256="$(
   cd "$HERE"
   {
-    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h EmuCapPacing.h EmuCapAudio.h EmuCapOwner.h EmuCapWire.h EmuCapOwned.inl
+    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h EmuCapPacing.h EmuCapAudio.h EmuCapOwner.h EmuCapWire.h EmuCapOwned.inl ../_common/emucap_front_auth.h
     find patches -type f -name '*.patch' -print0 |
       LC_ALL=C sort -z |
       xargs -0 shasum -a 256
@@ -186,6 +226,17 @@ write_metadata() {
   } >"$destination"
 }
 
+# Standalone Linux executables discover immutable system assets beside the binary.
+# Stage those assets for the portable launcher and release packager, without user data.
+stage_system_data() {
+  destination="$1"
+  if [ "$(uname -s)" != Darwin ]; then
+    rm -rf "$destination/Sys"
+    cmake -E copy_directory "$SRC/Data/Sys" "$destination/Sys"
+  fi
+}
+
+stage_system_data "$HEADLESS_BUILD/Binaries"
 HEADLESS_BIN="$HEADLESS_BUILD/Binaries/dolphin-emu-nogui"
 write_metadata "$HEADLESS_BUILD/Binaries/emucap-dolphin-build.json"
 echo "built: $HEADLESS_BIN"
@@ -201,10 +252,15 @@ if [ "${EMUCAP_DOLPHIN_BUILD_GUI:-1}" != "0" ]; then
       write_metadata "$GUI_BUILD/Binaries/DolphinQt.app/Contents/MacOS/emucap-dolphin-build.json"
       echo "built: $GUI_BUILD/Binaries/DolphinQt.app"
     else
+      stage_system_data "$GUI_BUILD/Binaries"
       write_metadata "$GUI_BUILD/Binaries/emucap-dolphin-build.json"
       echo "built: $GUI_BUILD/Binaries"
     fi
   else
+    if [ "${EMUCAP_DOLPHIN_REQUIRE_GUI:-0}" = 1 ]; then
+      echo "ERROR: required Dolphin GUI target failed to build" >&2
+      exit 1
+    fi
     echo "WARNING: Dolphin GUI build failed; the headless build is ready." >&2
   fi
 fi

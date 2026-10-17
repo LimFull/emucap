@@ -415,35 +415,8 @@ pub(super) fn sha256_file(path: &Path) -> Np2kaiResult<String> {
 }
 
 pub(super) fn atomic_write(path: &Path, data: &[u8]) -> Np2kaiResult<()> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| {
-            Np2kaiError::BadParams(format!("invalid output path: {}", path.display()))
-        })?;
-    let partial = path.with_file_name(format!(".{name}.partial-{}", std::process::id()));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let result = (|| -> Np2kaiResult<()> {
-        let mut file = fs::File::create(&partial)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        if path.is_file() {
-            fs::remove_file(path)?;
-        } else if path.exists() {
-            return Err(Np2kaiError::BadParams(format!(
-                "output path is not a regular file: {}",
-                path.display()
-            )));
-        }
-        fs::rename(&partial, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&partial);
-    }
-    result
+    crate::path_safety::atomic_write_file(path, data)?;
+    Ok(())
 }
 
 pub(super) fn state_sidecar(path: &Path) -> PathBuf {

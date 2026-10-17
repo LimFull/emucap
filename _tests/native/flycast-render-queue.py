@@ -12,7 +12,7 @@ s = a.source.read_text()
 s = s[s.index('class PvrMessageQueue'):s.index('\nstatic PvrMessageQueue pvrQueue;')]
 # Keep native submission, dequeue, dispatch, cancellation and completion code.
 # Replace only graphics backend work with a deterministic guest-memory writer.
-for signature in ['void render()', 'void renderFramebuffer(const FramebufferInfo& config)', 'void present()']:
+for signature in ['void render()', 'void renderFramebuffer(const FramebufferInfo& config)']:
     start = s.index(signature)
     opening = s.index('{', start)
     depth, end = 1, opening + 1
@@ -20,6 +20,14 @@ for signature in ['void render()', 'void renderFramebuffer(const FramebufferInfo
         depth += (s[end] == '{') - (s[end] == '}')
         end += 1
     s = s[:opening] + '{ writer(); }' + s[end:]
+adapter = (root/'adapters/flycast/emucap.cpp').read_text()
+start = adapter.index('void emucap_capture_latest()')
+opening = adapter.index('{', start)
+depth, end = 1, opening + 1
+while depth:
+    depth += (adapter[end] == '{') - (adapter[end] == '}')
+    end += 1
+capture_body = adapter[start:end]
 code = r'''
 #include "emucap_render_fence.h"
 #include <atomic>
@@ -29,6 +37,7 @@ code = r'''
 #include <functional>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 using namespace std::chrono_literals;
 std::atomic<unsigned> signals{0};
 class cResetEvent {
@@ -46,15 +55,60 @@ struct FramebufferInfo {};
 void setDefaultRoundingMode(){}
 struct {void restoreHostRoundingMode(){}} Sh4cntx;
 std::function<void()> writer=[]{ };
+std::function<void()> capture=[]{ };
+std::mutex g_fb_mtx;
+std::vector<unsigned char> g_fb_raw;
+int g_fb_w=0,g_fb_h=0;
+bool g_fb_fresh=false;
+std::atomic<bool> g_capture_disabled{false};
+void emucap_capture_raw(std::vector<unsigned char>& raw,int& w,int& h){capture();raw={1,2,3};w=h=1;}
+bool publish_native_failure(const char*,const char*,bool,const char*){return true;}
+// ACTUAL_CAPTURE_BODY
+struct Renderer { bool visible=true; bool Present(){return visible;} } backend;
+Renderer* renderer=&backend;
+bool presented=false;
+namespace ggpo { bool active(){return false;} }
+struct Executor {void Stop(){}} executor;
+struct {Executor* getSh4Executor(){return &executor;}} emu;
 int failure_reports=0;
 void emucap_renderer_failed(const char* reason) noexcept {assert(reason && *reason);++failure_reports;}
-''' + s + r'''
+'''.replace('// ACTUAL_CAPTURE_BODY', capture_body) + s + r'''
 using Result=EmucapRenderFence::Result;
 void await_submission(unsigned before){
  auto deadline=std::chrono::steady_clock::now()+2s;
  while(signals.load()==before){assert(std::chrono::steady_clock::now()<deadline);std::this_thread::yield();}
 }
 int main(){
+ // Actual Present must publish its capture before the later fence can complete.
+ {
+  PvrMessageQueue q;std::promise<void> entered,release;
+  auto gate=release.get_future();int published=0;
+  capture=[&]{entered.set_value();gate.wait();++published;};
+  q.enqueue(PvrMessageQueue::Present);
+  auto consumer=std::async(std::launch::async,[&]{return q.waitAndExecute();});
+  assert(entered.get_future().wait_for(2s)==std::future_status::ready);
+  auto before=signals.load();
+  auto observer=std::async(std::launch::async,[&]{return q.waitForWriters(2000);});
+  await_submission(before);assert(observer.wait_for(10ms)==std::future_status::timeout);
+  release.set_value();assert(consumer.get());assert(published==1);
+  assert(q.waitAndExecute(0));assert(observer.get()==Result::complete);
+ }
+ // No new native presentation means no new capture. Inline uses the same hook.
+ for(bool threaded : {true,false}) {
+  config::ThreadedRendering=threaded;PvrMessageQueue q;int published=0;
+  capture=[&]{++published;};backend.visible=false;
+  q.enqueue(PvrMessageQueue::Present);if(threaded)assert(q.waitAndExecute(0));
+  assert(published==0);backend.visible=true;
+  for(int i=0;i<5;++i){q.enqueue(PvrMessageQueue::Present);if(threaded)assert(q.waitAndExecute(0));assert(published==i+1);}
+ }
+ config::ThreadedRendering=true;capture=[]{ };
+ // Capture exceptions disable observation rather than reusing an older image.
+ {
+  PvrMessageQueue q;capture=[]{throw std::runtime_error("capture failed");};
+  q.enqueue(PvrMessageQueue::Present);assert(q.waitAndExecute(0));
+  assert(g_capture_disabled.load());
+  g_capture_disabled=false;capture=[]{ };
+ }
  // Already executing writer: the observer cannot see its half-written state.
  for(int disposition : {0,1,2}) {
   PvrMessageQueue q; int values[2]={0,0};
@@ -144,7 +198,7 @@ with tempfile.TemporaryDirectory(prefix='flycast-queue-') as d:
     subprocess.run(['clang++', '-std=c++17', '-O1', '-g', '-pthread', '-fsanitize='+a.sanitizer,
                     '-I'+str(root/'adapters/flycast'), str(d/'check.cpp'), '-o', str(d/'check')], check=True)
     subprocess.run([str(d/'check')], check=True, timeout=30)
-print('PASS native renderer queue: in-flight/queued writer, reset, cancellation, exception, stop, timeout, inline completion')
+print('PASS native renderer queue: in-flight/queued writer, reset, cancellation, exception, stop, timeout, inline completion, presentation publication')
 
 if a.rtt_source:
     print('PASS actual ReadRTTBuffer: direct readback and conversion finish before queue fence')

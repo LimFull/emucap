@@ -25,14 +25,6 @@ NAME="${3:-}"
 case "$PORT" in ''|*[!0-9]*) echo "ERROR: EMUCAP_PORT must be a decimal TCP port: $PORT" >&2; exit 2;; esac
 if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65534 ]; then echo "ERROR: EMUCAP_PORT out of range: $PORT" >&2; exit 2; fi
 
-emucap_data_root() {
-  if [ -n "${EMUCAP_EMU_HOME:-}" ]; then printf '%s\n' "$EMUCAP_EMU_HOME"; return; fi
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin) printf '%s\n' "${HOME:-/tmp}/Library/Application Support/emucap" ;;
-    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "${LOCALAPPDATA:-${HOME:-/tmp}/AppData/Local}/emucap" ;;
-    *) printf '%s\n' "${XDG_DATA_HOME:-${HOME:-/tmp}/.local/share}/emucap" ;;
-  esac
-}
 
 # GDB ports (DeSmuME opens one stub per CPU). 파생 PORT+1000/+1001은 인접 emucap 포트끼리 겹친다
 # (세션 N의 ARM7 = N+1의 ARM9), 그래서 OS가 배정한 자유 포트를 쓴다 — 두 소켓을 동시에 바인딩해 서로
@@ -53,18 +45,18 @@ for p in "$ARM9_PORT" "$ARM7_PORT"; do
   if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then echo "ERROR: GDB port out of range: $p" >&2; exit 2; fi
 done
 
-DATA_ROOT="$(emucap_data_root)"
+DATA_ROOT="$(emucap_runtime_base)"
 RUN_DIR="$DATA_ROOT/desmume-nds/$PORT"
 LOG="${EMUCAP_LOG:-$RUN_DIR/desmume-nds.log}"
 EMU_PIDFILE="$RUN_DIR/desmume.pid"
 BRIDGE_PIDFILE="$RUN_DIR/bridge.pid"
 WAIT="${EMUCAP_LAUNCH_WAIT:-20}"
 POST_CONNECT_GRACE="${EMUCAP_POST_CONNECT_GRACE:-2}"
-TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
-if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SESSION_TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
-fi
+emucap_require_front_identity "$SESSION_TOKEN" "${EMUCAP_LAUNCH_ID:-}" || exit 2
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required to mint a per-launch native debugger token." >&2; exit 2; }
+NATIVE_DEBUG_TOKEN="$(python3 -I -c 'import secrets; print(secrets.token_hex(32))')"
+[ -n "$NATIVE_DEBUG_TOKEN" ] || { echo "ERROR: failed to mint a native debugger token." >&2; exit 2; }
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 # Resolve the headless desmume-cli binary.
@@ -97,6 +89,38 @@ kill_ours() {
   kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true   # stub ignores SIGTERM → SIGKILL
 }
 connected_pid() { command -v lsof >/dev/null 2>&1 || return 2; lsof -nP -a -p "$1" -iTCP:"$PORT" -sTCP:ESTABLISHED >/dev/null 2>&1; }
+listener_owned_by_pid() {
+  local pid="$1" port="$2" port_hex inodes fd target inode owned
+  case "$(uname -s)" in
+    Linux)
+      [ -d "/proc/$pid/fd" ] || return 2
+      port_hex="$(printf '%04X' "$port")"
+      [ -r /proc/net/tcp ] || return 2
+      inodes="$(awk -v port="$port_hex" '
+        NR > 1 && $4 == "0A" {
+          split($2, local, ":")
+          if (toupper(local[1]) == "0100007F" && toupper(local[2]) == port) print $10
+        }
+      ' /proc/net/tcp)"
+      [ -n "$inodes" ] || return 1
+      for fd in "/proc/$pid/fd"/*; do
+        target="$(readlink "$fd" 2>/dev/null || true)"
+        case "$target" in
+          socket:\[*\])
+            inode="${target#socket:[}"; inode="${inode%]}"
+            for owned in $inodes; do [ "$inode" = "$owned" ] && return 0; done
+            ;;
+        esac
+      done
+      return 1
+      ;;
+    Darwin)
+      command -v lsof >/dev/null 2>&1 || return 2
+      lsof -nP -a -p "$pid" -iTCP@127.0.0.1:"$port" -sTCP:LISTEN >/dev/null 2>&1
+      ;;
+    *) return 2 ;;
+  esac
+}
 
 # MCP listener must be up.
 if command -v lsof >/dev/null 2>&1; then
@@ -142,7 +166,7 @@ mkdir -p "$RUN_DIR"
 {
   echo "emucap DeSmuME NDS launch"
   echo "  rom=$ROM"; echo "  port=$PORT"; echo "  name=${NAME:-<none>}"
-  echo "  session_token=${SESSION_TOKEN:+present}"; echo "  arm9_gdb=$ARM9_PORT"; echo "  arm7_gdb=$ARM7_PORT"
+  echo "  front_key=${SESSION_TOKEN:+present}"; echo "  arm9_gdb=$ARM9_PORT"; echo "  arm7_gdb=$ARM7_PORT"
   echo "  desmume_bin=$EMU_BIN"; echo "  bridge_bin=$BRIDGE_BIN"
 } >>"$LOG"
 
@@ -164,20 +188,29 @@ PY
 }
 
 # 1. Spawn headless DeSmuME with both GDB stubs; wait for both ports to LISTEN.
-EMU_PID="$(spawn_detached "$EMU_PIDFILE" "$EMU_BIN" --arm9gdb "$ARM9_PORT" --arm7gdb "$ARM7_PORT" --disable-sound "$ROM")"
-if command -v lsof >/dev/null 2>&1; then
-  for ((i = 0; i < WAIT; i++)); do
-    kill -0 "$EMU_PID" 2>/dev/null || { echo "ERROR: desmume-cli exited before gdb was ready (pid=$EMU_PID)." >&2; tail_log; exit 4; }
-    if lsof -nP -a -p "$EMU_PID" -iTCP:"$ARM9_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
-       && lsof -nP -a -p "$EMU_PID" -iTCP:"$ARM7_PORT" -sTCP:LISTEN >/dev/null 2>&1; then break; fi
-    sleep 1
-  done
-  lsof -nP -a -p "$EMU_PID" -iTCP:"$ARM9_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
-    || { echo "ERROR: desmume-cli did not open GDB ports $ARM9_PORT/$ARM7_PORT within ${WAIT}s." >&2; tail_log; kill_ours "$EMU_PID"; exit 4; }
-fi
+EMU_PID="$(EMUCAP_NATIVE_DEBUG_TOKEN="$NATIVE_DEBUG_TOKEN" \
+  spawn_detached "$EMU_PIDFILE" "$EMU_BIN" --arm9gdb "$ARM9_PORT" --arm7gdb "$ARM7_PORT" --disable-sound "$ROM")"
+GDB_READY=0
+for ((i = 0; i < WAIT; i++)); do
+  kill -0 "$EMU_PID" 2>/dev/null || { echo "ERROR: desmume-cli exited before gdb was ready (pid=$EMU_PID)." >&2; tail_log; exit 4; }
+  if listener_owned_by_pid "$EMU_PID" "$ARM9_PORT" \
+     && listener_owned_by_pid "$EMU_PID" "$ARM7_PORT"; then
+    GDB_READY=1
+    break
+  fi
+  ARM9_OWNER_STATUS=0; listener_owned_by_pid "$EMU_PID" "$ARM9_PORT" || ARM9_OWNER_STATUS=$?
+  ARM7_OWNER_STATUS=0; listener_owned_by_pid "$EMU_PID" "$ARM7_PORT" || ARM7_OWNER_STATUS=$?
+  if [ "$ARM9_OWNER_STATUS" -eq 2 ] || [ "$ARM7_OWNER_STATUS" -eq 2 ]; then
+    echo "ERROR: cannot verify GDB listener ownership on this host; refusing to release the native debugger token." >&2
+    tail_log; kill_ours "$EMU_PID"; exit 4
+  fi
+  sleep 1
+done
+[ "$GDB_READY" -eq 1 ] \
+  || { echo "ERROR: desmume-cli did not own both GDB ports within ${WAIT}s; refusing to release the native debugger token." >&2; tail_log; kill_ours "$EMU_PID"; exit 4; }
 
 # 2. Spawn the bridge; wait for it to connect to the emucap port.
-BRIDGE_PID="$(EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$ROM" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$EMU_PID" \
+BRIDGE_PID="$(EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_NATIVE_DEBUG_TOKEN="$NATIVE_DEBUG_TOKEN" EMUCAP_CONTENT="$ROM" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$EMU_PID" \
   spawn_detached "$BRIDGE_PIDFILE" "$BRIDGE_BIN" "$PORT" "127.0.0.1:$ARM9_PORT" "127.0.0.1:$ARM7_PORT")"
 if command -v lsof >/dev/null 2>&1; then
   for ((i = 0; i < WAIT; i++)); do

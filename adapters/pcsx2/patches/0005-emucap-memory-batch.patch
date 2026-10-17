@@ -1,6 +1,7 @@
-diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
---- a/pcsx2/PINE.cpp
-+++ b/pcsx2/PINE.cpp
+diff --git c/pcsx2/PINE.cpp i/pcsx2/PINE.cpp
+index bb79c99..40f3b8d 100644
+--- c/pcsx2/PINE.cpp
++++ i/pcsx2/PINE.cpp
 @@ -81,7 +81,7 @@
  #endif
  
@@ -10,7 +11,7 @@ diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
  #define EMUCAP_EE_RAM_SIZE 0x02000000
  #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
  #define EMUCAP_MAX_FRAME_ADVANCE 5000
-@@ -210,6 +210,7 @@
+@@ -210,6 +210,7 @@ namespace PINEServer
  		MsgEmuCapChangeMemoryCard = 0x94, /**< Ejects or inserts one managed file memory card. */
  		MsgEmuCapPacing = 0x95, /**< Returns the agent pacing readback and the frame counter. */
  		MsgEmuCapSetPacing = 0x96, /**< Sets a percent of the guest rate, or 0 for unlimited. */
@@ -18,12 +19,10 @@ diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
  		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
  	};
  
-@@ -1044,6 +1045,37 @@
- 					ToResultVector(ret_buffer, r5900Debug.getLO().lo, ret_cnt);
- 					ret_cnt += 8;
+@@ -1044,6 +1045,37 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
  				}, true);
-+				break;
-+			}
+ 				break;
+ 			}
 +			case MsgEmuCapMemoryBatch:
 +			{
 +				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) goto error;
@@ -53,13 +52,16 @@ diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
 +				}, true);
 +				if (!success) goto error;
 +				ret_cnt += 16 + total;
- 				break;
- 			}
++				break;
++			}
  			case MsgEmuCapReadBytes:
-diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
---- a/pcsx2/VMManager.cpp
-+++ b/pcsx2/VMManager.cpp
-@@ -181,6 +181,9 @@
+ 			{
+ 				if (!VMManager::HasValidVM())
+diff --git c/pcsx2/VMManager.cpp i/pcsx2/VMManager.cpp
+index 1769e96..564f31e 100644
+--- c/pcsx2/VMManager.cpp
++++ i/pcsx2/VMManager.cpp
+@@ -184,6 +184,9 @@ static bool s_fast_boot_requested = false;
  static bool s_gs_open_on_initialize = false;
  static bool s_thread_affinities_set = false;
  
@@ -69,7 +71,7 @@ diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
  static LimiterModeType s_limiter_mode = LimiterModeType::Nominal;
  static s64 s_limiter_ticks_per_frame = 0;
  static u64 s_limiter_frame_start = 0;
-@@ -264,6 +267,7 @@
+@@ -270,6 +273,7 @@ void VMManager::ResetResumeTimestamp()
  
  void VMManager::SetState(VMState state)
  {
@@ -77,7 +79,7 @@ diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
  	// Some state transitions aren't valid.
  	const VMState old_state = s_state.load(std::memory_order_acquire);
  	pxAssert(state != VMState::Initializing && state != VMState::Shutdown);
-@@ -1704,6 +1708,7 @@
+@@ -1767,6 +1771,7 @@ bool VMManager::RequestReset()
  
  void VMManager::Reset(bool force)
  {
@@ -85,7 +87,7 @@ diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
  	pxAssert(HasValidVM());
  
  	// If we're running, we're probably going to be executing this at event test time,
-@@ -1836,6 +1841,7 @@
+@@ -1899,6 +1904,7 @@ std::string VMManager::GetCurrentSaveStateFileName(s32 slot, bool backup)
  
  bool VMManager::DoLoadState(const char* filename, Error* error)
  {
@@ -93,10 +95,11 @@ diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
  	if (GSDumpReplayer::IsReplayingDump())
  	{
  		Error::SetString(error, TRANSLATE_STR("VMManager", "Cannot load state while replaying a GS dump."));
-diff --git a/pcsx2/VMManager.h b/pcsx2/VMManager.h
---- a/pcsx2/VMManager.h
-+++ b/pcsx2/VMManager.h
-@@ -65,6 +65,7 @@
+diff --git c/pcsx2/VMManager.h i/pcsx2/VMManager.h
+index a1764c6..8d3b656 100644
+--- c/pcsx2/VMManager.h
++++ i/pcsx2/VMManager.h
+@@ -68,6 +68,7 @@ using VMBootDoneCallback = std::function<void(VMBootResult result, const Error&
  
  namespace VMManager
  {

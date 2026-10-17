@@ -258,8 +258,22 @@ fn publishes_and_reverifies_exact_terminal_snapshot_members() {
 #[test]
 fn publishes_and_reverifies_event_aligned_initial_snapshot_members() {
     let root = tempfile::tempdir().unwrap();
+    let published = publish_initial_snapshot(root.path(), false);
+    let verified = verify_published_recording(
+        &published.bundle_path,
+        &EventContractRegistry::builtin().unwrap(),
+    )
+    .unwrap();
+    assert!(verified.manifest.members.iter().any(|member| {
+        member.role == MemberRole::InitialSnapshot
+            && member.path == "initial-snapshots/wram-start.bin"
+            && member.sha256 == hex::encode(Sha256::digest([1, 2, 3, 4]))
+    }));
+}
+
+fn publish_initial_snapshot(root: &std::path::Path, all_options: bool) -> PublishedRecording {
     let capture_id = "capture-initial-snapshot";
-    let mut staging = RecordingStaging::prepare(root.path(), capture_id).unwrap();
+    let mut staging = RecordingStaging::prepare(root, capture_id).unwrap();
     let snapshot = InitialSnapshotRequest {
         label: "wram-start".into(),
         memory_type: "snesWorkRam".into(),
@@ -299,19 +313,74 @@ fn publishes_and_reverifies_event_aligned_initial_snapshot_members() {
         observed: 1,
         dropped: 0,
     }];
-    let published = staging
+    if all_options {
+        add_movie_state_and_terminal(&mut staging, &mut input);
+    }
+    staging
         .publish(&EventContractRegistry::builtin().unwrap(), input)
+        .unwrap()
+}
+
+fn add_movie_state_and_terminal(staging: &mut RecordingStaging, input: &mut RecordingBundleInput) {
+    let movie = b"0:right\n";
+    let movie_identity = InputMovieIdentity {
+        format: crate::input_movie::INPUT_MOVIE_FORMAT.into(),
+        port: 0,
+        frames: 1,
+        bytes: movie.len() as u64,
+        sha256: hex::encode(Sha256::digest(movie)),
+    };
+    staging.write_input_movie(movie, &movie_identity).unwrap();
+    input.validation.request.input_movie = Some(movie_identity);
+    let state = b"opaque-saved-state";
+    let identity = StateArtifactIdentity {
+        format: "mesen-savestate".into(),
+        bytes: state.len() as u64,
+        sha256: hex::encode(Sha256::digest(state)),
+    };
+    staging.write_initial_state(state, &identity).unwrap();
+    input.validation.origin = RecordingOrigin::StateLoad;
+    input.validation.request.initial_state = Some(StateSnapshotReceipt {
+        snapshot_id: "snapshot-01test".into(),
+        snapshot: identity,
+        source: input.runtime.clone(),
+        frozen: StateSnapshotFrozenFacts {
+            state: FinalExecutionState::Frozen,
+            frame: 10,
+            boundary: StateSnapshotBoundary::FrameBoundary,
+        },
+    });
+    let snapshot = TerminalSnapshotRequest {
+        label: "wram-end".into(),
+        memory_type: "workram".into(),
+        address: 4,
+        length: 4,
+    };
+    staging
+        .write_terminal_snapshot(&snapshot, &[4, 5, 6, 7])
         .unwrap();
+    input.validation.request.terminal_snapshots = vec![snapshot];
+    let terminal = TerminalStateRequest {
+        profile: "cpu".into(),
+        contract_sha256: "55".repeat(32),
+    };
+    staging
+        .write_terminal_state(&terminal, b"{\"pc\":42}")
+        .unwrap();
+    input.validation.request.terminal_state = Some(terminal);
+}
+
+#[test]
+fn publishes_and_reverifies_all_optional_members_together() {
+    let root = tempfile::tempdir().unwrap();
+    let published = publish_initial_snapshot(root.path(), true);
     let verified = verify_published_recording(
         &published.bundle_path,
         &EventContractRegistry::builtin().unwrap(),
     )
     .unwrap();
-    assert!(verified.manifest.members.iter().any(|member| {
-        member.role == MemberRole::InitialSnapshot
-            && member.path == "initial-snapshots/wram-start.bin"
-            && member.sha256 == hex::encode(Sha256::digest([1, 2, 3, 4]))
-    }));
+    assert_eq!(verified.manifest.members.len(), 6);
+    assert_eq!(verified.manifest_sha256, published.manifest_sha256);
 }
 
 #[cfg(unix)]
@@ -417,6 +486,162 @@ fn published_verification_rejects_member_tampering() {
 }
 
 #[test]
+fn publication_rejects_unmanifested_root_and_event_files() {
+    for member in ["extra.bin", "events/extra.ndjson"] {
+        let root = tempfile::tempdir().unwrap();
+        let capture_id = "capture-extra";
+        let mut staging = RecordingStaging::prepare(root.path(), capture_id).unwrap();
+        let bytes = write_exact(&mut staging, 1);
+        fs::write(staging.staging_path().join(member), b"unrequested").unwrap();
+        let result = staging.publish(
+            &EventContractRegistry::builtin().unwrap(),
+            complete_input(capture_id, 1, bytes),
+        );
+        assert!(result.is_err(), "published unmanifested {member}");
+        assert!(!root.path().join(capture_id).exists());
+        assert_eq!(quarantine_count(root.path(), capture_id), 1);
+    }
+}
+
+#[test]
+fn recovery_verification_rejects_unmanifested_root_and_event_files() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    for member in ["extra.bin", "events/extra.ndjson", RECOVERY_OWNER_MEMBER] {
+        let root = tempfile::tempdir().unwrap();
+        let capture_id = "capture-extra";
+        let mut staging = RecordingStaging::prepare(root.path(), capture_id).unwrap();
+        let bytes = write_exact(&mut staging, 1);
+        let published = staging
+            .publish(&registry, complete_input(capture_id, 1, bytes))
+            .unwrap();
+        fs::write(published.bundle_path.join(member), b"unrequested").unwrap();
+        let mut identity_checked = false;
+        let result =
+            verify_published_recording_checked(&published.bundle_path, &registry, |_, manifest| {
+                assert_eq!(manifest.capture_id, capture_id);
+                identity_checked = true;
+                Ok(())
+            });
+        assert!(identity_checked);
+        assert!(result.is_err(), "recovered unmanifested {member}");
+        assert!(verify_published_recording(&published.bundle_path, &registry).is_err());
+    }
+}
+
+#[test]
+fn publication_and_reopen_reject_unrequested_directories() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    for member in ["extra", "events/extra"] {
+        for before_publish in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let capture_id = "capture-extra-directory";
+            let mut staging = RecordingStaging::prepare(root.path(), capture_id).unwrap();
+            let bytes = write_exact(&mut staging, 1);
+            if before_publish {
+                fs::create_dir(staging.staging_path().join(member)).unwrap();
+                assert!(staging
+                    .publish(&registry, complete_input(capture_id, 1, bytes))
+                    .is_err());
+                assert!(!root.path().join(capture_id).exists());
+                assert_eq!(quarantine_count(root.path(), capture_id), 1);
+            } else {
+                let published = staging
+                    .publish(&registry, complete_input(capture_id, 1, bytes))
+                    .unwrap();
+                fs::create_dir(published.bundle_path.join(member)).unwrap();
+                assert!(verify_published_recording(&published.bundle_path, &registry).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn published_verification_rejects_file_in_place_of_event_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let published = publish_initial_snapshot(root.path(), true);
+    let path = published.bundle_path.join("events");
+    fs::remove_dir_all(&path).unwrap();
+    fs::write(path, b"not a directory").unwrap();
+    assert!(verify_published_recording(
+        &published.bundle_path,
+        &EventContractRegistry::builtin().unwrap()
+    )
+    .is_err());
+}
+
+#[cfg(unix)]
+fn make_special_member(path: &std::path::Path, kind: &str) {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink, net::UnixListener};
+    match kind {
+        "symlink" => symlink("missing-target", path).unwrap(),
+        "fifo" => {
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+        "socket" => {
+            // Bind under a short name before moving into the nested bundle path.
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("s");
+            drop(UnixListener::bind(&socket).unwrap());
+            fs::rename(socket, path).unwrap();
+        }
+        _ => panic!("unknown special member kind"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_rejects_special_unmanifested_members_without_opening_them() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    for member in ["x", "events/x"] {
+        for kind in ["symlink", "fifo", "socket"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut staging = RecordingStaging::prepare(root.path(), "extra").unwrap();
+            let bytes = write_exact(&mut staging, 1);
+            make_special_member(&staging.staging_path().join(member), kind);
+            assert!(staging
+                .publish(&registry, complete_input("extra", 1, bytes))
+                .is_err());
+            assert!(!root.path().join("extra").exists());
+            assert_eq!(quarantine_count(root.path(), "extra"), 1);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn published_verification_rejects_special_entries_at_every_directory_level() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    for member in ["x", "events/x", "initial-snapshots/x", "snapshots/x"] {
+        for kind in ["symlink", "fifo", "socket"] {
+            let root = tempfile::tempdir().unwrap();
+            let published = publish_initial_snapshot(root.path(), true);
+            make_special_member(&published.bundle_path.join(member), kind);
+            assert!(
+                verify_published_recording(&published.bundle_path, &registry).is_err(),
+                "{kind} at {member}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn published_verification_rejects_symlinked_event_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let published = publish_initial_snapshot(root.path(), true);
+    let path = published.bundle_path.join("events");
+    let outside = root.path().join("outside");
+    fs::rename(&path, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, path).unwrap();
+    assert!(verify_published_recording(
+        &published.bundle_path,
+        &EventContractRegistry::builtin().unwrap()
+    )
+    .is_err());
+}
+
+#[test]
 fn bounded_writer_rejects_before_starting_the_over_limit_record() {
     let root = tempfile::tempdir().unwrap();
     let mut staging = RecordingStaging::prepare(root.path(), "capture-bounds").unwrap();
@@ -455,6 +680,50 @@ fn validates_output_root_capture_id_and_existing_destination_before_mutation() {
         RecordingStaging::prepare(root.path(), "capture-existing"),
         Err(super::error::PublishError::DestinationExists(_))
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_tree_is_private_beneath_a_permissive_output_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    let staging = RecordingStaging::prepare(root.path(), "capture-private").unwrap();
+    for path in [
+        staging.staging_path().to_path_buf(),
+        staging.staging_path().join("events"),
+    ] {
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+    }
+    assert_eq!(
+        fs::metadata(staging.events_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+    staging.discard().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_rejects_a_member_with_widened_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut staging = RecordingStaging::prepare(root.path(), "capture-open-member").unwrap();
+    let bytes = write_exact(&mut staging, 1);
+    fs::set_permissions(staging.events_path(), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        staging.publish(
+            &EventContractRegistry::builtin().unwrap(),
+            complete_input("capture-open-member", 1, bytes)
+        ),
+        Err(super::error::PublishError::UnsafeMember(_))
+    ));
+    assert!(!root.path().join("capture-open-member").exists());
 }
 
 #[cfg(unix)]
@@ -569,4 +838,68 @@ fn partial_evidence_can_publish_only_as_unverifiable() {
     );
     assert_eq!(published.manifest.members[0].bytes, raw.len() as u64);
     assert_eq!(published.manifest.members[0].records, Some(1));
+}
+
+#[test]
+fn imported_limits_are_admitted_before_member_io() {
+    let root = tempfile::tempdir().unwrap();
+    let mut staging = RecordingStaging::prepare(root.path(), "capture-limits").unwrap();
+    let bytes = write_exact(&mut staging, 1);
+    let registry = EventContractRegistry::builtin().unwrap();
+    let published = staging
+        .publish(&registry, complete_input("capture-limits", 1, bytes))
+        .unwrap();
+    let mut manifest = published.manifest;
+    manifest.request.limits.max_bytes = u64::MAX;
+    fs::write(
+        published.bundle_path.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(published.bundle_path.join("events/segment-000.ndjson")).unwrap();
+    let error = verify_published_recording(&published.bundle_path, &registry)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("max_bytes is outside the Core bound"),
+        "{error}"
+    );
+}
+
+#[test]
+fn recovery_identity_check_precedes_member_io() {
+    let root = tempfile::tempdir().unwrap();
+    let mut staging = RecordingStaging::prepare(root.path(), "capture-recovery").unwrap();
+    let bytes = write_exact(&mut staging, 1);
+    let registry = EventContractRegistry::builtin().unwrap();
+    let published = staging
+        .publish(&registry, complete_input("capture-recovery", 1, bytes))
+        .unwrap();
+    fs::remove_file(published.bundle_path.join("events/segment-000.ndjson")).unwrap();
+    let error = verify_published_recording_checked(&published.bundle_path, &registry, |_, _| {
+        Err(super::error::PublishedBundleError::Invalid(
+            "wrong recovery identity".into(),
+        ))
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("wrong recovery identity"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn published_verification_rejects_event_fifo() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut staging = RecordingStaging::prepare(root.path(), "capture-fifo").unwrap();
+    let bytes = write_exact(&mut staging, 1);
+    let registry = EventContractRegistry::builtin().unwrap();
+    let published = staging
+        .publish(&registry, complete_input("capture-fifo", 1, bytes))
+        .unwrap();
+    let path = published.bundle_path.join("events/segment-000.ndjson");
+    fs::remove_file(&path).unwrap();
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert!(verify_published_recording(&published.bundle_path, &registry).is_err());
 }

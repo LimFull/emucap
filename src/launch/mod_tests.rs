@@ -490,3 +490,15 @@ fn native_metadata_accepts_legacy_and_prefers_external_app_receipt() {
         external
     );
 }
+
+#[test]
+fn native_debug_tokens_are_fresh_and_fit_the_child_environment_contract() {
+    let first = super::new_native_debug_token();
+    let second = super::new_native_debug_token();
+    assert_ne!(first, second);
+    assert_eq!(first.len(), 111);
+    assert!(first.starts_with("native-"));
+    assert!(first
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
+}

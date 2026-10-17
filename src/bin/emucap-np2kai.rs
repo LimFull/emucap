@@ -10,8 +10,8 @@ fn main() -> anyhow::Result<()> {
     use emucap::np2kai_adapter::Np2kaiHost;
 
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 9 {
-        return Err(anyhow!("usage: emucap-np2kai <PORT> <CONTENT> <CORE> <FIRMWARE_DIR> <RUNTIME_HOME> <UPSTREAM_COMMIT> <PATCHSET_SHA256> <BUILD_PROFILE>"));
+    if args.len() != 10 {
+        return Err(anyhow!("usage: emucap-np2kai <PORT> <CONTENT> <CORE> <EXPECTED_CORE_SHA256> <FIRMWARE_DIR> <RUNTIME_HOME> <UPSTREAM_COMMIT> <PATCHSET_SHA256> <BUILD_PROFILE>"));
     }
     let port = args[1]
         .parse::<u16>()
@@ -22,11 +22,12 @@ fn main() -> anyhow::Result<()> {
     let mut host = Np2kaiHost::open(
         Path::new(&args[2]),
         Path::new(&args[3]),
-        Path::new(&args[4]),
+        &args[4],
         Path::new(&args[5]),
-        &args[6],
+        Path::new(&args[6]),
         &args[7],
         &args[8],
+        &args[9],
     )?;
     let (command_tx, command_rx) = mpsc::channel::<emucap::np2kai_adapter::dispatch::Command>();
     let terminal = Arc::new(AtomicBool::new(false));

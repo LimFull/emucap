@@ -325,6 +325,21 @@ fn breakpoint_hit_is_published_once_and_rearmed_under_the_public_id() {
 }
 
 #[test]
+fn breakpoint_id_exhaustion_precedes_neogeo_native_mutation() {
+    let mut bridge =
+        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    bridge.next_breakpoint_id = u64::MAX;
+    assert!(bridge
+        .set_breakpoint(&json!({"kind":"exec","start":0x100}))
+        .unwrap_err()
+        .to_string()
+        .contains("id space exhausted"));
+    assert!(bridge.gdb.sent.is_empty());
+    assert!(bridge.breakpoints.is_empty());
+    assert_eq!(bridge.next_breakpoint_id, u64::MAX);
+}
+
+#[test]
 fn breakpoint_stop_requires_the_plugin_callback_sequence() {
     let mut regs = Vec::new();
     for value in 0..REG_NAMES.len() as u32 {
@@ -608,6 +623,89 @@ fn memory_access_requires_freeze_and_checks_cross_boundary() {
     ));
     assert_eq!(oversized.error.unwrap().kind, "bad_params");
     assert!(bridge.gdb.sent.is_empty());
+}
+
+#[test]
+fn chunked_writes_preserve_each_neogeo_ram_profile_and_data_alias() {
+    for (profile, base, start, length) in [
+        ("neogeo_mvs", 0x100000, 0x23, 0x4001usize),
+        ("neogeo_aes", 0x100000, 0, 0x10000),
+        ("neogeo_cd", 0, 0, 0x200000),
+    ] {
+        let data: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        let mut bridge = NeoGeoBridge::new(
+            FakeGdb::with(&vec!["OK"; length.div_ceil(0x4000)]),
+            GdbBridgeEnv::default(),
+            profile,
+        )
+        .unwrap();
+        bridge.frozen = true;
+        let response = bridge.handle_request(request(
+            1,
+            "write_memory",
+            json!({"address":start, "data":hex::encode_upper(&data)}),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["written"], length);
+        let mut restored = Vec::new();
+        for packet in &bridge.gdb.sent {
+            let (header, raw) = packet.strip_prefix('M').unwrap().split_once(':').unwrap();
+            let (address, count) = header.split_once(',').unwrap();
+            let address = usize::from_str_radix(address, 16).unwrap();
+            let count = usize::from_str_radix(count, 16).unwrap();
+            let chunk = hex::decode(raw).unwrap();
+            assert_eq!(address, base + start + restored.len());
+            assert!((1..=0x4000).contains(&count));
+            assert_eq!(count, chunk.len());
+            restored.extend(chunk);
+        }
+        assert_eq!(restored, data);
+        assert!(bridge.frozen);
+    }
+}
+
+#[test]
+fn chunked_memory_write_stops_after_backend_failure() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["OK", "E00"]),
+        GdbBridgeEnv::default(),
+        "neogeo_cd",
+    )
+    .unwrap();
+    bridge.frozen = true;
+    let response = bridge.handle_request(request(
+        1,
+        "write_memory",
+        json!({"address":0, "hex":"ab".repeat(0x8001)}),
+    ));
+    assert!(!response.ok);
+    assert!(response.result.is_none());
+    assert_eq!(response.error.unwrap().kind, "emulator_error");
+    assert_eq!(bridge.gdb.sent.len(), 2);
+    assert!(bridge.frozen);
+}
+
+#[test]
+fn memory_write_preflights_full_payload_before_first_chunk() {
+    for (start, raw) in [
+        (0, String::new()),
+        (0x1fc000, "aa".repeat(0x4001)),
+        (0, "ag".into()),
+    ] {
+        let mut bridge =
+            NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_cd").unwrap();
+        bridge.frozen = true;
+        let response = bridge.handle_request(request(
+            1,
+            "write_memory",
+            json!({"address":start, "hex":raw}),
+        ));
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert!(
+            bridge.gdb.sent.is_empty(),
+            "reject the whole request before any chunk"
+        );
+    }
 }
 
 #[test]
@@ -1076,7 +1174,7 @@ fn oversized_frame_advance_is_rejected_before_backend_mutation() {
 
 fn featured(system: &str, replies: &[&str]) -> NeoGeoBridge<FakeGdb> {
     let mut gdb = FakeGdb::with(replies);
-    gdb.features = "peek_block,throttle_wait_hook,fastforward_readback".into();
+    gdb.features = "peek_block,throttle_wait_hook,fastforward_readback,validated_pacing".into();
     let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), system).unwrap();
     bridge.frozen = true;
     bridge
@@ -1147,6 +1245,46 @@ fn slow_neogeo_step_reports_the_host_deadline_with_partial_progress() {
         .gdb
         .sent
         .contains(&format!("qEmucap,opdeadline,{}", hex::encode("245000"))));
+}
+
+#[test]
+fn older_pacing_host_keeps_frame_and_input_deadlines_without_speed_control() {
+    for method in ["run_frames", "press_buttons"] {
+        let replies = if method == "run_frames" {
+            vec!["100", "3|1|1|1.0|0|0|0.016896", "OK", "OK", "101"]
+        } else {
+            vec!["3|1|1|1.0|0|0|0.016896", "OK", "OK"]
+        };
+        let mut bridge = featured("neogeo_mvs", &replies);
+        bridge.gdb.features =
+            "throttle_wait_hook,fastforward_readback,operation_deadline_v1".into();
+        assert!(!bridge.advertised_methods().contains(&"execution_speed"));
+        let response =
+            bridge.handle_request(request(1, method, json!({"frames":1,"buttons":["a"]})));
+        assert!(response.error.is_none(), "{method}: {:?}", response.error);
+        assert_eq!(response.result.unwrap()["status"], "completed");
+        assert!(bridge
+            .gdb
+            .sent
+            .iter()
+            .any(|s| s.starts_with("qEmucap,opdeadline,")));
+        assert!(bridge.gdb.timeout_changes[0] > Duration::from_secs(17));
+        assert_eq!(bridge.gdb.timeout, Duration::from_secs(5));
+        assert!(bridge.gdb.replies.is_empty());
+    }
+}
+
+#[test]
+fn deadline_only_host_keeps_a_native_deadline_without_pacing_readback() {
+    let mut bridge = featured("neogeo_aes", &["OK"]);
+    bridge.gdb.features = "operation_deadline_v1".into();
+    let timeout = bridge.frame_wait_timeout(1).unwrap();
+    assert_eq!(timeout, Duration::from_millis(10500));
+    assert_eq!(
+        bridge.gdb.sent.last().unwrap(),
+        &format!("qEmucap,opdeadline,{}", hex::encode("5500"))
+    );
+    assert!(!bridge.gdb.sent.iter().any(|s| s == "qEmucap,pacing"));
 }
 
 #[test]

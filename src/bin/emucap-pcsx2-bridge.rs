@@ -14,10 +14,14 @@ fn main() -> anyhow::Result<()> {
     let emucap_port = parse_port(&args[1]).context("invalid EMUCAP_PORT")?;
     let pine_slot = parse_port(&args[2]).context("invalid PINE_SLOT")?;
     let socket_path = args.get(3).map(PathBuf::from);
+    let native_token = std::env::var("EMUCAP_NATIVE_DEBUG_TOKEN")
+        .context("EMUCAP_NATIVE_DEBUG_TOKEN is required for PCSX2 PINE authentication")?;
 
     eprintln!("[pcsx2-rust] connecting pine_slot={pine_slot} emucap=127.0.0.1:{emucap_port}");
-    let pine = PineSocket::connect(pine_slot, socket_path.as_deref(), Duration::from_secs(12))
+    let mut pine = PineSocket::connect(pine_slot, socket_path.as_deref(), Duration::from_secs(12))
         .context("connect compatible PCSX2 PINE fork")?;
+    pine.authenticate_mutual(&native_token)
+        .context("authenticate compatible PCSX2 PINE fork")?;
     let mut bridge = Pcsx2Bridge::new(pine).context("verify PCSX2 host API")?;
     let dependency =
         ProcessDependency::from_process_env().context("load emulator process dependency")?;

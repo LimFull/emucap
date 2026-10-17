@@ -339,10 +339,8 @@ fn frozen_tap_projection_is_independent_of_host_delay() {
         vec![
             vec!["down".to_string()],
             vec!["down".to_string()],
-            vec![],
             vec!["a".to_string()],
-            vec!["a".to_string()],
-            vec![]
+            vec!["a".to_string()]
         ]
     );
 }
@@ -374,7 +372,6 @@ fn pointer_operations_are_exact_compositions_with_frozen_terminal_state() {
             ),
             ("step".into(), json!({"frames": 2})),
             ("set_input".into(), json!({"port": 0, "buttons": []})),
-            ("step".into(), json!({"frames": 1})),
         ]
     );
 
@@ -549,9 +546,9 @@ impl EmulatorLink for FaultProjectionLink {
 
 #[test]
 fn transient_tap_recovers_after_post_effect_timeout_at_each_boundary() {
-    // pause, acquire, pressed step, release, release-edge step. Pause itself owns no transient
+    // pause, acquire, pressed step, release. Pause itself owns no transient
     // resource, so inject an ambiguous post-effect timeout at every later boundary.
-    for fail_call in 2..=5 {
+    for fail_call in 2..=4 {
         let mut link = FaultProjectionLink::timeout_on(fail_call);
         let result = tap(&mut link, 0, &["a".into()], 2, 0);
         assert!(
@@ -638,6 +635,14 @@ fn tap_after_frames_advances_at_end() {
     let last = l.calls.last().unwrap();
     assert_eq!(last.0, "step");
     assert_eq!(last.1["frames"], 10); // 떼고 after_frames만큼 진행
+    assert_eq!(
+        l.calls
+            .iter()
+            .filter(|(method, _)| method == "step")
+            .map(|(_, params)| params["frames"].as_u64().unwrap())
+            .sum::<u64>(),
+        12
+    );
 }
 
 #[test]
@@ -1300,40 +1305,17 @@ fn dump_memory_treats_shell_metacharacters_as_literal_path_bytes() {
 }
 
 #[test]
-fn dump_memory_state_write_failure_preserves_prior_dump() {
-    // A state.json write failure AFTER a successful bridge dump must not destroy the prior good dump:
-    // the region files + state.json are staged and swapped in atomically, so a failure before the swap
-    // leaves the previous dump at `dir` byte-for-byte intact and leaves no staging litter.
+fn dump_memory_state_write_failure_publishes_nothing_and_cleans_owned_staging() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("dump");
-    std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("main.bin"), b"OLDDUMP").unwrap();
-    std::fs::write(out.join("regions.json"), br#"[{"name":"old"}]"#).unwrap();
-    std::fs::write(out.join("state.json"), br#"{"cpu.pc":1}"#).unwrap();
-
     let mut link = DumpLink::new(true);
-    let r = dump_memory(&mut link, out.to_str().unwrap());
-    assert!(r.is_err(), "a state.json write failure must fail the dump");
-
-    assert_eq!(
-        std::fs::read(out.join("main.bin")).unwrap(),
-        b"OLDDUMP",
-        "the prior main.bin must survive a failed re-dump"
-    );
-    assert_eq!(
-        std::fs::read(out.join("regions.json")).unwrap(),
-        br#"[{"name":"old"}]"#
-    );
-    assert_eq!(
-        std::fs::read(out.join("state.json")).unwrap(),
-        br#"{"cpu.pc":1}"#,
-        "the prior state.json must survive a failed re-dump"
-    );
+    let error = dump_memory(&mut link, out.to_str().unwrap()).unwrap_err();
+    assert!(error.to_string().contains("state.json"));
     assert!(
-        staging_leftovers(tmp.path()).is_empty(),
-        "staging/backup dirs must be cleaned up on failure: {:?}",
-        staging_leftovers(tmp.path())
+        !out.exists(),
+        "a failed capture must not publish partial data"
     );
+    assert!(staging_leftovers(tmp.path()).is_empty());
 }
 
 struct SaveReceiptLink {

@@ -138,7 +138,9 @@ impl<'a> ControlledTool<'a> {
     }
     fn advance(&mut self, method: &str, mut params: Value) -> Result<Value, LinkError> {
         self.check_generation()?;
-        let (field, unit) = if method == "step" {
+        let (field, unit) = if method == "step_input_polls" {
+            ("count", "input_polls")
+        } else if method == "step" {
             ("frames", "frames")
         } else {
             ("count", "instructions")
@@ -339,14 +341,22 @@ impl EmulatorLink for ControlledTool<'_> {
         self.inner.capabilities()
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
-        if matches!(method, "step" | "step_instructions") {
+        if matches!(method, "step" | "step_instructions" | "step_input_polls") {
             return self.advance(method, params);
         }
         if method == "set_input" {
             let old_input = self.input_issued;
             let old_effects = self.effects_started;
             let old_ports = self.input_ports.clone();
-            let release = params["buttons"].as_array().is_some_and(Vec::is_empty);
+            if params["_input_scope"] == "validate" {
+                return self.parent_request(method, params, false);
+            }
+            let release = params["_input_scope"] == "release"
+                || (params.get("_input_scope").is_none()
+                    && params["buttons"].as_array().is_some_and(Vec::is_empty)
+                    && params
+                        .get("axes")
+                        .is_none_or(|a| a.as_object().is_some_and(serde_json::Map::is_empty)));
             if release && !self.input_issued {
                 return Ok(json!({"status":"completed"}));
             }
@@ -424,8 +434,56 @@ pub fn tap_with_cancellation(
     cancellation: RequestCancellation,
     owner: &str,
 ) -> Result<ToolOutput, LinkError> {
-    let mut scope = ControlledTool::admit(link, "step", cancellation, owner)?;
-    let result = super::tap(&mut scope, port, buttons, press_frames, after_frames);
+    tap_axes_with_cancellation(
+        link,
+        port,
+        buttons,
+        &Default::default(),
+        press_frames,
+        after_frames,
+        cancellation,
+        owner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn tap_axes_with_cancellation(
+    link: &mut dyn EmulatorLink,
+    port: u64,
+    buttons: &[String],
+    axes: &std::collections::BTreeMap<String, i64>,
+    press_frames: u64,
+    after_frames: u64,
+    cancellation: RequestCancellation,
+    owner: &str,
+) -> Result<ToolOutput, LinkError> {
+    tap_axes_in_unit_with_cancellation(
+        link,
+        port,
+        buttons,
+        axes,
+        press_frames,
+        after_frames,
+        StepUnit::Frames,
+        cancellation,
+        owner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn tap_axes_in_unit_with_cancellation(
+    link: &mut dyn EmulatorLink,
+    port: u64,
+    buttons: &[String],
+    axes: &std::collections::BTreeMap<String, i64>,
+    press: u64,
+    after: u64,
+    unit: StepUnit,
+    cancellation: RequestCancellation,
+    owner: &str,
+) -> Result<ToolOutput, LinkError> {
+    let mut scope = ControlledTool::admit(link, unit.capability_method(), cancellation, owner)?;
+    let result = super::tap_axes_in_unit(&mut scope, port, buttons, axes, press, after, unit);
     scope.finish(result)
 }
 

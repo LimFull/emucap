@@ -5,9 +5,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from PIL import Image
-from input_pacing import Origin, Session
-from observation_speed import ROOT, Witness, free_port, warmup
+from input_pacing import Origin, Session  # noqa: E402
+from observation_speed import ROOT, Witness, free_port, warmup  # noqa: E402
 
 
 def main():

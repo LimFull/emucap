@@ -100,7 +100,7 @@
      // Pacing readback: <percent, 0=unlimited>,<native unlimited 0/1>,<revision>,<VBlank clock>, hex.
      else if ( strncmp( (const char *)packet, "qEmucap,pacing", 14) == 0) {
 +      const auto policy = emucap_pacing.Read();
-       send_size = snprintf( (char *)out_ptr, BUFMAX, "%x,%x,%llx,%llx",
+       send_size = snprintf( (char *)out_ptr, BUFMAX - 1, "%x,%x,%llx,%llx",
 -                            (unsigned)emucap_pace_percent.load(),
 -                            emucap_native_unlimited.load() ? 1u : 0u,
 -                            (unsigned long long)emucap_pace_revision.load(),

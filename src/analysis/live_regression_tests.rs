@@ -412,6 +412,7 @@ fn validate_movie_frames_rejects_absurd_and_nonmonotonic() {
     use crate::analysis::regression::{Movie, MovieFrame};
     let absurd = Movie {
         frames: vec![MovieFrame {
+            axes: Default::default(),
             frame: 5_000_000,
             buttons: vec![],
         }],
@@ -423,10 +424,12 @@ fn validate_movie_frames_rejects_absurd_and_nonmonotonic() {
     let nonmono = Movie {
         frames: vec![
             MovieFrame {
+                axes: Default::default(),
                 frame: 10,
                 buttons: vec![],
             },
             MovieFrame {
+                axes: Default::default(),
                 frame: 3,
                 buttons: vec![],
             },
@@ -440,10 +443,12 @@ fn validate_movie_frames_rejects_absurd_and_nonmonotonic() {
     let dup = Movie {
         frames: vec![
             MovieFrame {
+                axes: Default::default(),
                 frame: 10,
                 buttons: vec![],
             },
             MovieFrame {
+                axes: Default::default(),
                 frame: 10,
                 buttons: vec!["a".into()],
             },
@@ -456,16 +461,35 @@ fn validate_movie_frames_rejects_absurd_and_nonmonotonic() {
     let ok = Movie {
         frames: vec![
             MovieFrame {
+                axes: Default::default(),
                 frame: 0,
                 buttons: vec![],
             },
             MovieFrame {
+                axes: Default::default(),
                 frame: 10,
                 buttons: vec![],
             },
         ],
     };
     assert!(validate_movie_frames(&ok).is_ok());
+
+    let boundary = Movie {
+        frames: vec![MovieFrame {
+            axes: Default::default(),
+            frame: regression::MAX_REGRESSION_ADVANCES - 1,
+            buttons: vec![],
+        }],
+    };
+    assert!(validate_movie_frames(&boundary).is_ok());
+    let over = Movie {
+        frames: vec![MovieFrame {
+            axes: Default::default(),
+            frame: regression::MAX_REGRESSION_ADVANCES,
+            buttons: vec![],
+        }],
+    };
+    assert!(validate_movie_frames(&over).is_err());
 }
 
 struct LazyNoProbe {
@@ -507,6 +531,7 @@ fn savestate_regression_without_probe_is_unsupported_after_capability_load() {
     let tmp = tempfile::tempdir().unwrap();
     let case_dir = tmp.path().join("pc98-case");
     std::fs::create_dir_all(&case_dir).unwrap();
+    std::fs::write(case_dir.join("missing.mss"), b"state").unwrap();
     let case = regression::Case {
         format_version: regression::CASE_FORMAT_VERSION,
         id: "pc98-case".into(),
@@ -542,6 +567,7 @@ struct Pc98InputReplayLink {
     poll_events: Vec<serde_json::Value>,
     fail_call: Option<usize>,
     generation_change_call: Option<usize>,
+    delay_after_call: Option<(usize, std::time::Duration)>,
 }
 
 impl Pc98InputReplayLink {
@@ -569,6 +595,7 @@ impl Pc98InputReplayLink {
             poll_events: Vec::new(),
             fail_call: None,
             generation_change_call: None,
+            delay_after_call: None,
         }
     }
 
@@ -591,6 +618,11 @@ impl Pc98InputReplayLink {
         self.generation_change_call = Some(call);
         self
     }
+
+    fn with_delay_after_call(mut self, call: usize, delay: std::time::Duration) -> Self {
+        self.delay_after_call = Some((call, delay));
+        self
+    }
 }
 
 impl EmulatorLink for Pc98InputReplayLink {
@@ -609,6 +641,11 @@ impl EmulatorLink for Pc98InputReplayLink {
         }
         if self.generation_change_call == Some(self.calls.len()) {
             self.caps.identity.launch_id = Some("launch-b".into());
+        }
+        if let Some((call, delay)) = self.delay_after_call {
+            if call == self.calls.len() {
+                std::thread::sleep(delay);
+            }
         }
         match method {
             "reset"
@@ -697,6 +734,119 @@ fn pc98_input_replay_without_probe_can_pass_from_reset() {
             "pause"
         ]
     );
+}
+
+#[test]
+fn oversized_movie_is_rejected_before_any_emulator_call() {
+    let (_tmp, case_dir, case) = input_replay_case();
+    let movie = std::fs::File::create(case_dir.join("inputs.movie")).unwrap();
+    movie
+        .set_len(regression::MAX_REGRESSION_MOVIE_BYTES + 1)
+        .unwrap();
+    let mut link = Pc98InputReplayLink::new(
+        &[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+        ],
+        "01",
+    );
+
+    assert!(matches!(
+        run_one_case(&mut link, &case_dir, &case),
+        regression::Verdict::Invalid(_)
+    ));
+    assert!(link.calls.is_empty());
+}
+
+#[test]
+fn movie_row_limit_is_rejected_before_any_emulator_call() {
+    let (_tmp, case_dir, case) = input_replay_case();
+    let text = (0..=regression::MAX_REGRESSION_MOVIE_ROWS)
+        .map(|frame| format!("{frame}:a\n"))
+        .collect::<String>();
+    std::fs::write(case_dir.join("inputs.movie"), text).unwrap();
+    let mut link = Pc98InputReplayLink::new(
+        &[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+        ],
+        "01",
+    );
+
+    assert!(matches!(
+        run_one_case(&mut link, &case_dir, &case),
+        regression::Verdict::Invalid(_)
+    ));
+    assert!(link.calls.is_empty());
+}
+
+#[test]
+fn movie_advance_boundary_is_preflighted_without_emulator_calls() {
+    let (_tmp, case_dir, case) = input_replay_case();
+    std::fs::write(
+        case_dir.join("inputs.movie"),
+        format!("{}:a\n", regression::MAX_REGRESSION_ADVANCES - 1),
+    )
+    .unwrap();
+    assert_eq!(prepare_case(&case_dir, &case).unwrap().advances(), 5_000);
+
+    std::fs::write(
+        case_dir.join("inputs.movie"),
+        format!("{}:a\n", regression::MAX_REGRESSION_ADVANCES),
+    )
+    .unwrap();
+    assert!(matches!(
+        prepare_case(&case_dir, &case),
+        Err(regression::Verdict::Invalid(_))
+    ));
+}
+
+#[test]
+fn suite_aggregate_advance_budget_is_checked_during_preflight() {
+    let suite = tempfile::tempdir().unwrap();
+    let mut cases = Vec::new();
+    for (index, frame) in [2_499u64, 2_500].into_iter().enumerate() {
+        let id = format!("case-{index}");
+        let dir = suite.path().join(&id);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inputs.movie"), format!("{frame}:a\n")).unwrap();
+        let mut case = input_replay_case().2;
+        case.id = id;
+        cases.push((dir, case));
+    }
+
+    let error = prepare_suite(&cases).unwrap_err();
+    assert!(error.contains("suite advances exceed 5000"));
+}
+
+#[test]
+fn suite_aggregate_movie_bytes_include_every_preflighted_movie() {
+    let suite = tempfile::tempdir().unwrap();
+    let movie = format!(
+        "{}0:a",
+        " ".repeat(regression::MAX_REGRESSION_MOVIE_BYTES as usize - 3)
+    );
+    let mut cases = Vec::new();
+    for index in 0..17 {
+        let id = format!("case-{index}");
+        let dir = suite.path().join(&id);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inputs.movie"), &movie).unwrap();
+        let mut case = input_replay_case().2;
+        case.id = id;
+        cases.push((dir, case));
+    }
+
+    let error = prepare_suite(&cases).unwrap_err();
+    assert!(error.contains("suite movies exceed 16777216 aggregate bytes"));
 }
 
 #[cfg(unix)]
@@ -947,6 +1097,37 @@ fn input_replay_cleanup_failure_is_fail_loud_and_attempts_remaining_cleanup() {
     assert!(
         matches!(verdict, regression::Verdict::ReproError(ref error) if error.contains("temporal cleanup failed")),
         "cleanup failure must not be reported as a completed replay: {verdict:?}"
+    );
+    assert_eq!(
+        &link.calls[link.calls.len() - 3..],
+        &["set_input", "clear_all_breakpoints", "pause"]
+    );
+}
+
+#[test]
+fn input_replay_deadline_runs_terminal_cleanup() {
+    let (_tmp, case_dir, case) = input_replay_case();
+    let prepared = prepare_case(&case_dir, &case).unwrap();
+    let mut link = Pc98InputReplayLink::new(
+        &[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+        ],
+        "01",
+    )
+    // reset is call 1 and replay pause is call 2. Expire after pause so the body fails through the
+    // same terminal cleanup path used by backend errors.
+    .with_delay_after_call(2, std::time::Duration::from_millis(250));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+
+    let verdict = run_prepared_case(&mut link, &prepared, deadline);
+    assert!(
+        matches!(verdict, regression::Verdict::ReproError(ref error) if error.contains("regression operation exceeded")),
+        "deadline must fail the replay: {verdict:?}"
     );
     assert_eq!(
         &link.calls[link.calls.len() - 3..],

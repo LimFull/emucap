@@ -20,36 +20,13 @@ FLYCAST_SUBMODULES_SHA256="$(lock_value FLYCAST_SUBMODULES_SHA256)"
   exit 1
 }
 
-emucap_data_root() {
-  if [ -n "${EMUCAP_EMU_HOME:-}" ]; then
-    echo "$EMUCAP_EMU_HOME"
-    return
-  fi
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin)
-      echo "${HOME:-/tmp}/Library/Application Support/emucap"
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      if [ -n "${LOCALAPPDATA:-}" ]; then
-        echo "$LOCALAPPDATA/emucap"
-      elif [ -n "${APPDATA:-}" ]; then
-        echo "$APPDATA/emucap"
-      else
-        echo "${HOME:-/tmp}/AppData/Local/emucap"
-      fi
-      ;;
-    *)
-      if [ -n "${XDG_DATA_HOME:-}" ]; then
-        echo "$XDG_DATA_HOME/emucap"
-      else
-        echo "${HOME:-/tmp}/.local/share/emucap"
-      fi
-      ;;
-  esac
-}
-
-DEFAULT_BUILD_HOME="$(emucap_data_root)/flycast-build"
-BUILD_HOME_INPUT="${EMUCAP_FLYCAST_BUILD_HOME:-$DEFAULT_BUILD_HOME}"
+. "$HERE/../_common/runtime-env.sh"
+if [ -n "${EMUCAP_FLYCAST_BUILD_HOME:-}" ]; then
+  BUILD_HOME_INPUT="$EMUCAP_FLYCAST_BUILD_HOME"
+else
+  DATA_ROOT="$(emucap_runtime_base)"
+  BUILD_HOME_INPUT="$DATA_ROOT/flycast-build"
+fi
 CUSTOM_BUILD_HOME=0
 if [ -n "${EMUCAP_FLYCAST_BUILD_HOME:-}" ]; then
   CUSTOM_BUILD_HOME=1
@@ -183,6 +160,9 @@ inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 
 # 1. 어댑터 소스 복사
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pacing.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
 cp "$HERE/emucap_state.h" "$HERE/emucap_render_fence.h" "$SRC/core/"
+cp "$HERE/../_common/emucap_pattern.h" "$SRC/core/"
+cp "$HERE/../_common/emucap_front_auth.h" "$SRC/core/"
+cp "$HERE/../_common/emucap_atomic_file.h" "$SRC/core/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/core/"
 echo "→ emucap.cpp/.h + input ownership + failure serializers 복사: $SRC/core/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알린다(사용자가 git
@@ -193,7 +173,7 @@ git -C "$HERE" diff --quiet HEAD -- \
   patches/0002-preserve-interpreter-timing-state.patch emucap_state.h \
   patches/0003-renderer-observation-fence.patch emucap_render_fence.h \
   emucap.cpp emucap.h emucap_input.h emucap_pacing.h emucap_failure.cpp emucap_failure.h \
-  ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
+  ../_common/emucap_front_auth.h ../_common/emucap_pattern.h ../_common/emucap_atomic_file.h ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@flycast-${FLYCAST_COMMIT:0:12}"
 SWAP_PATCH_SHA256="$(cat "$HERE/patches/0001-bound-cocoa-display-link-wait.patch" "$HERE/emucap_sdl_swap_wait.h" | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print $1}')"
@@ -295,23 +275,18 @@ inject_check 'emucap_input_engaged' "$SRC/core/hw/maple/maple_cfg.cpp"
 inject_check 'emucap.h' "$SRC/core/hw/maple/maple_cfg.cpp"
 echo "→ maple_cfg.cpp 입력 주입(GetInput에서 pjs->kcode override — 소비 지점, 경합 없음)"
 
-# 2c. gui.cpp screenshot 헬퍼 2개: capture_raw(UI/GL 스레드 — renderer->GetLastFrame로 raw RGB) +
-#    encode_png(GL 불필요 — stbi). 같은 TU의 renderer/appendVectorData 재사용. emucap은 매 렌더마다
-#    capture_raw로 버퍼를 채우고(UI 스레드), screenshot 요청 시 encode_png로 인코딩한다(emu 스레드) →
-#    freeze 중에도 동작(gui_runOnUiThread는 freeze 데드락이라 쓰지 않음).
+# 2c. Reuse GetLastFrame on the renderer/context owner and PNG encoding on the
+# emulation owner. The native Present hook publishes before the observation fence.
 perl -0777 -pi -e 's{(stbi_write_png_to_func\(appendVectorData, &data, width, height, 3, &rawData\[0\], 0\);\n\})}{${1}\n\n// emucap: raw 캡처(UI/GL 스레드) + PNG 인코딩(GL 불필요)\nvoid emucap_capture_raw(std::vector<u8>& out, int& w, int& h) {\n\tout.clear(); w = 0; h = 0;\n\tif (renderer != nullptr) renderer->GetLastFrame(out, w, h);\n}\nvoid emucap_encode_png(const u8* raw, int w, int h, std::vector<u8>& png) {\n\tpng.clear();\n\tstbi_flip_vertically_on_write(0);\n\tstbi_write_png_to_func(appendVectorData, &png, w, h, 3, raw, 0);\n}} unless m{emucap_capture_raw}' \
   "$SRC/core/ui/gui.cpp"
 inject_check 'emucap_capture_raw' "$SRC/core/ui/gui.cpp"
 echo "→ gui.cpp screenshot 헬퍼 주입(emucap_capture_raw + emucap_encode_png)"
 
-# 2d. mainui.cpp 캡처 훅: 렌더가 끝난 뒤(UI/GL 스레드) 최신 프레임 raw를 버퍼에 떠둔다.
-#    MainFrameCount 증가 직전에 건다. emucap.h include도 주입.
+# 2d. Shutdown notification stays on the UI owner. Capture is published inside
+# the patched PVR Present path, before the renderer observation fence can complete.
 perl -0777 -pi -e 's/(#include [^\n]*\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
   "$SRC/core/ui/mainui.cpp"
-perl -0777 -pi -e 's/(\n\tMainFrameCount\+\+;)/\n\temucap_capture_latest();${1}/ unless m{emucap_capture_latest}' \
-  "$SRC/core/ui/mainui.cpp"
-inject_check 'emucap_capture_latest' "$SRC/core/ui/mainui.cpp"
-inject_check 'emucap.h' "$SRC/core/ui/mainui.cpp"
+inject_check 'emucap_capture_latest' "$SRC/core/hw/pvr/Renderer_if.cpp"
 perl -0777 -pi -e 's/(void mainui_stop\(\)\n\{\n\tmainui_enabled = false;)/${1}\n\temucap_notify_shutdown();/ unless m{emucap_notify_shutdown}' \
   "$SRC/core/ui/mainui.cpp"
 inject_check 'emucap_notify_shutdown' "$SRC/core/ui/mainui.cpp"

@@ -29,14 +29,6 @@ NAME="${3:-}"
 case "$PORT" in ''|*[!0-9]*) echo "ERROR: EMUCAP_PORT must be a decimal TCP port: $PORT" >&2; exit 2;; esac
 if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65534 ]; then echo "ERROR: EMUCAP_PORT out of range: $PORT" >&2; exit 2; fi
 
-emucap_data_root() {
-  if [ -n "${EMUCAP_EMU_HOME:-}" ]; then printf '%s\n' "$EMUCAP_EMU_HOME"; return; fi
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin) printf '%s\n' "${HOME:-/tmp}/Library/Application Support/emucap" ;;
-    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "${LOCALAPPDATA:-${HOME:-/tmp}/AppData/Local}/emucap" ;;
-    *) printf '%s\n' "${XDG_DATA_HOME:-${HOME:-/tmp}/.local/share}/emucap" ;;
-  esac
-}
 
 # Debugger WebSocket port. A single OS-assigned free port avoids collisions across concurrent PSP
 # sessions (same rationale as NDS's ARM9/ARM7 GDB ports); env override kept for parity with the
@@ -53,18 +45,18 @@ fi
 case "$WS_PORT" in ''|*[!0-9]*) echo "ERROR: PSP_DEBUGGER_PORT must be decimal: $WS_PORT" >&2; exit 2;; esac
 if [ "$WS_PORT" -lt 1 ] || [ "$WS_PORT" -gt 65535 ]; then echo "ERROR: PSP_DEBUGGER_PORT out of range: $WS_PORT" >&2; exit 2; fi
 
-DATA_ROOT="$(emucap_data_root)"
+DATA_ROOT="$(emucap_runtime_base)"
 RUN_DIR="$DATA_ROOT/ppsspp/$PORT"
 LOG="${EMUCAP_LOG:-$RUN_DIR/ppsspp.log}"
 EMU_PIDFILE="$RUN_DIR/ppsspp.pid"
 BRIDGE_PIDFILE="$RUN_DIR/bridge.pid"
 WAIT="${EMUCAP_LAUNCH_WAIT:-20}"
 POST_CONNECT_GRACE="${EMUCAP_POST_CONNECT_GRACE:-2}"
-TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
-if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SESSION_TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
-fi
+emucap_require_front_identity "$SESSION_TOKEN" "${EMUCAP_LAUNCH_ID:-}" || exit 2
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required to mint a per-launch native debugger token." >&2; exit 2; }
+NATIVE_DEBUG_TOKEN="$(python3 -I -c 'import secrets; print(secrets.token_hex(32))')"
+[ -n "$NATIVE_DEBUG_TOKEN" ] || { echo "ERROR: failed to mint a native debugger token." >&2; exit 2; }
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 # Resolve the headless PPSSPPHeadless binary.
@@ -97,6 +89,38 @@ kill_ours() {
   kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
 }
 connected_pid() { command -v lsof >/dev/null 2>&1 || return 2; lsof -nP -a -p "$1" -iTCP:"$PORT" -sTCP:ESTABLISHED >/dev/null 2>&1; }
+listener_owned_by_pid() {
+  local pid="$1" port="$2" port_hex inodes fd target inode owned
+  case "$(uname -s)" in
+    Linux)
+      [ -d "/proc/$pid/fd" ] || return 2
+      port_hex="$(printf '%04X' "$port")"
+      [ -r /proc/net/tcp ] || return 2
+      inodes="$(awk -v port="$port_hex" '
+        NR > 1 && $4 == "0A" {
+          split($2, local, ":")
+          if (toupper(local[1]) == "0100007F" && toupper(local[2]) == port) print $10
+        }
+      ' /proc/net/tcp)"
+      [ -n "$inodes" ] || return 1
+      for fd in "/proc/$pid/fd"/*; do
+        target="$(readlink "$fd" 2>/dev/null || true)"
+        case "$target" in
+          socket:\[*\])
+            inode="${target#socket:[}"; inode="${inode%]}"
+            for owned in $inodes; do [ "$inode" = "$owned" ] && return 0; done
+            ;;
+        esac
+      done
+      return 1
+      ;;
+    Darwin)
+      command -v lsof >/dev/null 2>&1 || return 2
+      lsof -nP -a -p "$pid" -iTCP@127.0.0.1:"$port" -sTCP:LISTEN >/dev/null 2>&1
+      ;;
+    *) return 2 ;;
+  esac
+}
 
 # MCP listener must be up.
 if command -v lsof >/dev/null 2>&1; then
@@ -141,7 +165,7 @@ mkdir -p "$RUN_DIR"
 {
   echo "emucap PPSSPP PSP launch"
   echo "  content=$CONTENT"; echo "  port=$PORT"; echo "  name=${NAME:-<none>}"
-  echo "  session_token=${SESSION_TOKEN:+present}"; echo "  ws_port=$WS_PORT"
+  echo "  front_key=${SESSION_TOKEN:+present}"; echo "  ws_port=$WS_PORT"
   echo "  ppsspp_bin=$EMU_BIN"; echo "  bridge_bin=$BRIDGE_BIN"
 } >>"$LOG"
 
@@ -164,21 +188,27 @@ PY
 
 # 1. Spawn headless PPSSPP with the debugger WebSocket; wait for the port to LISTEN. The content is
 #    positional (never -m/--mount — see the header note), and --timeout is never passed.
-EMU_PID="$(spawn_detached "$EMU_PIDFILE" "$EMU_BIN" "--debugger=$WS_PORT" "--graphics=software" "$CONTENT")"
-if command -v lsof >/dev/null 2>&1; then
-  for ((i = 0; i < WAIT; i++)); do
-    kill -0 "$EMU_PID" 2>/dev/null || { echo "ERROR: PPSSPPHeadless exited before the debugger port was ready (pid=$EMU_PID)." >&2; tail_log; exit 4; }
-    lsof -nP -a -p "$EMU_PID" -iTCP:"$WS_PORT" -sTCP:LISTEN >/dev/null 2>&1 && break
-    sleep 1
-  done
-  lsof -nP -a -p "$EMU_PID" -iTCP:"$WS_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
-    || { echo "ERROR: PPSSPPHeadless did not open debugger port $WS_PORT within ${WAIT}s." >&2; tail_log; kill_ours "$EMU_PID"; exit 4; }
-fi
+EMU_PID="$(EMUCAP_NATIVE_DEBUG_TOKEN="$NATIVE_DEBUG_TOKEN" \
+  spawn_detached "$EMU_PIDFILE" "$EMU_BIN" "--debugger=$WS_PORT" "--graphics=software" "$CONTENT")"
+WS_READY=0
+for ((i = 0; i < WAIT; i++)); do
+  kill -0 "$EMU_PID" 2>/dev/null || { echo "ERROR: PPSSPPHeadless exited before the debugger port was ready (pid=$EMU_PID)." >&2; tail_log; exit 4; }
+  if listener_owned_by_pid "$EMU_PID" "$WS_PORT"; then
+    WS_READY=1
+    break
+  elif [ "$?" -eq 2 ]; then
+    echo "ERROR: cannot verify debugger listener ownership on this host; refusing to release the native debugger token." >&2
+    tail_log; kill_ours "$EMU_PID"; exit 4
+  fi
+  sleep 1
+done
+[ "$WS_READY" -eq 1 ] \
+  || { echo "ERROR: PPSSPPHeadless did not own debugger port $WS_PORT within ${WAIT}s; refusing to release the native debugger token." >&2; tail_log; kill_ours "$EMU_PID"; exit 4; }
 
 # 2. Spawn the bridge; wait for it to connect to the emucap port. Unlike the NDS bridge, this
 #    bridge makes a single WebSocket connect attempt with no retry, so step 1's readiness wait is
 #    load-bearing here (not just a liveness check).
-BRIDGE_PID="$(EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$CONTENT" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$EMU_PID" \
+BRIDGE_PID="$(EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_NATIVE_DEBUG_TOKEN="$NATIVE_DEBUG_TOKEN" EMUCAP_CONTENT="$CONTENT" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$EMU_PID" \
   spawn_detached "$BRIDGE_PIDFILE" "$BRIDGE_BIN" "$PORT" "$WS_PORT")"
 if command -v lsof >/dev/null 2>&1; then
   for ((i = 0; i < WAIT; i++)); do

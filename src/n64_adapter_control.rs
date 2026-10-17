@@ -13,22 +13,95 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+type PauseFn = unsafe extern "C" fn(c_int) -> c_int;
+static STATE_PAUSE: std::sync::Mutex<Option<PauseFn>> = std::sync::Mutex::new(None);
+static STATE_PAUSE_ARMED: AtomicBool = AtomicBool::new(false);
+static STATE_PAUSE_RESULT: AtomicI32 = AtomicI32::new(-1);
+pub(super) fn configure_state_pause(f: PauseFn) {
+    STATE_PAUSE_ARMED.store(false, Ordering::Release);
+    *STATE_PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+pub(super) extern "C" fn pause_on_state_boundary() {
+    if STATE_PAUSE_ARMED.swap(false, Ordering::AcqRel) {
+        let pause = *STATE_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        let result = pause.map_or(-1, |f| unsafe { f(M64P_DBG_RUNSTATE_PAUSED) });
+        STATE_PAUSE_RESULT.store(result, Ordering::Release);
+    }
+}
 impl Mupen64PlusHost {
+    fn complete_state_job(
+        &mut self,
+        result: &AtomicI32,
+        operation: &'static str,
+    ) -> N64Result<Value> {
+        let before = UPDATE_COUNT.load(Ordering::Acquire);
+        STATE_PAUSE_RESULT.store(-1, Ordering::Release);
+        STATE_PAUSE_ARMED.store(true, Ordering::Release);
+        let outcome = (|| {
+            self.resume(&json!({}))?;
+            wait_until(operation, OPERATION_DEADLINE, || {
+                result.load(Ordering::Acquire) != -1
+                    && STATE_PAUSE_RESULT.load(Ordering::Acquire) == 0
+                    && UPDATE_COUNT.load(Ordering::Acquire) > before
+                    && unsafe { (self.api.debug_get_state)(M64P_DBG_RUN_STATE) }
+                        == M64P_DBG_RUNSTATE_PAUSED
+            })?;
+            self.frame_paused = false;
+            self.frozen = true;
+            operation_result(result, operation)?;
+            Ok(json!({"frame":self.public_frame()}))
+        })();
+        STATE_PAUSE_ARMED.store(false, Ordering::Release);
+        outcome
+    }
+
     pub(super) fn set_input(&mut self, params: &Value) -> N64Result<Value> {
-        require_port_zero(params)?;
         self.require_connected()?;
-        let buttons = normalize_buttons(params.get("buttons"))?;
-        self.apply_input_buttons(&buttons)?;
-        Ok(json!({
-            "status": "completed",
-            "buttons": self.held_buttons.iter().collect::<Vec<_>>(),
-            "override_engaged": !self.held_buttons.is_empty(),
-            "ownership": if self.held_buttons.is_empty() {
-                "native"
-            } else {
-                "shared_with_native"
+        let state = self.validate_input(params)?;
+        if let Some(action) = params.get("_input_scope").and_then(Value::as_str) {
+            let token = params
+                .pointer("/_temporal_owner/operation_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    N64Error::BadParams("input scope requires authenticated parent".into())
+                })?;
+            if !self
+                .producer_ownership
+                .as_ref()
+                .and_then(|owner| owner.active_parent_key())
+                .is_some_and(|key| {
+                    serde_json::to_value(key).ok().as_ref() == params.get("_temporal_owner")
+                })
+            {
+                return Err(N64Error::BadState(
+                    "input scope has no active parent".into(),
+                ));
             }
-        }))
+            match action {
+                "validate" => return Ok(json!({"status":"validated"})),
+                "acquire" => {
+                    self.require_frozen("controller input acquire")?;
+                    self.input_baseline = Some((token.to_string(), self.controller.clone()));
+                }
+                "release" => {
+                    if self
+                        .input_baseline
+                        .as_ref()
+                        .is_some_and(|(owner, _)| owner != token)
+                    {
+                        return Err(N64Error::Busy);
+                    }
+                    self.restore_input_baseline()?;
+                    return Ok(json!({"status":"completed"}));
+                }
+                _ => unreachable!(),
+            }
+        }
+        self.publish_controller(state)?;
+        let mut result = self.controller.public();
+        result["status"] = json!("completed");
+        result["override_engaged"] = json!(self.controller.engaged);
+        Ok(result)
     }
 
     pub(super) fn press_buttons(&mut self, params: &Value) -> N64Result<Value> {
@@ -47,17 +120,17 @@ impl Mupen64PlusHost {
             )));
         }
 
+        let persistent = self.controller.clone();
+        let active = persistent.overlay(input::ControllerState::decode(params)?)?;
         let was_frozen = self.is_frozen_boundary();
         if !was_frozen {
             self.pause(&json!({"cpu":"r4300"}))?;
         }
-        let persistent = self.held_buttons.clone();
-        let active = persistent.union(&pulse).cloned().collect::<BTreeSet<_>>();
         let outcome = (|| {
-            self.apply_input_buttons(&active)?;
+            self.publish_controller(active)?;
             self.step(&json!({"frames":frames, "cpu":"r4300"}))
         })();
-        let release = self.apply_input_buttons(&persistent);
+        let release = self.publish_controller(persistent);
         if let Err(error) = release {
             return Err(self.stop_generation_with_unresolved_effect("input-pulse cleanup", &error));
         }
@@ -78,7 +151,7 @@ impl Mupen64PlusHost {
                 "event":stepped["event"],
                 "buttons":pulse.iter().collect::<Vec<_>>(),
                 "frames":frames,
-                "persistent_buttons":self.held_buttons.iter().collect::<Vec<_>>(),
+                "persistent_buttons":self.controller.buttons.iter().collect::<Vec<_>>(),
                 "transient_override_engaged":false,
                 "state":"frozen",
             }));
@@ -91,7 +164,7 @@ impl Mupen64PlusHost {
             "buttons": pulse.iter().collect::<Vec<_>>(),
             "frames": frames,
             "state": if was_frozen { "frozen" } else { "running" },
-            "persistent_buttons": self.held_buttons.iter().collect::<Vec<_>>(),
+            "persistent_buttons": self.controller.buttons.iter().collect::<Vec<_>>(),
             "transient_override_engaged": false,
             "frame": stepped["frame"],
         }))
@@ -165,13 +238,16 @@ impl Mupen64PlusHost {
         let partial = state_partial_sibling(&path)?;
         let _ = fs::remove_file(&partial);
         let frame_before = self.public_frame();
+        let poll_before = poll::POLL_COUNT.load(Ordering::Acquire);
+        let vi_before = VI_COUNT.load(Ordering::Acquire);
         let result = (|| {
             STATE_SAVE_RESULT.store(-1, Ordering::Release);
             let path_c = path_cstring(&partial)?;
             check_core("STATE_SAVE", unsafe {
                 (self.api.core_do_command)(M64CMD_STATE_SAVE, 1, path_c.as_ptr() as *mut c_void)
             })?;
-            let stepped = match self.step(&json!({"frames":1u64, "cpu":"r4300"})) {
+            let stepped = match self.complete_state_job(&STATE_SAVE_RESULT, "save-state completion")
+            {
                 Ok(stepped) => stepped,
                 Err(error) => {
                     return Err(self.stop_generation_with_unresolved_effect("save_state", &error))
@@ -198,6 +274,8 @@ impl Mupen64PlusHost {
                 "format": "mupen64plus-native",
                 "bytes": bytes,
                 "sha256": sha256,
+                "input_polls_before":poll_before,"input_polls_after":poll::POLL_COUNT.load(Ordering::Acquire),
+                "vi_before":vi_before,"vi_after":VI_COUNT.load(Ordering::Acquire),
                 "state": "frozen",
                 "frame_before": frame_before,
                 "frame": stepped["frame"],
@@ -219,13 +297,15 @@ impl Mupen64PlusHost {
             )));
         }
         let frame_before = self.public_frame();
+        let poll_before = poll::POLL_COUNT.load(Ordering::Acquire);
+        let vi_before = VI_COUNT.load(Ordering::Acquire);
         let path_c = path_cstring(&path)?;
+        STATE_LOAD_RESULT.store(-1, Ordering::Release);
         check_core("STATE_LOAD", unsafe {
             (self.api.core_do_command)(M64CMD_STATE_LOAD, 0, path_c.as_ptr() as *mut c_void)
         })?;
-        STATE_LOAD_RESULT.store(-1, Ordering::Release);
         self.frame_clock_synchronized = false;
-        let stepped = match self.step(&json!({"frames":1u64, "cpu":"r4300"})) {
+        let stepped = match self.complete_state_job(&STATE_LOAD_RESULT, "load-state completion") {
             Ok(stepped) => stepped,
             Err(error) => {
                 return Err(self.stop_generation_with_unresolved_effect("load_state", &error))
@@ -245,60 +325,14 @@ impl Mupen64PlusHost {
             "frame_before": frame_before,
             "frame": stepped["frame"],
             "frame_counter_continuous": false,
+            "input_polls_before":poll_before,"input_polls_after":poll::POLL_COUNT.load(Ordering::Acquire),
+            "vi_before":vi_before,"vi_after":VI_COUNT.load(Ordering::Acquire),
             "pc": LAST_PC.load(Ordering::Acquire),
         }))
     }
 
-    fn apply_input_buttons(&mut self, desired: &BTreeSet<String>) -> N64Result<()> {
-        let releases = self
-            .held_buttons
-            .difference(desired)
-            .cloned()
-            .collect::<Vec<_>>();
-        let presses = desired
-            .difference(&self.held_buttons)
-            .cloned()
-            .collect::<Vec<_>>();
-        for button in releases {
-            self.send_input_button(&button, false)?;
-            self.held_buttons.remove(&button);
-        }
-        for button in presses {
-            self.send_input_button(&button, true)?;
-            self.held_buttons.insert(button);
-        }
-        Ok(())
-    }
-
-    pub(super) fn reapply_held_buttons_after_reset(&self) -> N64Result<()> {
-        for button in &self.held_buttons {
-            self.send_input_button(button, true)?;
-        }
-        Ok(())
-    }
-
-    fn send_input_button(&self, button: &str, pressed: bool) -> N64Result<()> {
-        let key = input_key(button).ok_or_else(|| {
-            N64Error::BadParams(format!("unsupported N64 input button: {button}"))
-        })?;
-        check_core(
-            if pressed {
-                "SEND_SDL_KEYDOWN"
-            } else {
-                "SEND_SDL_KEYUP"
-            },
-            unsafe {
-                (self.api.core_do_command)(
-                    if pressed {
-                        M64CMD_SEND_SDL_KEYDOWN
-                    } else {
-                        M64CMD_SEND_SDL_KEYUP
-                    },
-                    key,
-                    ptr::null_mut(),
-                )
-            },
-        )
+    pub(super) fn reapply_held_buttons_after_reset(&mut self) -> N64Result<()> {
+        self.publish_controller(self.controller.clone())
     }
 
     pub(super) fn is_frozen_boundary(&self) -> bool {

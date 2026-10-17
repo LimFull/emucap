@@ -1,3 +1,5 @@
+diff --git a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+index 53bb7b2dac..2ef04f67db 100644
 --- a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
 +++ b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
 @@ -22,7 +22,8 @@
@@ -10,7 +12,7 @@
  
  #include <chrono>
  #include <condition_variable>
-@@ -65,8 +66,20 @@
+@@ -65,8 +66,20 @@ void RunSaveStateOperation(DebuggerRequest &req, bool isSave, BreakReason breakR
  	if (!req.ParamString("path", &path))
  		return;
  
@@ -32,7 +34,7 @@
  		std::lock_guard<std::mutex> guard(wait->m);
  		wait->status = status;
  		wait->message = std::string(message);
-@@ -94,7 +107,9 @@
+@@ -94,7 +107,9 @@ void RunSaveStateOperation(DebuggerRequest &req, bool isSave, BreakReason breakR
  		completed = wait->cv.wait_for(guard, std::chrono::seconds(15), [&] { return wait->done; });
  	}
  
@@ -43,7 +45,7 @@
  		Core_Resume();
  
  	if (!completed)
-@@ -104,6 +119,8 @@
+@@ -104,6 +119,8 @@ void RunSaveStateOperation(DebuggerRequest &req, bool isSave, BreakReason breakR
  
  	JsonWriter &json = req.Respond();
  	json.writeString("path", path);

@@ -12,6 +12,9 @@ use super::{Api, N64Error, N64Result};
 
 pub(super) unsafe fn load_api(handle: *mut c_void) -> N64Result<Api> {
     Ok(Api {
+        core_set_state_boundary_callback: symbol(handle, b"CoreEmucapSetStateBoundaryCallback\0")?,
+        core_set_poll_callback: symbol(handle, b"CoreEmucapSetPollCallback\0")?,
+        core_emucap_input: symbol(handle, b"CoreEmucapInput\0")?,
         core_shutdown: symbol(handle, b"CoreShutdown\0")?,
         core_attach_plugin: symbol(handle, b"CoreAttachPlugin\0")?,
         core_detach_plugin: symbol(handle, b"CoreDetachPlugin\0")?,
@@ -41,7 +44,10 @@ pub(super) unsafe fn symbol<T: Copy>(handle: *mut c_void, name: &'static [u8]) -
     library
         .get::<T>(name)
         .map(|symbol| *symbol)
-        .map_err(|error| N64Error::Dynamic(error.to_string()))
+        .map_err(|error| N64Error::Dynamic(format!(
+            "required native export {} is unavailable: {error}; rebuild or install the native bundle pinned by this checkout",
+            String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(name))
+        )))
 }
 
 pub(super) fn open_library(path: &Path) -> N64Result<*mut c_void> {

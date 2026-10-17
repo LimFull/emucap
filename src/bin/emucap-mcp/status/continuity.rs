@@ -33,7 +33,13 @@ pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLi
         );
     }
 
-    let store = emucap::live::runtime::RuntimeStore::discover();
+    let store = match emucap::live::runtime::RuntimeStore::discover() {
+        Ok(store) => store,
+        Err(error) => {
+            object.insert("runtime_error".into(), serde_json::json!(error.to_string()));
+            return;
+        }
+    };
     let refreshed_current = link
         .endpoint_port()
         .and_then(|port| store.read_current(port).ok().flatten());

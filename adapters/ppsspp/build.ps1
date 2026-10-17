@@ -5,8 +5,34 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $work = if ($env:EMUCAP_PPSSPP_WORK) { $env:EMUCAP_PPSSPP_WORK } else { Join-Path $here "work" }
 
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
-  & $Program @Arguments
-  if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
+  # Windows PowerShell 5.1 wraps a native process' stderr as non-terminating
+  # error records.  Git writes routine progress there, so the script-wide
+  # Stop preference must not turn successful native commands into failures.
+  $previousPreference = $ErrorActionPreference
+  $exitCode = $null
+  try {
+    $ErrorActionPreference = "Continue"
+    & $Program @Arguments
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+  if ($null -eq $exitCode -or $exitCode -ne 0) {
+    throw "$Program failed with exit code $exitCode"
+  }
+}
+
+function Test-GitCommit([string]$Repository, [string]$Commit) {
+  $previousPreference = $ErrorActionPreference
+  $exitCode = $null
+  try {
+    $ErrorActionPreference = "SilentlyContinue"
+    & git -C $Repository cat-file -e "$Commit^{commit}" 2>$null
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+  return ($null -ne $exitCode -and $exitCode -eq 0)
 }
 
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -61,7 +87,9 @@ try {
     Invoke-Checked git @("init", $src)
     Invoke-Checked git @("-C", $src, "remote", "add", "origin", $origin)
   }
-  Invoke-Checked git @("-C", $src, "fetch", "--depth", "1", "--update-shallow", "origin", $lock.PPSSPP_COMMIT)
+  if (-not (Test-GitCommit $src $lock.PPSSPP_COMMIT)) {
+    Invoke-Checked git @("-C", $src, "fetch", "--depth", "1", "--update-shallow", "origin", $lock.PPSSPP_COMMIT)
+  }
   if (Test-Path -LiteralPath (Join-Path $src ".git/index")) {
     Invoke-Checked git @("-C", $src, "checkout", "--", ".")
     Invoke-Checked git @("-C", $src, "clean", "-fdq", "--", "Core", "headless")
@@ -83,7 +111,10 @@ try {
     if (-not (Test-Path -LiteralPath $cmake)) { throw "Install the Visual Studio CMake component" }
   }
   $build = Join-Path $src "build-headless"
-  Invoke-Checked $cmake @("-S", $src, "-B", $build, "-G", "Visual Studio 17 2022", "-A", "x64", "-DHEADLESS=ON")
+  # Visual Studio reports the host CPU in CMAKE_SYSTEM_PROCESSOR on ARM Windows.
+  # Bind upstream's CPU selection to the x64 target selected above, including bundled FFmpeg.
+  # Recompute cached CPU options left by an earlier host-derived configure.
+  Invoke-Checked $cmake @("-S", $src, "-B", $build, "-G", "Visual Studio 17 2022", "-A", "x64", "-DFORCED_CPU=x86_64", "-U", "X86", "-U", "X86_64", "-DHEADLESS=ON")
   Invoke-Checked $cmake @("--build", $build, "--config", "Release", "--target", "PPSSPPHeadless", "--parallel", "$Jobs")
   $binDir = Join-Path $build "Release"
   $binary = Join-Path $binDir "PPSSPPHeadless.exe"

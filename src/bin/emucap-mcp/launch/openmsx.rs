@@ -63,7 +63,10 @@ pub(super) fn launch_openmsx(
         }
     };
     let content = Path::new(&args.content_path);
-    let log = adapter_log_path("openmsx", port, "openmsx.log");
+    let log = match adapter_log_path(port, runtime, "openmsx.log") {
+        Ok(path) => path,
+        Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
+    };
     let display = args.display.unwrap_or(false);
     let sound = args.sound.unwrap_or(false);
     let launch = openmsx_launch::Launch {

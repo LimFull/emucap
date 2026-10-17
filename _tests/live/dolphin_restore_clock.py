@@ -11,8 +11,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
-from observation_speed import ROOT, Witness, free_port
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from observation_speed import ROOT, Witness, free_port  # noqa: E402
 
 
 def digest(path):

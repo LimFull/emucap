@@ -1,5 +1,6 @@
 diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
 new file mode 100644
+index 0000000000..a92819eb32
 --- /dev/null
 +++ b/Core/EmucapPacing.h
 @@ -0,0 +1,36 @@
@@ -40,6 +41,7 @@ new file mode 100644
 +    EmucapPacingSnapshot policy_;
 +};
 diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+index 505a14a164..7fd179a788 100644
 --- a/Core/HLE/sceDisplay.cpp
 +++ b/Core/HLE/sceDisplay.cpp
 @@ -15,7 +15,7 @@
@@ -51,7 +53,7 @@ diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
  #include <algorithm>
  #include <cmath>
  #include <map>
-@@ -358,20 +358,18 @@
+@@ -387,20 +387,18 @@ void __DisplaySetWasPaused() {
  	wasPaused = true;
  }
  
@@ -76,10 +78,10 @@ diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
  }
  
  // TOOD: Should return 59.997?
-@@ -402,7 +400,7 @@
- 		return fixRate(g_Config.iFpsLimit2);
- 	if (PSP_CoreParameter().fpsLimit == FPSLimit::ANALOG)
+@@ -433,7 +431,7 @@ static double FrameTimingLimit() {
  		return fixRate(PSP_CoreParameter().analogFpsLimit);
+ 	if (PSP_CoreParameter().fpsLimit == FPSLimit::DEBUGGER)
+ 		return fixRate(PSP_CoreParameter().debuggerFpsLimit);
 -	const int percent = emucapSpeedPercent;
 +	const int percent = emucapPacing.Read().percent;
  	return percent == 0 ? 0.0 : framerate * percent / 100.0;

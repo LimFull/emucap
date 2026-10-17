@@ -27,6 +27,8 @@ emu = { osd_ticks = function() return 100 end, osd_ticks_per_second = function()
 for _, name in ipairs({"reset", "stop", "pre_save", "post_load", "frame"}) do
   emu["add_machine_" .. name .. "_notifier"] = function(f) callbacks[name] = f; return f end
 end
+local fixture = dofile(root .. "/_tests/adapters/pc98/control_io_fixture.lua")
+fixture.install(emu, socket)
 dofile(root .. "/adapters/mame-pc98/plugins/emucap_gdbstub/init.lua").startplugin()
 local function upvalue(f, name, value, write)
   for i = 1, 100 do
@@ -48,7 +50,7 @@ local handle = upvalue(service, "handle")
 local function request(name, arg)
   writes = {}
   local encoded = arg and ("," .. arg:gsub(".", function(c) return string.format("%02x", c:byte()) end)) or ""
-  handle("qEmucap," .. name .. encoded)
+  fixture.call(handle, "qEmucap," .. name .. encoded)
   local reply = writes[#writes]
   assert(reply and reply:match("^%$"), name .. " did not reply")
   return reply:match("^%$(.*)#%x%x$")
@@ -62,17 +64,17 @@ assert(request("framebegin", "one:120:1000") == "FRAME|one|running|0|120|none")
 machine.paused = false
 local throttle_hook = upvalue(callbacks.reset, "throttle_wait_hook")
 local function cancel_wire(id)
-  return "$qEmucap,framecancel," .. id:gsub(".", function(c) return string.format("%02x", c:byte()) end) .. "#00"
+  return fixture.wire("qEmucap,framecancel," .. id:gsub(".", function(c) return string.format("%02x", c:byte()) end))
 end
 writes = {}
-set(throttle_hook, "rxbuf", cancel_wire("wrong"))
+input = {cancel_wire("wrong")}
 assert(not throttle_hook(), "stale cancel ended the native pacing wait")
 assert(writes[#writes]:match("^%$E00#"))
 writes = {}
-set(throttle_hook, "rxbuf", cancel_wire("one"))
+input = {cancel_wire("one")}
 assert(throttle_hook(), "matching cancel was not scheduled outside the pacing wait")
 assert(#writes == 0)
-set(throttle_hook, "rxbuf", "")
+fixture.upvalue(handle, "socket"):discard_input()
 assert(request("framebegin", "two:10:1000") == "E09")
 assert(request("framecancel", "wrong") == "E00")
 assert(upvalue(callbacks.frame, "frame_wait_target") == 120)

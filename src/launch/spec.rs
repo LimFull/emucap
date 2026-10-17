@@ -114,7 +114,7 @@ pub fn flycast_spec(binary: &Path, log_path: &Path, opts: &SpecOpts) -> LaunchSp
 }
 
 /// Dolphin (GameCube / Wii). The launcher resolves and copies the compatible native fork, then
-/// provides a per-port user directory. GUI batch mode hides only the game list while retaining the
+/// provides a generation-owned user directory. GUI batch mode hides only the game list while retaining the
 /// render window; the no-GUI build explicitly selects the headless window platform.
 pub fn dolphin_spec(
     binary: &Path,
@@ -145,7 +145,7 @@ pub fn dolphin_spec(
         spec = spec.arg("--batch");
     }
     if system == "wii" {
-        // The per-port user directory is intentionally reusable. Select the emulated source in
+        // The generation-owned user directory is isolated. Select the emulated source in
         // Dolphin's current-run layer so a prior GUI choice cannot turn this generation into a
         // real or absent Wii Remote while the adapter advertises core-button injection.
         spec = spec.arg("--config=Wiimote.Wiimote1.Source=1");

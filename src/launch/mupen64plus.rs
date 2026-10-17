@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{emu_home_dir, find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
+use super::{find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
 
+// Compatibility generation of the published host ABI, not a patch revision.
+// Additive exports retain this generation; the loader checks required symbols
+// and managed launch separately checks the exact pinned patchset.
 pub const REQUIRED_HOST_API: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,7 +124,7 @@ pub(crate) fn library_path(root: &Path, stem: &str) -> Option<PathBuf> {
 pub fn require_compatible_root(
     repo_root: &Path,
     root: &Path,
-    display: bool,
+    _display: bool,
 ) -> io::Result<BuildMetadata> {
     if !library_exists(root, "libmupen64plus")
         || !library_exists(root, "mupen64plus-rsp-hle")
@@ -135,7 +138,7 @@ pub fn require_compatible_root(
             ),
         ));
     }
-    if display && !library_exists(root, "mupen64plus-video-rice") {
+    if !library_exists(root, "mupen64plus-video-rice") {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -174,7 +177,7 @@ pub fn require_compatible_root(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "Mupen64Plus build metadata does not match {}",
+                "Mupen64Plus build metadata does not match {}; rebuild or install the native bundle pinned by this checkout",
                 repo_root
                     .join("adapters/mupen64plus/upstream.lock")
                     .display()
@@ -227,8 +230,7 @@ pub fn launch_spec(launch: &Launch<'_>, runtime_home: &Path) -> LaunchSpec {
 pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
     validate_content(launch.content)?;
     require_compatible_root(launch.repo_root, launch.root, launch.display)?;
-    let runtime_home = emu_home_dir("mupen64plus", launch.port);
-    std::fs::create_dir_all(&runtime_home)?;
+    let runtime_home = super::emu_generation_dir("mupen64plus", launch.port, launch.runtime)?;
     let pid = spawn_detached(&launch_spec(launch, &runtime_home))?;
     if launch.display {
         super::spawn_display_caffeinate(pid);

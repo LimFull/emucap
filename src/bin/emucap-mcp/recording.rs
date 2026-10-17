@@ -159,7 +159,7 @@ pub(crate) async fn run_record_window(
             .unwrap_or_else(|error| error.into_inner());
         recording::record_window(
             &mut *link,
-            RuntimeStore::discover(),
+            RuntimeStore::discover()?,
             request,
             worker_cancellation,
             &mut |progress| {

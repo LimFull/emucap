@@ -208,103 +208,16 @@ fn opened_file_is_safe_regular(
         && path_metadata.modified().ok() == handle_metadata.modified().ok())
 }
 
-/// Open a regular member relative to an already selected real directory without following any
-/// member-path symlink. On Unix every component is resolved from a directory handle, so renaming
-/// or replacing a path between validation and open cannot redirect the read outside `root`.
-#[cfg(unix)]
+/// Open a regular member relative to one retained root handle without following any member-path
+/// link or reparse point. Every component is resolved from its acquired parent handle.
 pub fn open_regular_member_no_follow(root: &Path, relative: &str) -> io::Result<fs::File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-
     if !is_portable_relative_member(relative) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "member path must remain relative to its managed root",
         ));
     }
-
-    fn open_owned(path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
-        use std::os::unix::ffi::OsStrExt;
-
-        let path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-        // SAFETY: `path` is a NUL-terminated owned byte string and `flags` request read-only
-        // descriptors. A successful descriptor is immediately wrapped in OwnedFd.
-        let fd = unsafe { libc::open(path.as_ptr(), flags) };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: `fd` is newly returned and exclusively owned by this call.
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        }
-    }
-
-    fn openat_owned(
-        directory: &OwnedFd,
-        component: &std::ffi::OsStr,
-        flags: libc::c_int,
-    ) -> io::Result<OwnedFd> {
-        let component = CString::new(component.as_bytes()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "member component contains NUL")
-        })?;
-        // SAFETY: `directory` remains alive for the call, `component` is NUL-terminated, and a
-        // successful descriptor is immediately wrapped in OwnedFd.
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), component.as_ptr(), flags) };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: `fd` is newly returned and exclusively owned by this call.
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        }
-    }
-
-    let directory_flags =
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    let mut directory = open_owned(root, directory_flags)?;
-    let components = Path::new(relative).components().collect::<Vec<_>>();
-    for component in &components[..components.len() - 1] {
-        let Component::Normal(component) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "member path contains an unsafe component",
-            ));
-        };
-        directory = openat_owned(&directory, component, directory_flags)?;
-    }
-    let Component::Normal(file_name) = components[components.len() - 1] else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "member path contains an unsafe file name",
-        ));
-    };
-    let file = openat_owned(
-        &directory,
-        file_name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-    )?;
-    let file = fs::File::from(file);
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "managed member is not a regular file",
-        ));
-    }
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-pub fn open_regular_member_no_follow(root: &Path, relative: &str) -> io::Result<fs::File> {
-    let path = regular_member_path(root, relative)?;
-    let canonical_root = fs::canonicalize(root)?;
-    let canonical_path = fs::canonicalize(&path)?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "managed member escapes its root",
-        ));
-    }
-    open_regular_file_no_follow(&canonical_path)
+    crate::rooted_fs::RootedDirectory::open(root)?.open_regular_member(Path::new(relative))
 }
 
 pub fn read_bounded_regular_member(
@@ -321,8 +234,17 @@ pub fn read_bounded_regular_file_no_follow(path: &Path, max_bytes: u64) -> io::R
     read_bounded_opened_regular_file(file, max_bytes)
 }
 
-fn read_bounded_opened_regular_file(mut file: fs::File, max_bytes: u64) -> io::Result<Vec<u8>> {
+pub(crate) fn read_bounded_opened_regular_file(
+    mut file: fs::File,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
     let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input is not a regular file",
+        ));
+    }
     if metadata.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -453,6 +453,19 @@ impl CaptureCapsuleRepository {
         Ok(updated)
     }
 
+    pub(crate) fn check_recovery_eligibility(
+        &self,
+        capsule: &CaptureCapsule,
+        current_lease: &CaptureLeaseIdentity,
+    ) -> Result<(), CaptureCapsuleError> {
+        if process_state(&capsule.lease.holder) != ProcessState::Exited {
+            return Err(CaptureCapsuleError::RecoveryBlocked(
+                "former capture lease holder exit is not proven".into(),
+            ));
+        }
+        self.verify_generation_and_lease(current_lease, false)
+    }
+
     pub fn reconcile(
         &self,
         current_lease: &CaptureLeaseIdentity,
@@ -465,12 +478,7 @@ impl CaptureCapsuleRepository {
         if capsule.state.is_terminal() {
             return Ok(ReconcileOutcome::AlreadyTerminal);
         }
-        if process_state(&capsule.lease.holder) != ProcessState::Exited {
-            return Err(CaptureCapsuleError::RecoveryBlocked(
-                "former capture lease holder exit is not proven".into(),
-            ));
-        }
-        self.verify_generation_and_lease(current_lease, false)?;
+        self.check_recovery_eligibility(&capsule, current_lease)?;
 
         if let Some(bundle) = verified_bundle {
             if bundle.manifest.capture_id != capsule.capture_id

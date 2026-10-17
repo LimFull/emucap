@@ -11,9 +11,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
-from observation_speed import ROOT, Witness, free_port, state_call, warmup
-from input_pacing import Session
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from observation_speed import ROOT, Witness, free_port, state_call, warmup  # noqa: E402
+from input_pacing import Session  # noqa: E402
 
 
 def flatten(value, prefix=''):

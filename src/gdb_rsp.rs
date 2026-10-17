@@ -6,9 +6,11 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use sha1::{Digest as _, Sha1};
+
 #[cfg(test)]
 #[path = "gdb_rsp_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GdbError {
@@ -21,6 +23,55 @@ pub enum GdbError {
 }
 
 pub type GdbResult<T> = Result<T, GdbError>;
+
+/// One demultiplexing operation, including packets skipped before its terminal reply.
+pub(crate) struct ExchangeBudget {
+    deadline: Instant,
+    exhausted: std::cell::Cell<bool>,
+    packets: usize,
+    bytes: usize,
+}
+
+impl ExchangeBudget {
+    pub(crate) fn new(timeout: Duration) -> GdbResult<Self> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| GdbError::Emulator("GDB exchange timeout overflow".into()))?;
+        Ok(Self {
+            deadline,
+            exhausted: std::cell::Cell::new(false),
+            packets: 0,
+            bytes: 0,
+        })
+    }
+
+    pub(crate) fn remaining(&self) -> GdbResult<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|value| !value.is_zero())
+            .ok_or_else(|| {
+                self.exhausted.set(true);
+                GdbError::Emulator("GDB demultiplexing deadline expired".into())
+            })
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
+    pub(crate) fn skipped(&mut self, packet: &str) -> GdbResult<()> {
+        self.remaining()?;
+        if self.packets >= 1024 || packet.len() > (8 * 1024 * 1024) - self.bytes {
+            self.exhausted.set(true);
+            return Err(GdbError::Emulator(
+                "GDB demultiplexing budget exceeded".into(),
+            ));
+        }
+        self.packets += 1;
+        self.bytes += packet.len();
+        Ok(())
+    }
+}
 
 pub trait GdbTransport {
     fn send(&mut self, payload: &str) -> GdbResult<String>;
@@ -94,12 +145,14 @@ impl GdbBridgeEnv {
 
 // Bound encoded RSP payloads before decoding; framing adds four bytes.
 const MAX_RSP_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RSP_PREFIX_BYTES: usize = 64 * 1024;
 
 pub struct GdbRspClient {
     stream: TcpStream,
     buf: VecDeque<u8>,
     poisoned: bool,
     io_deadline: Option<Instant>,
+    timeout: Duration,
 }
 
 impl GdbRspClient {
@@ -120,6 +173,7 @@ impl GdbRspClient {
                         buf: VecDeque::new(),
                         poisoned: false,
                         io_deadline: None,
+                        timeout,
                     });
                 }
                 Err(err) if Instant::now() < deadline => {
@@ -131,6 +185,109 @@ impl GdbRspClient {
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    /// Start RSP on a stream that already completed the xemu native-authentication exchange.
+    pub fn from_authenticated_stream(
+        stream: TcpStream,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        Ok(Self {
+            stream,
+            buf: VecDeque::new(),
+            poisoned: false,
+            io_deadline: None,
+            timeout,
+        })
+    }
+
+    /// Authenticate an already-connected emucap-managed GDB stub before any
+    /// ordinary RSP command is sent. Generic GDB-backed adapters continue to
+    /// use `connect` without this extension; DeSmuME requires it on each CPU
+    /// socket. Any failed or unexpected exchange makes the connection unusable.
+    pub fn authenticate(&mut self, native_debug_token: &str) -> GdbResult<()> {
+        if native_debug_token.is_empty() {
+            self.poisoned = true;
+            return Err(GdbError::Emulator(
+                "native debugger token must be non-empty for GDB authentication".into(),
+            ));
+        }
+
+        let payload = format!(
+            "qEmucap,auth:{}",
+            hex::encode(native_debug_token.as_bytes())
+        );
+        match self.send(&payload) {
+            Ok(reply) if reply == "OK" => Ok(()),
+            Ok(_) => {
+                self.poisoned = true;
+                Err(GdbError::Emulator(
+                    "GDB stub rejected native debugger authentication".into(),
+                ))
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Mutually authenticate the MAME native-control hop. The bridge validates
+    /// the producer before it returns a client proof, so a process that merely
+    /// won the predictable loopback port cannot collect a reusable bearer.
+    pub fn authenticate_mutual(&mut self, native_debug_token: &str) -> GdbResult<()> {
+        if native_debug_token.is_empty()
+            || native_debug_token.len() > 256
+            || native_debug_token.as_bytes().contains(&0)
+        {
+            self.poisoned = true;
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            return Err(GdbError::Emulator(
+                "native debugger token is outside the MAME authentication bounds".into(),
+            ));
+        }
+
+        let client_nonce = hex::encode(ulid::Ulid::generate().to_bytes());
+        let result = (|| {
+            let reply = self.send(&format!("qEmucap,auth1:{client_nonce}"))?;
+            let fields = reply.strip_prefix("qEmucap,auth2:").ok_or_else(|| {
+                GdbError::Emulator(
+                    "MAME native server returned an invalid authentication reply".into(),
+                )
+            })?;
+            let (server_nonce, server_proof) = fields.split_once(':').ok_or_else(|| {
+                GdbError::Emulator(
+                    "MAME native server returned an incomplete authentication proof".into(),
+                )
+            })?;
+            if !is_hex(server_nonce, 32) || !is_hex(server_proof, 40) {
+                return Err(GdbError::Emulator(
+                    "MAME native server authentication fields are outside bounds".into(),
+                ));
+            }
+            let expected =
+                native_auth_proof(native_debug_token, b"server", &client_nonce, server_nonce);
+            if !constant_time_equal(expected.as_bytes(), server_proof.as_bytes()) {
+                return Err(GdbError::Emulator(
+                    "MAME native server proof did not match this launch".into(),
+                ));
+            }
+            let client_proof =
+                native_auth_proof(native_debug_token, b"client", &client_nonce, server_nonce);
+            if self.send(&format!("qEmucap,auth3:{client_proof}"))? != "OK" {
+                return Err(GdbError::Emulator(
+                    "MAME native server rejected the client proof".into(),
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+        result
     }
 
     fn checksum(payload: &[u8]) -> u8 {
@@ -197,10 +354,11 @@ impl GdbRspClient {
             .ok_or_else(|| GdbError::Emulator("invalid GDB exchange budget".into()))?;
         let read_timeout = self.stream.read_timeout()?;
         let write_timeout = self.stream.write_timeout()?;
-        self.io_deadline = Some(deadline);
+        let previous_deadline = self.io_deadline;
+        self.io_deadline = Some(previous_deadline.map_or(deadline, |outer| outer.min(deadline)));
         let result = operation(self);
         let elapsed = self.remaining_budget();
-        self.io_deadline = None;
+        self.io_deadline = previous_deadline;
         let restore_read = self.stream.set_read_timeout(read_timeout).map_err(|error| {
             std::io::Error::new(
                 error.kind(),
@@ -218,6 +376,7 @@ impl GdbRspClient {
             });
         if result.is_err() || elapsed.is_err() || restore_read.is_err() || restore_write.is_err() {
             self.poisoned = true;
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
         }
         if let Err(primary) = result {
             if restore_read.is_ok() && restore_write.is_ok() {
@@ -294,7 +453,16 @@ impl GdbRspClient {
     }
 
     fn read_packet(&mut self) -> std::io::Result<String> {
-        while self.read_byte()? != b'$' {}
+        let mut prefix = 0;
+        while self.read_byte()? != b'$' {
+            prefix += 1;
+            if prefix > MAX_RSP_PREFIX_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "GDB framing prefix exceeds byte limit",
+                ));
+            }
+        }
 
         let mut raw = Vec::new();
         loop {
@@ -367,6 +535,17 @@ impl GdbRspClient {
     }
 
     fn check_pending_packet_size(&self) -> std::io::Result<()> {
+        let prefix = self
+            .buf
+            .iter()
+            .position(|byte| *byte == b'$')
+            .unwrap_or(self.buf.len());
+        if prefix > MAX_RSP_PREFIX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "GDB framing prefix exceeds byte limit",
+            ));
+        }
         if self.buf.len() > MAX_RSP_PAYLOAD_BYTES + 4 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -417,12 +596,71 @@ impl GdbRspClient {
     }
 }
 
+fn is_hex(value: &str, size: usize) -> bool {
+    value.len() == size && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn hmac_sha1(key: &[u8], fields: &[&[u8]]) -> [u8; 20] {
+    const BLOCK_BYTES: usize = 64;
+    let mut key_block = [0u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        key_block[..20].copy_from_slice(&Sha1::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5cu8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Sha1::new();
+    inner.update(inner_pad);
+    for field in fields {
+        inner.update((field.len() as u64).to_be_bytes());
+        inner.update(field);
+    }
+    let inner_digest = inner.finalize();
+    let mut outer = Sha1::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn native_auth_proof(
+    token: &str,
+    direction: &[u8],
+    client_nonce: &str,
+    server_nonce: &str,
+) -> String {
+    hex::encode(hmac_sha1(
+        token.as_bytes(),
+        &[
+            b"emucap-mame-native-auth-v1",
+            direction,
+            client_nonce.as_bytes(),
+            server_nonce.as_bytes(),
+        ],
+    ))
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for (index, value) in left.iter().enumerate() {
+        difference |= usize::from(*value ^ right.get(index).copied().unwrap_or(0));
+    }
+    difference == 0
+}
+
 impl GdbTransport for GdbRspClient {
     fn is_terminal(&self) -> bool {
         self.poisoned
     }
 
     fn send(&mut self, payload: &str) -> GdbResult<String> {
+        if self.io_deadline.is_none() {
+            return self.bounded(self.timeout, |client| client.send(payload));
+        }
         self.ensure_usable()?;
         let result = (|| {
             self.write_packet(payload)?;
@@ -444,12 +682,18 @@ impl GdbTransport for GdbRspClient {
     }
 
     fn send_no_reply(&mut self, payload: &str) -> GdbResult<()> {
+        if self.io_deadline.is_none() {
+            return self.bounded(self.timeout, |client| client.send_no_reply(payload));
+        }
         self.ensure_usable()?;
         let result = self.write_packet(payload);
         self.finish_io(result)
     }
 
     fn recv_reply(&mut self) -> GdbResult<String> {
+        if self.io_deadline.is_none() {
+            return self.bounded(self.timeout, |client| client.recv_reply());
+        }
         self.ensure_usable()?;
         let result = self.read_packet();
         self.finish_io(result)
@@ -460,6 +704,9 @@ impl GdbTransport for GdbRspClient {
     }
 
     fn interrupt(&mut self) -> GdbResult<String> {
+        if self.io_deadline.is_none() {
+            return self.bounded(self.timeout, |client| client.interrupt());
+        }
         self.ensure_usable()?;
         let result = self.write_bytes(&[0x03]);
         self.finish_io(result)?;
@@ -475,15 +722,13 @@ impl GdbTransport for GdbRspClient {
     }
 
     fn get_timeout(&self) -> GdbResult<Duration> {
-        Ok(self
-            .stream
-            .read_timeout()?
-            .unwrap_or(Duration::from_secs(5)))
+        Ok(self.timeout)
     }
 
     fn set_timeout(&mut self, timeout: Duration) -> GdbResult<()> {
         self.stream.set_read_timeout(Some(timeout))?;
         self.stream.set_write_timeout(Some(timeout))?;
+        self.timeout = timeout;
         Ok(())
     }
 
@@ -492,6 +737,9 @@ impl GdbTransport for GdbRspClient {
     }
 
     fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
+        if self.io_deadline.is_none() {
+            return self.bounded(self.timeout, |client| client.recv_nonblocking());
+        }
         self.ensure_usable()?;
         let result = self.recv_nonblocking_packet();
         self.finish_io(result)

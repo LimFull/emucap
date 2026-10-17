@@ -1,6 +1,8 @@
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+index 0b72447b49..60dd5638c4 100644
 --- a/headless/Headless.cpp
 +++ b/headless/Headless.cpp
-@@ -86,12 +86,32 @@
+@@ -138,6 +138,23 @@ int64_t System_GetPropertyInt(SystemProperty prop) {
  	return -1;
  }
  float System_GetPropertyFloat(SystemProperty prop) { return -1.0f; }
@@ -14,7 +16,7 @@
 +#if PPSSPP_PLATFORM(WINDOWS)
 +	// Mount a filesystem
 +	g_Config.memStickDirectory = exePath / "memstick";
-+	File::CreateDir(g_Config.memStickDirectory);
++	File::CreateDir(g_Config.memStickDirectory, true);
 +	CreateSysDirectories();
 +#elif !PPSSPP_PLATFORM(ANDROID)
 +	g_Config.memStickDirectory = Path(std::string(getenv("HOME"))) / ".ppsspp";
@@ -23,31 +25,27 @@
 +
  bool System_GetPropertyBool(SystemProperty prop) {
  	switch (prop) {
- 		case SYSPROP_CAN_JIT:
- 			return true;
--		case SYSPROP_SKIP_UI:
--			return true;
-+		case SYSPROP_SKIP_UI: {
-+			// Managed screenshots include guest system dialogs, even without a window.
-+			const char *managedRoot = getenv("EMUCAP_PPSSPP_MEMSTICK");
-+			return !(managedRoot && *managedRoot);
-+		}
- 		default:
- 			return false;
- 	}
-@@ -634,14 +654,7 @@
+ 	case SYSPROP_IS_HEADLESS: return true;
+@@ -1147,19 +1164,9 @@ int main(int argc, const char* argv[]) {
+ 
  	Path exePath = File::GetExeDirectory();
- 	g_Config.flash0Directory = exePath / "assets/flash0";
  
+-	// --memstick, applied by ApplyToConfig() further up, wins. This runs after it, so without the
+-	// check the default below would silently overwrite whatever was asked for.
+-	if (!cmdLineOptions.memStick.has_value()) {
+-		// TODO: Share this derivation with the main build.
 -#if PPSSPP_PLATFORM(WINDOWS)
--	// Mount a filesystem
--	g_Config.memStickDirectory = exePath / "memstick";
--	File::CreateDir(g_Config.memStickDirectory);
--	CreateSysDirectories();
+-		// Mount a filesystem
+-		g_Config.memStickDirectory = exePath / "memstick";
+-		File::CreateDir(g_Config.memStickDirectory, true);
+-		CreateSysDirectories();
 -#elif !PPSSPP_PLATFORM(ANDROID)
--	g_Config.memStickDirectory = Path(std::string(getenv("HOME"))) / ".ppsspp";
+-		g_Config.memStickDirectory = Path(std::string(getenv("HOME"))) / ".ppsspp";
 -#endif
-+	ConfigureMemstick(exePath);
- 
- 	// Try to find the flash0 directory.  Often this is from a subdirectory.
- 	Path nextPath = exePath;
+-	}
++	const char *managedRoot = getenv("EMUCAP_PPSSPP_MEMSTICK");
++	if ((managedRoot && *managedRoot) || !cmdLineOptions.memStick.has_value())
++		ConfigureMemstick(exePath);
+ 	// The memstick's NAND, unless --nand says otherwise.
+ 	if (cmdLineOptions.nand.has_value()) {
+ 		g_Config.nandRootDirectory = Path(cmdLineOptions.nand.value());

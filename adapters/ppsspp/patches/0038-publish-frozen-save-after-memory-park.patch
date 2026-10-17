@@ -1,0 +1,15 @@
+diff --git a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+index 9d2f38d452..ed4945c37f 100644
+--- a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+@@ -128,8 +128,8 @@ void RunSaveStateOperation(DebuggerRequest &req, bool isSave, BreakReason breakR
+ 	if (wait->status == SaveState::Status::FAILURE)
+ 		return req.Fail(wait->message.empty() ? (isSave ? "Failed to save state" : "Failed to load state") : wait->message);
+ 
+-	if (!isSave && !WaitForLoadedMemoryPark(std::chrono::steady_clock::now() + std::chrono::seconds(2)))
+-		return req.Fail("emucap memory park unverified after state load");
++	if ((!isSave || !resumeAfter) && !WaitForLoadedMemoryPark(std::chrono::steady_clock::now() + std::chrono::seconds(2)))
++		return req.Fail("emucap memory park unverified after state operation");
+ 
+ 	JsonWriter &json = req.Respond();
+ 	json.writeString("path", path);

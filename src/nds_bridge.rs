@@ -269,6 +269,7 @@ struct CpuConn<G> {
     gdb: G,
     frozen: bool,
     events: Vec<Value>,
+    control_unverified: bool,
 }
 
 pub struct NdsBridge<G> {
@@ -379,11 +380,11 @@ impl<G: GdbTransport> NdsBridge<G> {
 
     pub fn backend_terminal(&self) -> bool {
         self.control_unverified
+            || self.arm9.control_unverified
             || self.arm9.gdb.is_terminal()
-            || self
-                .arm7
-                .as_ref()
-                .is_some_and(|connection| connection.gdb.is_terminal())
+            || self.arm7.as_ref().is_some_and(|connection| {
+                connection.control_unverified || connection.gdb.is_terminal()
+            })
     }
 }
 

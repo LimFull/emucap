@@ -56,6 +56,11 @@ def payload_hashes(directory):
     for path in sorted(directory.rglob('*')):
         if path.is_symlink():
             raise ValueError(f'symlink payload: {path}')
+        relative = path.relative_to(directory).as_posix()
+        # Provenance is independently authenticated before cache consumption.
+        # The compilation manifest owns only the original runtime payload.
+        if relative in ('NATIVE-PROVENANCE.json', 'NATIVE-PROVENANCE.sigstore.json') or relative.startswith('provenance/'):
+            continue
         if path.is_file() and path != directory / 'NATIVE-BUILD.json':
             files[path.relative_to(directory).as_posix()] = sha(path)
     return files

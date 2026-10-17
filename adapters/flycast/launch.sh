@@ -37,33 +37,6 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   exit 2
 fi
 
-emucap_data_root() {
-  if [ -n "${EMUCAP_EMU_HOME:-}" ]; then
-    echo "$EMUCAP_EMU_HOME"
-    return
-  fi
-  case "$(uname -s 2>/dev/null || echo unknown)" in
-    Darwin)
-      echo "${HOME:-/tmp}/Library/Application Support/emucap"
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      if [ -n "${LOCALAPPDATA:-}" ]; then
-        echo "$LOCALAPPDATA/emucap"
-      elif [ -n "${APPDATA:-}" ]; then
-        echo "$APPDATA/emucap"
-      else
-        echo "${HOME:-/tmp}/AppData/Local/emucap"
-      fi
-      ;;
-    *)
-      if [ -n "${XDG_DATA_HOME:-}" ]; then
-        echo "$XDG_DATA_HOME/emucap"
-      else
-        echo "${HOME:-/tmp}/.local/share/emucap"
-      fi
-      ;;
-  esac
-}
 
 default_flycast_binary() {
   local build_home="${EMUCAP_FLYCAST_BUILD_HOME:-$EMUCAP_DATA_ROOT/flycast-build}"
@@ -74,17 +47,14 @@ default_flycast_binary() {
   esac
 }
 
-EMUCAP_DATA_ROOT="$(emucap_data_root)"
+EMUCAP_DATA_ROOT="$(emucap_runtime_base)"
 RUN_DIR="$EMUCAP_DATA_ROOT/flycast/$PORT"
 FLY="${FLYCAST_APP:-$(default_flycast_binary)}"
 case "$FLY" in
   *.app) FLY="$FLY/Contents/MacOS/Flycast" ;;
 esac
-TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
-if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SESSION_TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
-fi
+emucap_require_front_identity "$SESSION_TOKEN" "${EMUCAP_LAUNCH_ID:-}" || exit 2
 [ -n "$DISC" ] && [ -f "$DISC" ] || { echo "ERROR: 디스크 없음: $DISC"; exit 1; }
 [ -x "$FLY" ] || { echo "ERROR: Flycast 바이너리 없음: $FLY (adapters/flycast/build.sh로 빌드하거나 FLYCAST_APP 지정)"; exit 1; }
 PIDFILE="$RUN_DIR/flycast.pid"
@@ -265,9 +235,10 @@ fi
 # 출력은 discoverable 로그로(무음 실패 방지 — 부팅 에러를 에이전트가 볼 수 있게).
 LAUNCH_LOG="${EMUCAP_LOG:-$RUN_DIR/flycast.log}"
 mkdir -p "$(dirname "$LAUNCH_LOG")"
-env EMUCAP_PORT="$PORT" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$DISC" "${FLYCAST_ISO_ENV[@]}" \
+export EMUCAP_SESSION_TOKEN="$SESSION_TOKEN"
+env EMUCAP_PORT="$PORT" EMUCAP_CONTENT="$DISC" "${FLYCAST_ISO_ENV[@]}" \
   nohup "$FLY_RUNTIME" -config "Dynarec:Enabled=no" "$DISC" >"$LAUNCH_LOG" 2>&1 &
 NEWPID=$!; disown
 command -v caffeinate >/dev/null 2>&1 && { caffeinate -d -w "$NEWPID" >/dev/null 2>&1 & disown; }
 echo "$NEWPID" > "$PIDFILE"
-echo "Flycast 기동: pid=$NEWPID port=$PORT disc=$DISC session_token=${SESSION_TOKEN:+present} (runtime=$FLY_RUNTIME; 인터프리터; 음소거=$MUTE; log=$LAUNCH_LOG; 정리는 이 포트의 우리 인스턴스만)"
+echo "Flycast 기동: pid=$NEWPID port=$PORT disc=$DISC front_key=${SESSION_TOKEN:+present} (runtime=$FLY_RUNTIME; 인터프리터; 음소거=$MUTE; log=$LAUNCH_LOG; 정리는 이 포트의 우리 인스턴스만)"

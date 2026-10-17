@@ -36,9 +36,9 @@ provides them from their own console or dumps. **Never commit BIOS files to the 
 **Where they go.** Managed launches never read or update the user's Mednafen profile. Put canonical
 BIOS filenames in the OS-specific emucap data root under `firmware/`, or set
 `EMUCAP_MEDNAFEN_FIRMWARE` to an absolute inventory directory. The launcher copies known files into
-the port-owned Mednafen home before spawn. PC-FX is additionally validated by identity: set
+the launch-generation Mednafen home before spawn. PC-FX is additionally validated by identity: set
 `EMUCAP_PCFX_BIOS` to an absolute path, or place `pcfx.rom` in that shared emucap firmware directory.
-On **Windows** the Mednafen adapter is BETA and building it from source is non-trivial; use the
+Windows source-build and runtime qualification remains pending; use the
 top-level **Platforms** guidance rather than guessing a host-specific emulator profile path.
 
 **Per system — give the user the exact filename and the exact folder:**
@@ -124,7 +124,7 @@ PC-FX uses an explicit system ID because its disc extensions overlap other CD sy
 {"content_path":"/path/to/pcfx.cue","system":"pcfx","display":false}
 ```
 
-The Rust launcher gives every Mednafen module a per-port `MEDNAFEN_HOME`, so it neither reads nor
+The Rust launcher gives every Mednafen launch generation its own `MEDNAFEN_HOME`, so it neither reads nor
 updates `~/.mednafen`. It stages only the canonical BIOS filenames listed above. The PC-FX version
 1.00 image is also validated before spawn.
 
@@ -309,7 +309,7 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   support `vram`/`cram`/`vsram`/`vdpreg` write BPs via a VDP write hook. VDP read BPs are not yet supported.
   MD `ram` BP is mapped to CPU address 0xFF0000)/
   `disassemble` (SH-2/MIPS/HuC6280/V810/68000/V30MZ)/
-  `find_pattern` (pattern search in 128KB units inside the debugger address space)/
+  `find_pattern` (exact pattern search up to 16 MiB per request inside the debugger address space)/
   `reset`/`set_input` · `press_buttons` (controller injection — overwrites `mednafen.cpp`'s PortData[0] with the button
   mask, active-high; tap/hold_until are assembled in Rust from set_input+step)/
   `screenshot` (right after MDFNI_Emulate, PNG-encode espec.surface via `PNGWrite` → base64)/

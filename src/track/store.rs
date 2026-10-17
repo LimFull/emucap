@@ -1,10 +1,10 @@
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::track::model::{Finding, Rom, Run};
 
-const MAX_LEDGER_JSON_BYTES: u64 = 16 * 1024 * 1024;
+use super::budget::{ScanBudget, MAX_RECORD_BYTES as MAX_LEDGER_JSON_BYTES};
 const MAX_LEDGER_ID_BYTES: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +27,8 @@ pub enum TrackError {
     Corrupt(String),
     #[error("ledger JSON exceeds {limit} bytes: {path}")]
     TooLarge { path: PathBuf, limit: u64 },
+    #[error("tracking operation exceeds {limit} {resource}; use direct record IDs or partition the ledger")]
+    ResourceLimit { resource: &'static str, limit: u64 },
 }
 
 /// cwd에서 위로 올라가며 `.git`을 가진 가장 가까운 디렉터리(=에이전트가 작업하는 패치 프로젝트의
@@ -233,6 +235,14 @@ pub fn save_finding(root: &Path, finding: &Finding) -> Result<(), TrackError> {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(root: &Path, path: &Path) -> Result<T, TrackError> {
+    read_json_budgeted(root, path, &mut ScanBudget::default())
+}
+
+fn read_json_budgeted<T: serde::de::DeserializeOwned>(
+    root: &Path,
+    path: &Path,
+    budget: &mut ScanBudget,
+) -> Result<T, TrackError> {
     validate_existing_managed_parent(root, path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -247,6 +257,7 @@ fn read_json<T: serde::de::DeserializeOwned>(root: &Path, path: &Path) -> Result
             limit: MAX_LEDGER_JSON_BYTES,
         });
     }
+    budget.admit_size(metadata.len())?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -254,17 +265,8 @@ fn read_json<T: serde::de::DeserializeOwned>(root: &Path, path: &Path) -> Result
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(MAX_LEDGER_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LEDGER_JSON_BYTES {
-        return Err(TrackError::TooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_LEDGER_JSON_BYTES,
-        });
-    }
+    let file = options.open(path)?;
+    let bytes = budget.read(file, metadata.len(), path)?;
     serde_json::from_slice(&bytes).map_err(|source| TrackError::Parse {
         path: path.to_path_buf(),
         source,
@@ -272,7 +274,31 @@ fn read_json<T: serde::de::DeserializeOwned>(root: &Path, path: &Path) -> Result
 }
 
 fn read_run(root: &Path, path: &Path, rom_sha1: &str, run_id: &str) -> Result<Run, TrackError> {
-    let run: Run = read_json(root, path)?;
+    // Direct record access keeps its existing per-file contract for recovery.
+    let mut budget = ScanBudget {
+        elements: u64::MAX,
+        ..Default::default()
+    };
+    read_run_budgeted(root, path, rom_sha1, run_id, &mut budget)
+}
+
+fn read_run_budgeted(
+    root: &Path,
+    path: &Path,
+    rom_sha1: &str,
+    run_id: &str,
+    budget: &mut ScanBudget,
+) -> Result<Run, TrackError> {
+    let run: Run = read_json_budgeted(root, path, budget)?;
+    for count in [
+        run.tags.len(),
+        run.gates.len(),
+        run.metrics.len(),
+        run.artifacts.len(),
+        run.interventions.len(),
+    ] {
+        budget.elements(count)?;
+    }
     if run.rom_sha1 != rom_sha1
         || run.id != run_id
         || validate_ledger_id("stored rom_sha1", &run.rom_sha1).is_err()
@@ -425,13 +451,14 @@ fn managed_directory_exists(root: &Path, directory: &Path) -> Result<bool, Track
 
 /// roms/*/runs/*/run.json 경로를 모은다(.tmp 등 비-run.json·비-디렉터리는 무시).
 /// 디렉터리 읽기 실패는 전파. 엄격/관용 walk가 공유하는 단일 트래버설.
-fn run_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
+fn run_json_paths(root: &Path, budget: &mut ScanBudget) -> Result<Vec<PathBuf>, TrackError> {
     let mut out = Vec::new();
     let roms_dir = root.join("roms");
     if !managed_directory_exists(root, &roms_dir)? {
         return Ok(out);
     }
     for rom_entry in fs::read_dir(&roms_dir)? {
+        budget.entry()?;
         let rom_entry = rom_entry?;
         let file_type = rom_entry.file_type()?;
         if file_type.is_symlink() {
@@ -448,6 +475,7 @@ fn run_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
             continue;
         }
         for run_entry in fs::read_dir(&runs_dir)? {
+            budget.entry()?;
             let run_entry = run_entry?;
             let file_type = run_entry.file_type()?;
             if file_type.is_symlink() {
@@ -462,6 +490,7 @@ fn run_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
             let rj = run_entry.path().join("run.json");
             match fs::symlink_metadata(&rj) {
                 Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    budget.record()?;
                     out.push(rj)
                 }
                 Ok(_) => {}
@@ -474,13 +503,14 @@ fn run_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
 }
 
 /// roms/*/rom.json 경로를 모은다.
-fn rom_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
+fn rom_json_paths(root: &Path, budget: &mut ScanBudget) -> Result<Vec<PathBuf>, TrackError> {
     let mut out = Vec::new();
     let roms_dir = root.join("roms");
     if !managed_directory_exists(root, &roms_dir)? {
         return Ok(out);
     }
     for rom_entry in fs::read_dir(&roms_dir)? {
+        budget.entry()?;
         let rom_entry = rom_entry?;
         let file_type = rom_entry.file_type()?;
         if file_type.is_symlink() {
@@ -494,7 +524,10 @@ fn rom_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
         }
         let rj = rom_entry.path().join("rom.json");
         match fs::symlink_metadata(&rj) {
-            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => out.push(rj),
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                budget.record()?;
+                out.push(rj);
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -504,19 +537,21 @@ fn rom_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
 }
 
 /// findings/*.json 경로를 모은다.
-fn finding_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
+fn finding_json_paths(root: &Path, budget: &mut ScanBudget) -> Result<Vec<PathBuf>, TrackError> {
     let mut out = Vec::new();
     let dir = root.join("findings");
     if !managed_directory_exists(root, &dir)? {
         return Ok(out);
     }
     for entry in fs::read_dir(&dir)? {
+        budget.entry()?;
         let entry = entry?;
         let file_type = entry.file_type()?;
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) == Some("json")
             && (file_type.is_file() || file_type.is_symlink())
         {
+            budget.record()?;
             out.push(p);
         }
     }
@@ -524,7 +559,10 @@ fn finding_json_paths(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
 }
 
 /// 경로 목록을 로드하되 파싱 실패는 에러 전파 대신 skipped로 모은다.
-fn load_lenient<T, F>(paths: Vec<PathBuf>, mut load: F) -> (Vec<T>, Vec<PathBuf>)
+fn load_lenient<T, F>(
+    paths: Vec<PathBuf>,
+    mut load: F,
+) -> Result<(Vec<T>, Vec<PathBuf>), TrackError>
 where
     F: FnMut(&Path) -> Result<T, TrackError>,
 {
@@ -533,30 +571,45 @@ where
     for p in paths {
         match load(&p) {
             Ok(v) => out.push(v),
+            Err(error @ TrackError::ResourceLimit { .. }) => return Err(error),
             Err(_) => skipped.push(p),
         }
     }
-    (out, skipped)
+    Ok((out, skipped))
 }
 
 /// roms/*/runs/*/run.json 전부 로드. 손상 run.json은 에러(무결성과 데이터 일치 검사).
 pub fn walk_runs(root: &Path) -> Result<Vec<Run>, TrackError> {
-    run_json_paths(root)?
+    walk_runs_budgeted(root, &mut ScanBudget::default())
+}
+
+pub(super) fn walk_runs_budgeted(
+    root: &Path,
+    budget: &mut ScanBudget,
+) -> Result<Vec<Run>, TrackError> {
+    run_json_paths(root, budget)?
         .iter()
         .map(|path| {
             let (rom_sha1, run_id) = run_identity_from_path(root, path)?;
-            read_run(root, path, &rom_sha1, &run_id)
+            read_run_budgeted(root, path, &rom_sha1, &run_id, budget)
         })
         .collect()
 }
 
 /// roms/*/rom.json 전부 로드. 손상은 에러.
 pub fn walk_roms(root: &Path) -> Result<Vec<Rom>, TrackError> {
-    rom_json_paths(root)?
+    walk_roms_budgeted(root, &mut ScanBudget::default())
+}
+
+pub(super) fn walk_roms_budgeted(
+    root: &Path,
+    budget: &mut ScanBudget,
+) -> Result<Vec<Rom>, TrackError> {
+    rom_json_paths(root, budget)?
         .iter()
         .map(|path| {
             let rom_sha1 = rom_identity_from_path(root, path)?;
-            let rom: Rom = read_json(root, path)?;
+            let rom: Rom = read_json_budgeted(root, path, budget)?;
             if rom.sha1 != rom_sha1 || validate_ledger_id("stored rom_sha1", &rom.sha1).is_err() {
                 return Err(TrackError::Corrupt(format!(
                     "rom identity does not match {}",
@@ -570,25 +623,46 @@ pub fn walk_roms(root: &Path) -> Result<Vec<Rom>, TrackError> {
 
 /// findings/*.json 전부 로드. 손상은 에러.
 pub fn walk_findings(root: &Path) -> Result<Vec<Finding>, TrackError> {
-    finding_json_paths(root)?
+    walk_findings_budgeted(root, &mut ScanBudget::default())
+}
+
+pub(super) fn walk_findings_budgeted(
+    root: &Path,
+    budget: &mut ScanBudget,
+) -> Result<Vec<Finding>, TrackError> {
+    finding_json_paths(root, budget)?
         .iter()
-        .map(|path| read_finding(root, path))
+        .map(|path| read_finding_budgeted(root, path, budget))
         .collect()
 }
 
 /// walk_runs의 손상 내성 변형: 파싱 실패는 skipped 경로로 모은다(디렉터리 읽기 실패는 전파).
 pub fn walk_runs_lenient(root: &Path) -> Result<(Vec<Run>, Vec<PathBuf>), TrackError> {
-    Ok(load_lenient(run_json_paths(root)?, |path| {
+    walk_runs_lenient_budgeted(root, &mut ScanBudget::default())
+}
+
+pub(super) fn walk_runs_lenient_budgeted(
+    root: &Path,
+    budget: &mut ScanBudget,
+) -> Result<(Vec<Run>, Vec<PathBuf>), TrackError> {
+    load_lenient(run_json_paths(root, budget)?, |path| {
         let (rom_sha1, run_id) = run_identity_from_path(root, path)?;
-        read_run(root, path, &rom_sha1, &run_id)
-    }))
+        read_run_budgeted(root, path, &rom_sha1, &run_id, budget)
+    })
 }
 
 /// walk_roms의 손상 내성 변형.
 pub fn walk_roms_lenient(root: &Path) -> Result<(Vec<Rom>, Vec<PathBuf>), TrackError> {
-    Ok(load_lenient(rom_json_paths(root)?, |path| {
+    walk_roms_lenient_budgeted(root, &mut ScanBudget::default())
+}
+
+pub(super) fn walk_roms_lenient_budgeted(
+    root: &Path,
+    budget: &mut ScanBudget,
+) -> Result<(Vec<Rom>, Vec<PathBuf>), TrackError> {
+    load_lenient(rom_json_paths(root, budget)?, |path| {
         let rom_sha1 = rom_identity_from_path(root, path)?;
-        let rom: Rom = read_json(root, path)?;
+        let rom: Rom = read_json_budgeted(root, path, budget)?;
         if rom.sha1 != rom_sha1 || validate_ledger_id("stored rom_sha1", &rom.sha1).is_err() {
             return Err(TrackError::Corrupt(format!(
                 "rom identity does not match {}",
@@ -596,14 +670,21 @@ pub fn walk_roms_lenient(root: &Path) -> Result<(Vec<Rom>, Vec<PathBuf>), TrackE
             )));
         }
         Ok(rom)
-    }))
+    })
 }
 
 /// walk_findings의 손상 내성 변형(이질 *.json·손상 finding을 skipped로).
 pub fn walk_findings_lenient(root: &Path) -> Result<(Vec<Finding>, Vec<PathBuf>), TrackError> {
-    Ok(load_lenient(finding_json_paths(root)?, |path| {
-        read_finding(root, path)
-    }))
+    walk_findings_lenient_budgeted(root, &mut ScanBudget::default())
+}
+
+pub(super) fn walk_findings_lenient_budgeted(
+    root: &Path,
+    budget: &mut ScanBudget,
+) -> Result<(Vec<Finding>, Vec<PathBuf>), TrackError> {
+    load_lenient(finding_json_paths(root, budget)?, |path| {
+        read_finding_budgeted(root, path, budget)
+    })
 }
 
 /// run_id(전역 유일)로 run을 타깃 로드한다. roms/*/runs/<run_id>/run.json만 검사해 일치 1개만
@@ -611,12 +692,14 @@ pub fn walk_findings_lenient(root: &Path) -> Result<(Vec<Finding>, Vec<PathBuf>)
 /// 일치 run 손상 → Err(전파).
 pub fn find_run_by_id(root: &Path, run_id: &str) -> Result<Option<Run>, TrackError> {
     validate_ledger_id("run_id", run_id)?;
+    let mut budget = ScanBudget::default();
     let roms_dir = root.join("roms");
     if !managed_directory_exists(root, &roms_dir)? {
         return Ok(None);
     }
     let mut found: Option<PathBuf> = None;
     for rom_entry in fs::read_dir(&roms_dir)? {
+        budget.entry()?;
         let rom_entry = rom_entry?;
         if !rom_entry.file_type()?.is_dir() {
             continue;
@@ -717,8 +800,13 @@ fn rom_identity_from_path(root: &Path, path: &Path) -> Result<String, TrackError
     Ok(components[1].clone())
 }
 
-fn read_finding(root: &Path, path: &Path) -> Result<Finding, TrackError> {
-    let finding: Finding = read_json(root, path)?;
+fn read_finding_budgeted(
+    root: &Path,
+    path: &Path,
+    budget: &mut ScanBudget,
+) -> Result<Finding, TrackError> {
+    let finding: Finding = read_json_budgeted(root, path, budget)?;
+    budget.elements(finding.evidence_refs.len())?;
     let expected_id = path
         .file_stem()
         .and_then(|value| value.to_str())

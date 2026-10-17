@@ -19,7 +19,7 @@ use crate::qmp::{QmpError, QmpTransport};
 mod clock_profile;
 pub use clock_profile::{qualification_shift, XemuClockProfile};
 
-pub const REQUIRED_HOST_API: u64 = 3;
+pub const REQUIRED_HOST_API: u64 = 4;
 const HOST_FEATURES: &[&str] = &["controlled_start"];
 const MAX_MEMORY_TRANSFER: usize = 0x2_0000;
 const MAX_MEMORY_CHUNK: usize = 0x2000;
@@ -377,6 +377,10 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 other => Err(XemuBridgeError::UnknownMethod(other.into())),
             }
         };
+        // QMP notifications belong to the completed native transaction. State and
+        // job queries provide their authoritative results; debugger stop evidence
+        // is retained separately by the GDB demultiplexer for poll_events.
+        let _ = self.qmp.drain_events();
         match result {
             Ok(value) => Response {
                 id,

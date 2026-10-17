@@ -37,11 +37,13 @@ else
   packages=(build-essential clang cmake ninja-build pkg-config meson autoconf automake libtool
     curl git python3-dev patchelf gettext nasm zlib1g-dev libgl1-mesa-dev libegl1-mesa-dev)
   case "$adapter" in
-    mesen2) packages+=(libsdl2-dev libasound2-dev) ;;
-    dolphin) packages+=(qt6-base-dev qt6-tools-dev libqt6svg6-dev libusb-1.0-0-dev libevdev-dev
+    mesen2) packages+=(libsdl2-dev libasound2-dev libfontconfig1-dev zip) ;;
+    dolphin) packages+=(qt6-base-dev qt6-base-private-dev qt6-tools-dev libqt6svg6-dev libusb-1.0-0-dev libevdev-dev
       libsfml-dev libavcodec-dev libavformat-dev libswscale-dev libminiupnpc-dev libpugixml-dev
       libudev-dev libcurl4-openssl-dev liblzma-dev libbz2-dev libxxhash-dev libfmt-dev libxrandr-dev libxi-dev) ;;
-    ppsspp) packages+=(libsdl2-dev libfontconfig1-dev libfreetype-dev libvulkan-dev libglew-dev libsnappy-dev) ;;
+    ppsspp) packages+=(fonts-noto-cjk libfontconfig1-dev libfreetype-dev libharfbuzz-dev libvulkan-dev libglew-dev
+      libsnappy-dev libasound2-dev libpulse-dev libudev-dev libx11-dev libxcursor-dev
+      libxi-dev libxrandr-dev libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev wayland-protocols) ;;
     mednafen) packages+=(libsdl2-dev libsndfile1-dev libflac-dev liblzo2-dev libasound2-dev) ;;
     flycast) packages+=(libsdl2-dev libzip-dev libcurl4-openssl-dev libpulse-dev libudev-dev libvulkan-dev) ;;
     np2kai) ;;
@@ -67,6 +69,13 @@ else
   sudo apt-get update -qq
   sudo apt-get install -y --no-install-recommends "${packages[@]}"
   dpkg-query -W > native-toolchain.txt
+  if [ "$adapter" = ppsspp ]; then
+    deps="$source_root/native-dependencies/ppsspp"
+    bash adapters/ppsspp/build-sdl.sh "$deps" "$source_root/native-dependency-sources/ppsspp-sdl"
+    export CMAKE_PREFIX_PATH="$deps${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+    export PKG_CONFIG_PATH="$deps/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export LD_LIBRARY_PATH="$deps/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
   if [ "$adapter" = pcsx2 ]; then
     export CC=clang CXX=clang++
     . adapters/pcsx2/upstream.lock
@@ -77,6 +86,9 @@ else
     git -C "$upstream" fetch --depth 1 origin "$PCSX2_COMMIT"
     git -C "$upstream" checkout -q FETCH_HEAD
     deps="$source_root/native-dependencies/pcsx2"
+    # Compiled dependency caches have no authenticated producer. Build this
+    # closure fresh; complete native packages use the verified reuse path.
+    rm -rf "$deps" "$source_root/native-dependency-sources/pcsx2"
     mkdir -p "$source_root/native-dependency-sources/pcsx2"
     (cd "$source_root/native-dependency-sources/pcsx2"; BUILD_FFMPEG=1 bash "$upstream/.github/workflows/scripts/linux/build-dependencies-qt.sh" "$deps")
     export CMAKE_PREFIX_PATH="$deps"
@@ -92,6 +104,8 @@ if [ "$adapter" = xemu ]; then
   "$EMUCAP_XEMU_PYTHON" -m pip install 'PyYAML==6.0.2'
 fi
 bash _tests/adapters/build-lock-test.sh
+if [ "$adapter" = ppsspp ]; then export EMUCAP_PPSSPP_REQUIRE_GUI=1; fi
+if [ "$adapter" = dolphin ]; then export EMUCAP_DOLPHIN_REQUIRE_GUI=1; fi
 bash "adapters/$adapter/build.sh"
 if [ "$adapter" = np2kai ]; then
   extension=so

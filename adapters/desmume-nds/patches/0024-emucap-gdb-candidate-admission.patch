@@ -1,0 +1,479 @@
+diff --git a/desmume/src/gdbstub/gdbstub.cpp b/desmume/src/gdbstub/gdbstub.cpp
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -189,7 +189,7 @@
+ #define SEND(A,B,C) send(A, (char*)B, C, 0)
+ #define CLOSESOCKET(A) closesocket(A)
+ #define SOCKLEN_T int
+-static int set_socket_nodelay(int socket) {
++static int set_socket_nodelay(SOCKET_TYPE socket) {
+     BOOL nodelay_opt = 1;
+     return setsockopt( socket, IPPROTO_TCP, TCP_NODELAY,
+                        (char*)&nodelay_opt, sizeof( nodelay_opt));
+@@ -274,7 +274,7 @@
+ #define SEND(A,B,C) write(A, B, C)
+ #define CLOSESOCKET(A) close(A)
+ #define SOCKLEN_T socklen_t
+-static int set_socket_nodelay(int socket) {
++static int set_socket_nodelay(SOCKET_TYPE socket) {
+     int nodelay_opt = 1;
+     return setsockopt( socket, IPPROTO_TCP, TCP_NODELAY,
+                        &nodelay_opt, sizeof( nodelay_opt));
+@@ -926,126 +926,7 @@
+   return difference == 0;
+ }
+ 
+-// Wait for one unauthenticated byte while allowing the listener's control pipe
+-// to preempt admission. Reading one byte per iteration also makes the absolute
+-// deadline effective against a peer that otherwise drips bytes forever.
+-static int emucap_recv_auth_byte_until(
+-    SOCKET_TYPE sock, struct gdb_stub_state *state, uint8_t *reply,
+-    const emucap_gdb_clock::time_point &deadline) {
+-  while (emucap_gdb_clock::now() < deadline) {
+-    const std::chrono::microseconds remaining =
+-        std::chrono::duration_cast<std::chrono::microseconds>(
+-            deadline - emucap_gdb_clock::now());
+-    if (remaining.count() <= 0)
+-      return -1;
+-
+-    struct timeval timeout;
+-    timeout.tv_sec = (long)(remaining.count() / 1000000);
+-    timeout.tv_usec = (long)(remaining.count() % 1000000);
+-    fd_set read_set;
+-    FD_ZERO(&read_set);
+-    FD_SET(sock, &read_set);
+-    FD_SET(state->ctl_pipe[0], &read_set);
+-    int selected = select(FD_SETSIZE, &read_set, NULL, NULL, &timeout);
+-    if (selected > 0) {
+-      if (FD_ISSET(state->ctl_pipe[0], &read_set))
+-        return -1;
+-      if (FD_ISSET(sock, &read_set)) {
+-        int n = recv(sock, (char *)reply, 1, 0);
+-        if (n == 1)
+-          return 0;
+-        if (n == 0 || !emucap_socket_retryable())
+-          return -1;
+-      }
+-    }
+-    else if (selected < 0 && !emucap_socket_retryable()) {
+-      return -1;
+-    }
+-  }
+-  return -1;
+-}
+-
+-static int emucap_send_auth_ok_until(
+-    SOCKET_TYPE sock, struct gdb_stub_state *state,
+-    const emucap_gdb_clock::time_point &deadline) {
+-  static const char frame[] = "$OK#9a";
+-  uint8_t reply;
+-  for (int attempt = 0; attempt < EMUCAP_GDB_ACK_ATTEMPTS; attempt++) {
+-    if (emucap_send_all_until(sock, frame, sizeof(frame) - 1, deadline) != 0)
+-      return -1;
+-    if (emucap_recv_auth_byte_until(sock, state, &reply, deadline) != 0)
+-      return -1;
+-    if (reply == '+')
+-      return 0;
+-  }
+-  return -1;
+-}
+-
+-// Admit only a peer whose first complete RSP operation authenticates with the
+-// per-launch native debugger token. A control message preempts admission, and the absolute
+-// deadline bounds silent, slow-drip, and no-ACK peers. Until this returns true
+-// the socket is not installed in state->sock_fd and can neither dispatch
+-// commands nor receive asynchronous stop packets.
+-static bool emucap_authenticate_connection(
+-    SOCKET_TYPE sock, struct gdb_stub_state *state) {
+-  struct packet_reader_gdb packet;
+-  memset(&packet, 0, sizeof(packet));
+-  packet.state = IDLE_READ_STATE;
+-  const emucap_gdb_clock::time_point deadline =
+-      emucap_gdb_clock::now() + std::chrono::milliseconds(EMUCAP_GDB_AUTH_DEADLINE_MS);
+-
+-  while (emucap_gdb_clock::now() < deadline) {
+-    uint8_t cur_byte;
+-    if (emucap_recv_auth_byte_until(sock, state, &cur_byte, deadline) != 0)
+-      return false;
+-
+-    switch (packet.state) {
+-    case IDLE_READ_STATE:
+-      if (cur_byte != '$')
+-        return false;
+-      packet.state = MID_PACKET_READ_STATE;
+-      packet.pos_index = 0;
+-      packet.checksum = 0;
+-      break;
+-
+-    case MID_PACKET_READ_STATE:
+-      if (cur_byte == '#') {
+-        packet.buffer[packet.pos_index] = '\0';
+-        packet.state = FIRST_CHECKSUM_READ_STATE;
+-      }
+-      else {
+-        if (packet.pos_index >= BUFMAX - 1)
+-          return false;
+-        packet.checksum += cur_byte;
+-        packet.buffer[packet.pos_index++] = cur_byte;
+-      }
+-      break;
+-
+-    case FIRST_CHECKSUM_READ_STATE: {
+-      int nibble = emucap_auth_hex_nibble(cur_byte);
+-      if (nibble < 0)
+-        return false;
+-      packet.read_checksum = (uint8_t)(nibble << 4);
+-      packet.state = SECOND_CHECKSUM_READ_STATE;
+-      break;
+-    }
+-
+-    case SECOND_CHECKSUM_READ_STATE: {
+-      int nibble = emucap_auth_hex_nibble(cur_byte);
+-      if (nibble < 0)
+-        return false;
+-      packet.read_checksum += (uint8_t)nibble;
+-      const bool checksum_ok = packet.read_checksum == packet.checksum;
+-      uint8_t reply = checksum_ok ? '+' : '-';
+-      if (emucap_send_all_until(sock, (char *)&reply, 1, deadline) != 0 ||
+-          !checksum_ok || !emucap_auth_packet_matches(packet.buffer))
+-        return false;
+-      return emucap_send_auth_ok_until(sock, state, deadline) == 0;
+-    }
+-    }
+-  }
+-  return false;
+-}
++#include "EmucapGdbAdmission.h"
+ 
+ #define CHECKSUM_PART_SIZE 3
+ /**
+@@ -2141,6 +2022,13 @@
+   fd_set read_sock_set;
+   fd_set main_set;
+   int quit = 0;
++  EmucapGdbAdmission candidates;
++  if (!emucap_selectable_socket(state->listen_fd) ||
++      !emucap_selectable_socket(state->ctl_pipe[0]) ||
++      emucap_set_nonblocking(state->listen_fd, true) != 0) {
++    CLOSESOCKET(state->listen_fd);
++    return;
++  }
+ 
+   FD_ZERO( &main_set);
+ 
+@@ -2151,10 +2039,17 @@
+     int sel_res;
+ 
+     read_sock_set = main_set;
++    fd_set write_sock_set;
++    FD_ZERO(&write_sock_set);
++    if (state->sock_fd != (SOCKET_TYPE)-1 || !state->active) candidates.clear();
++    struct timeval candidate_timeout;
++    bool pending_candidates = candidates.select_sets(read_sock_set, write_sock_set, candidate_timeout);
+ 
+     //DEBUG_LOG("Waiting on sockets\n");
+ 
+-    sel_res = select( FD_SETSIZE, &read_sock_set, NULL, NULL, NULL);
++    sel_res = select(FD_SETSIZE, &read_sock_set, &write_sock_set, NULL,
++                     pending_candidates ? &candidate_timeout : NULL);
++    if (sel_res < 0 && !emucap_socket_retryable()) break;
+     //DEBUG_LOG("sockets ready %d\n", sel_res);
+ 
+     if ( sel_res > 0) {
+@@ -2210,51 +2105,31 @@
+         //struct armcpu_t *cpu = twin_states->cpus[i];
+         SOCKET_TYPE arm_listener = state->listen_fd;
+ 
+-        /* check for a connection request */
+-        if ( FD_ISSET( arm_listener, &read_sock_set)) {
+-          SOCKET_TYPE new_conn;
+-          struct sockaddr_in gdb_addr;
+-          SOCKLEN_T addr_size = sizeof( gdb_addr);
+-
+-          //DEBUG_LOG("listener\n");
+-
+-          /* accept the connection if we do not already have one */
+-          new_conn = accept( arm_listener, (struct sockaddr *)&gdb_addr,
+-                             &addr_size);
+-
+-          if ( new_conn != -1) {
+-            int close_sock = 1;
+-
+-            //DEBUG_LOG("got new socket\n");
+-            if ( state->sock_fd == -1 && state->active) {
+-
+-              int set_res;
+-
+-              //DEBUG_LOG("new connection\n");
+-
+-              /* make the socket NODELAY */
+-              set_res = set_socket_nodelay( new_conn);
+-
+-              if ( set_res != 0) {
+-                LOG_ERROR( "Failed to set NODELAY socket option \"%s\"\n", strerror( errno));
+-              }
+-              if (emucap_set_socket_io_timeout(new_conn) != 0) {
+-                LOG_ERROR( "Failed to set GDB socket I/O timeout\n");
+-              }
+-              else if (emucap_authenticate_connection(new_conn, state)) {
+-                close_sock = 0;
+-                state->rx_packet.state = IDLE_READ_STATE;
+-                state->rx_packet.pos_index = 0;
+-                FD_SET( new_conn, &main_set);
+-                state->sock_fd = new_conn;
+-              }
+-            }
+-
+-            if ( close_sock) {
+-              //DEBUG_LOG("closing new socket\n");
+-              CLOSESOCKET( new_conn);
+-            }
+-	  }
++        // Service ready authentication before accepting more peers. Pending candidates
++        // own neither the debugger slot nor asynchronous stop delivery.
++        if (state->sock_fd == (SOCKET_TYPE)-1 && state->active) {
++          SOCKET_TYPE authenticated = candidates.service(read_sock_set, write_sock_set);
++          if (authenticated != (SOCKET_TYPE)-1) {
++            state->rx_packet.state = IDLE_READ_STATE;
++            state->rx_packet.pos_index = 0;
++            state->sock_fd = authenticated;
++            FD_SET(authenticated, &main_set);
++            // The ready byte was the final auth ACK. Wait for a fresh readiness result
++            // before calling the established socket's blocking packet reader.
++            FD_CLR(authenticated, &read_sock_set);
++          }
++        }
++        if (FD_ISSET(arm_listener, &read_sock_set)) {
++          for (int accepted = 0; accepted < 2; ++accepted) {
++            struct sockaddr_in gdb_addr;
++            SOCKLEN_T addr_size = sizeof(gdb_addr);
++            SOCKET_TYPE new_conn = accept(arm_listener, (struct sockaddr *)&gdb_addr, &addr_size);
++            if (new_conn == (SOCKET_TYPE)-1) break;
++            if (state->sock_fd == (SOCKET_TYPE)-1 && state->active)
++              candidates.add(new_conn);
++            else
++              CLOSESOCKET(new_conn);
++          }
+         }
+ 
+         /* handle the gdb connection */
+diff --git a/desmume/src/gdbstub/EmucapGdbAdmission.h b/desmume/src/gdbstub/EmucapGdbAdmission.h
+new file mode 100644
+--- /dev/null
++++ b/desmume/src/gdbstub/EmucapGdbAdmission.h
+@@ -0,0 +1,215 @@
++// Bounded native debugger candidates. Included after the gdbstub socket/auth helpers.
++#pragma once
++#include <array>
++
++static bool emucap_selectable_socket(SOCKET_TYPE sock) {
++#ifdef WIN32
++  return sock != INVALID_SOCKET;
++#else
++  return sock >= 0 && sock < FD_SETSIZE;
++#endif
++}
++
++static int emucap_set_nonblocking(SOCKET_TYPE sock, bool nonblocking) {
++#ifdef WIN32
++  u_long enabled = nonblocking ? 1 : 0;
++  return ioctlsocket(sock, FIONBIO, &enabled);
++#else
++  int flags = fcntl(sock, F_GETFL, 0);
++  if (flags < 0) return -1;
++  return fcntl(sock, F_SETFL, nonblocking ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
++#endif
++}
++
++class EmucapGdbCandidate {
++  enum Stage { Start, Payload, ChecksumHigh, ChecksumLow, ReplyAck };
++  // Prefix and hex-encoded token, excluding the RSP delimiters/checksum and terminator.
++  static const size_t PayloadLimit = sizeof("qEmucap,auth:") - 1 +
++                                     2 * EMUCAP_GDB_AUTH_MAX_TOKEN_BYTES;
++  static const size_t ReadsPerTurn = PayloadLimit + 4;
++  SOCKET_TYPE socket_ = (SOCKET_TYPE)-1;
++  Stage stage_ = Start;
++  uint8_t packet_[PayloadLimit + 1] = {};
++  size_t length_ = 0;
++  uint8_t checksum_ = 0, received_checksum_ = 0;
++  char output_[7] = {};
++  size_t output_size_ = 0, output_sent_ = 0;
++  int attempts_ = 0;
++  bool close_after_output_ = false;
++
++  void output(const char *bytes, size_t size, bool close_after) {
++    memcpy(output_, bytes, size);
++    output_size_ = size;
++    output_sent_ = 0;
++    close_after_output_ = close_after;
++  }
++
++  bool consume(uint8_t byte) {
++    switch (stage_) {
++    case Start:
++      if (byte != '$') { retire(); break; }
++      stage_ = Payload;
++      break;
++    case Payload:
++      if (byte == '#') {
++        packet_[length_] = 0;
++        stage_ = ChecksumHigh;
++      } else if (byte == 0 || length_ == PayloadLimit) {
++        retire();
++      } else {
++        packet_[length_++] = byte;
++        checksum_ += byte;
++      }
++      break;
++    case ChecksumHigh: {
++      int nibble = emucap_auth_hex_nibble(byte);
++      if (nibble < 0) { retire(); break; }
++      received_checksum_ = (uint8_t)(nibble << 4);
++      stage_ = ChecksumLow;
++      break;
++    }
++    case ChecksumLow: {
++      int nibble = emucap_auth_hex_nibble(byte);
++      if (nibble < 0) { retire(); break; }
++      received_checksum_ += (uint8_t)nibble;
++      if (received_checksum_ != checksum_)
++        output("-", 1, true);
++      else if (!emucap_auth_packet_matches(packet_))
++        output("+", 1, true);
++      else {
++        output("+$OK#9a", 7, false);
++        attempts_ = 1;
++        stage_ = ReplyAck;
++      }
++      break;
++    }
++    case ReplyAck:
++      if (byte == '+') return true;
++      if (attempts_ == EMUCAP_GDB_ACK_ATTEMPTS) retire();
++      else { ++attempts_; output("$OK#9a", 6, false); }
++      break;
++    }
++    return false;
++  }
++
++public:
++  emucap_gdb_clock::time_point deadline;
++  EmucapGdbCandidate() = default;
++  EmucapGdbCandidate(const EmucapGdbCandidate &) = delete;
++  EmucapGdbCandidate &operator=(const EmucapGdbCandidate &) = delete;
++  ~EmucapGdbCandidate() { retire(); }
++
++  SOCKET_TYPE socket() const { return socket_; }
++  bool token_verified() const {
++    return socket_ != (SOCKET_TYPE)-1 && stage_ == ReplyAck && !close_after_output_;
++  }
++  void retire() {
++    if (socket_ != (SOCKET_TYPE)-1) CLOSESOCKET(socket_);
++    socket_ = (SOCKET_TYPE)-1;
++  }
++  void start(SOCKET_TYPE socket) {
++    retire();
++    socket_ = socket;
++    deadline = emucap_gdb_clock::now() +
++        std::chrono::milliseconds(EMUCAP_GDB_AUTH_DEADLINE_MS);
++    stage_ = Start;
++    length_ = output_size_ = output_sent_ = 0;
++    checksum_ = received_checksum_ = 0;
++    attempts_ = 0;
++    close_after_output_ = false;
++    if (!emucap_selectable_socket(socket_) || emucap_set_nonblocking(socket_, true) != 0) {
++      retire(); return;
++    }
++    // NODELAY failure previously remained nonfatal; I/O setup must succeed at promotion.
++    set_socket_nodelay(socket_);
++  }
++  void select_sets(fd_set &reads, fd_set &writes) const {
++    if (output_sent_ < output_size_) FD_SET(socket_, &writes);
++    else FD_SET(socket_, &reads);
++  }
++  bool poll(const fd_set &reads, const fd_set &writes) {
++    if (emucap_gdb_clock::now() >= deadline) { retire(); return false; }
++    if (output_sent_ < output_size_) {
++      if (!FD_ISSET(socket_, &writes)) return false;
++      int n = emucap_socket_send(socket_, output_ + output_sent_,
++                                (int)(output_size_ - output_sent_));
++      if (n > 0) output_sent_ += (size_t)n;
++      else if (n == 0 || !emucap_socket_retryable()) retire();
++      if (socket_ != (SOCKET_TYPE)-1 && output_sent_ == output_size_ && close_after_output_)
++        retire();
++      return false;
++    }
++    if (!FD_ISSET(socket_, &reads)) return false;
++    // Bound syscalls as well as payload. Reading through the maximum available frame
++    // in one turn prevents a finite accept burst from evicting large valid auth packets.
++    for (size_t i = 0; i < ReadsPerTurn; ++i) {
++      uint8_t byte;
++      int n = recv(socket_, (char *)&byte, 1, 0);
++      if (n == 1) {
++        if (consume(byte)) return emucap_gdb_clock::now() < deadline;
++        if (socket_ == (SOCKET_TYPE)-1 || output_sent_ < output_size_) return false;
++      } else {
++        if (n == 0 || !emucap_socket_retryable()) retire();
++        return false;
++      }
++    }
++    return false;
++  }
++  SOCKET_TYPE promote() {
++    if (emucap_gdb_clock::now() >= deadline ||
++        emucap_set_nonblocking(socket_, false) != 0 ||
++        emucap_set_socket_io_timeout(socket_) != 0) {
++      retire(); return (SOCKET_TYPE)-1;
++    }
++    SOCKET_TYPE socket = socket_;
++    socket_ = (SOCKET_TYPE)-1;
++    return socket;
++  }
++};
++
++class EmucapGdbAdmission {
++  // Winsock fd_sets also hold listener/control/established sockets; eight fits its
++  // default64 entries. POSIX additionally validates each descriptor's numeric range.
++  std::array<EmucapGdbCandidate, 8> candidates_;
++public:
++  void clear() { for (auto &candidate : candidates_) candidate.retire(); }
++  void add(SOCKET_TYPE socket) {
++    if (!emucap_selectable_socket(socket)) { CLOSESOCKET(socket); return; }
++    EmucapGdbCandidate *oldest = nullptr;
++    auto now = emucap_gdb_clock::now();
++    for (auto &candidate : candidates_) {
++      if (candidate.socket() == (SOCKET_TYPE)-1) { candidate.start(socket); return; }
++      if (now >= candidate.deadline) { candidate.start(socket); return; }
++      if (!candidate.token_verified() &&
++          (oldest == nullptr || candidate.deadline < oldest->deadline))
++        oldest = &candidate;
++    }
++    if (oldest != nullptr) oldest->start(socket);
++    else CLOSESOCKET(socket);
++  }
++  bool select_sets(fd_set &reads, fd_set &writes, timeval &timeout) {
++    bool pending = false;
++    auto now = emucap_gdb_clock::now();
++    auto nearest = now + std::chrono::milliseconds(EMUCAP_GDB_AUTH_DEADLINE_MS);
++    for (auto &candidate : candidates_) {
++      if (candidate.socket() == (SOCKET_TYPE)-1) continue;
++      if (now >= candidate.deadline) { candidate.retire(); continue; }
++      pending = true;
++      if (candidate.deadline < nearest) nearest = candidate.deadline;
++      candidate.select_sets(reads, writes);
++    }
++    auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(nearest - now);
++    timeout.tv_sec = (long)(remaining.count() / 1000000);
++    timeout.tv_usec = (long)(remaining.count() % 1000000);
++    return pending;
++  }
++  SOCKET_TYPE service(const fd_set &reads, const fd_set &writes) {
++    for (auto &candidate : candidates_) {
++      if (candidate.socket() != (SOCKET_TYPE)-1 && candidate.poll(reads, writes)) {
++        SOCKET_TYPE socket = candidate.promote();
++        if (socket != (SOCKET_TYPE)-1) { clear(); return socket; }
++      }
++    }
++    return (SOCKET_TYPE)-1;
++  }
++};

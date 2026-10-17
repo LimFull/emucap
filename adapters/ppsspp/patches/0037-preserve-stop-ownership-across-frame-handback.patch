@@ -1,0 +1,145 @@
+diff --git a/Core/Core.cpp b/Core/Core.cpp
+index 0f14748b72..26e5d97c1c 100644
+--- a/Core/Core.cpp
++++ b/Core/Core.cpp
+@@ -261,18 +261,21 @@ static std::condition_variable g_emucapFrameStepCond;
+ static std::mutex g_emucapFrameStepMutex;
+ static EmucapFrameStepResult g_emucapFrameStep;
+ static bool g_emucapFrameStepFinishing = false;
++static std::atomic<bool> g_emucapFrameOwned{false};
+ 
+ struct DebuggerStopOwner {
+     std::function<void()> completed;
+     std::function<bool()> connected;
+     std::chrono::steady_clock::time_point deadline, cleanupDeadline;
+     bool stopping = false;
++    bool pauseRequested = false;
++    BreakReason pauseReason = BreakReason::DebugStep;
+ };
+ static DebuggerStopOwner g_debuggerStop;
+ 
+ bool Core_HasDebuggerWork() {
+     std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+-    return g_debuggerStop.completed || !g_cpuStepQueue.empty() ||
++    return g_emucapFrameOwned.load() || g_debuggerStop.completed || !g_cpuStepQueue.empty() ||
+         !g_cpuStepCommand.empty() || g_cpuStepCommand.completed;
+ }
+ 
+@@ -282,7 +285,8 @@ bool Core_ArmDebuggerStop(std::function<void()> completed, std::function<bool()>
+     if (!completed || Core_HasDebuggerWork()) return false;
+     if (coreState == CORE_STEPPING_CPU) {
+         if (!allowPendingPark && !Core_EmucapMemoryParked()) return false;
+-    } else if (!allowRunning || coreState != CORE_RUNNING_CPU) {
++    } else if (!allowRunning || (coreState != CORE_RUNNING_CPU &&
++        !(allowPendingPark && (coreState == CORE_NEXTFRAME || coreState == CORE_REENTER_DISPATCH || coreState == CORE_RUNNING_GE)))) {
+         return false;
+     }
+     std::lock_guard<std::mutex> frameGuard(g_emucapFrameStepMutex);
+@@ -293,6 +297,14 @@ bool Core_ArmDebuggerStop(std::function<void()> completed, std::function<bool()>
+     return true;
+ }
+ 
++bool Core_RequestDebuggerPause(std::function<void()> completed, std::function<bool()> connected, BreakReason reason) {
++    if (!Core_ArmDebuggerStop(std::move(completed), std::move(connected), true, true)) return false;
++    std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
++    g_debuggerStop.pauseRequested = coreState != CORE_STEPPING_CPU;
++    g_debuggerStop.pauseReason = reason;
++    return true;
++}
++
+ // CPU-owner service; a lost connection cannot leave a temporary run armed indefinitely.
+ static void Core_PollDebuggerStop() {
+     std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+@@ -302,7 +314,10 @@ static void Core_PollDebuggerStop() {
+         ((g_debuggerStop.connected && !g_debuggerStop.connected()) || now >= g_debuggerStop.deadline)) {
+         g_debuggerStop.stopping = true;
+         g_debuggerStop.cleanupDeadline = now + std::chrono::seconds(2);
+-        if (coreState == CORE_RUNNING_CPU) Core_Break(BreakReason::DebugBreak, 0);
++    }
++    if ((g_debuggerStop.stopping || g_debuggerStop.pauseRequested) && coreState == CORE_RUNNING_CPU) {
++        Core_Break(g_debuggerStop.stopping ? BreakReason::DebugBreak : g_debuggerStop.pauseReason, 0);
++        g_debuggerStop.pauseRequested = false;
+     }
+     if (g_debuggerStop.stopping && now >= g_debuggerStop.cleanupDeadline && !Core_EmucapMemoryParked())
+         std::abort();
+@@ -387,6 +402,7 @@ bool Core_EmucapBeginFrameStep(u32 count, u64 startVblank) {
+ 	std::lock_guard<std::mutex> guard(g_emucapFrameStepMutex);
+ 	if (count == 0 || coreState != CORE_STEPPING_CPU || g_emucapFrameStep.status == EmucapFrameStepStatus::Running)
+ 		return false;
++	g_emucapFrameOwned.store(true);
+ 	g_emucapFrameStep.status = EmucapFrameStepStatus::Running;
+ 	g_emucapFrameStep.requested = count;
+ 	g_emucapFrameStep.completed = 0;
+@@ -417,6 +433,7 @@ EmucapFrameStepResult Core_EmucapCancelFrameStep() {
+ 	if (g_emucapFrameStep.status == EmucapFrameStepStatus::Running)
+ 		g_emucapFrameStep.status = EmucapFrameStepStatus::Interrupted;
+ 	g_emucapFrameStepFinishing = false;
++	g_emucapFrameOwned.store(false);
+ 	g_emucapFrameStepCond.notify_all();
+ 	return g_emucapFrameStep;
+ }
+@@ -661,7 +678,7 @@ void Core_SwitchToGe() {
+ bool Core_RequestCPUStep(CPUStepType type, std::function<void()> completed, std::function<bool()> stillOwned) {
+ 	if (completed && type != CPUStepType::Into) return false;
+ 	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+-	if (g_debuggerStop.completed || g_cpuStepQueue.size() >= MAX_PENDING_STEPS) {
++	if (g_emucapFrameOwned.load() || g_debuggerStop.completed || g_cpuStepQueue.size() >= MAX_PENDING_STEPS) {
+ 		ERROR_LOG(Log::CPU, "Too many steps queued (%d), dropping this one", (int)g_cpuStepQueue.size());
+ 		return false;
+ 	}
+diff --git a/Core/Core.h b/Core/Core.h
+index 2c123dd257..44e14c08fc 100644
+--- a/Core/Core.h
++++ b/Core/Core.h
+@@ -127,6 +127,7 @@ BreakReason Core_BreakReason();
+ // Can fail if another step type was requested this frame.
+ // stepSize is always in instructions (4 bytes each), never bytes - see Core_PerformCPUStep in Core.cpp.
+ bool Core_HasDebuggerWork();
++bool Core_RequestDebuggerPause(std::function<void()> completed, std::function<bool()> connected, BreakReason reason);
+ bool Core_ArmDebuggerStop(std::function<void()> completed, std::function<bool()> connected, bool allowRunning = false, bool allowPendingPark = false);
+ bool Core_RequestCPUStep(CPUStepType stepType, std::function<void()> completed = {}, std::function<bool()> stillOwned = {});
+ 
+diff --git a/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp b/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
+index 3d472b807e..7569dfc7c1 100644
+--- a/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
++++ b/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
+@@ -71,9 +71,8 @@ static DebugInterface *CPUFromRequest(DebuggerRequest &req) {
+ void WebSocketCPUStepping(DebuggerRequest &req) {
+ 	Core_RunOnCPUThread([&] {
+ 		if (!currentDebugMIPS || !currentDebugMIPS->isAlive()) return req.Fail("CPU not started");
+-		if (!Core_ArmDebuggerStop(WebSocketSteppingReceipt(req), req.client->executionConnected, true, true))
+-			return req.Fail("Another execution request owns native control");
+-		if (coreState == CORE_RUNNING_CPU) Core_Break(BreakReason::DebugStep, 0);
++		if (!Core_RequestDebuggerPause(WebSocketSteppingReceipt(req), req.client->executionConnected, BreakReason::DebugStep))
++			return req.Fail(StringFromFormat("Cannot own CPU stop: state=%s pending=%d", CoreStateToString(coreState), Core_HasDebuggerWork()));
+ 	});
+ }
+ 
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index 8e61ce1540..51a5878803 100644
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -166,8 +166,8 @@ void WebSocketSteppingState::Broadcast(net::WebSocketServer *ws) {
+ 	}
+ 	if (coreState != CORE_STEPPING_CPU)
+ 		std::abort();  // Powerdown/GE stepping is not an exact CPU-frame terminal.
+-	if (result.status == EmucapFrameStepStatus::TimedOut)
+-		result = Core_EmucapCancelFrameStep();
++	// Retire the native frame reservation only after its frozen terminal is proven.
++	result = Core_EmucapCancelFrameStep();
+ 	JsonWriter json;
+ 	json.begin();
+ 	json.writeString("event", "emucap.frameStep");
+@@ -293,10 +293,9 @@ static DebugInterface *CPUFromRequest(DebuggerRequest &req, uint32_t *threadID =
+ void WebSocketSteppingState::Into(DebuggerRequest &req) {
+ 	Core_RunOnCPUThread([&] {
+ 		if (!currentDebugMIPS || !currentDebugMIPS->isAlive()) return req.Fail("CPU not started");
+-		if (coreState == CORE_RUNNING_CPU) {
+-			if (!Core_ArmDebuggerStop(WebSocketSteppingReceipt(req), req.client->executionConnected, true, true))
++		if (coreState != CORE_STEPPING_CPU) {
++			if (!Core_RequestDebuggerPause(WebSocketSteppingReceipt(req), req.client->executionConnected, BreakReason::DebugStepInto))
+ 				return req.Fail("Another execution request owns native control");
+-			Core_Break(BreakReason::DebugStepInto, 0);
+ 			return;
+ 		}
+ 		if (coreState != CORE_STEPPING_CPU) return req.Fail("CPU not stepping");

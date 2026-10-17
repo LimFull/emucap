@@ -16,6 +16,9 @@ fn features_gate_batch_and_pacing_separately() {
     assert!(supports_batch(&features));
     assert!(!supports_pacing(&features));
     assert!(supports_pacing(&parse_features(
+        "throttle_wait_hook,fastforward_readback,validated_pacing"
+    )));
+    assert!(!supports_pacing(&parse_features(
         "throttle_wait_hook,fastforward_readback"
     )));
     assert!(parse_features("").is_empty());
@@ -73,11 +76,33 @@ fn native_governor_maps_to_the_common_policy() {
         "x|1|500|1.0|0|0|0.0",
         "3|2|500|1.0|0|0|0.0",
         "3|1|500|nan|0|0|0.0",
+        "3|1|500|0|0|0|0.0",
+        "3|1|500|-0.0|0|0|0.0",
+        "3|1|500|-1|0|0|0.0",
+        "3|1|500|inf|0|0|0.0",
+        "3|1|500|1e-50|0|0|0.0",
+        "3|1|500|1e100|0|0|0.0",
+        "3|1|500|1e9|0|0|0.0",
+        "3|1|500|1..2|0|0|0.0",
+        "3|1|2147483648|1|0|0|0.0",
+        "3|1|18446744073709551615|1|0|0|0.0",
     ] {
         assert!(MamePacing::parse(bad).is_none(), "{bad}");
     }
     for value in [policy("1|1|500|1.0|0|0|0.0"), policy("1|0|500|1.0|1|0|0.0")] {
         assert!(capability.verify_policy(&value).is_ok(), "{value}");
+    }
+}
+
+#[test]
+fn native_custom_pacing_remains_round_trippable() {
+    for speed in [0, 1, 100000, i32::MAX] {
+        for rate in ["0.75", "2.0", "1e-3"] {
+            let raw = format!("9|1|{speed}|{rate}|0|0|0.02");
+            let pacing = MamePacing::parse(&raw).unwrap();
+            assert_eq!(pacing.restore_spec(10), format!("10|1|{speed}|{rate}"));
+            let _ = pacing.public(&speed_capability());
+        }
     }
 }
 

@@ -5,12 +5,170 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::control_session::{self, Attachment, EventKind, SessionEvent};
-use super::protocol::{read_ndjson_frame, to_line, Request};
+use sha2::{Digest, Sha256};
 
+use super::control_session::{self, Attachment, EventKind, SessionEvent};
+use super::protocol::read_ndjson_frame;
+
+mod admission;
 mod outbound;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const MAX_PENDING_ADMISSIONS: usize = 64;
+pub const SESSION_TOKEN_ENV: &str = "EMUCAP_SESSION_TOKEN";
+pub const MAX_SESSION_TOKEN_BYTES: usize = 256;
+
+pub fn session_token_is_valid(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_SESSION_TOKEN_BYTES
+        && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+pub fn generated_session_token_is_current(token: &str) -> bool {
+    let Some(random) = token.strip_prefix("broker-") else {
+        return false;
+    };
+    random.len() == 52
+        && random.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'h'
+                    | b'j'
+                    | b'k'
+                    | b'm'
+                    | b'n'
+                    | b'p'..=b't'
+                    | b'v'..=b'z'
+            )
+        })
+}
+
+pub fn new_session_token() -> String {
+    format!(
+        "broker-{}{}",
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase()
+    )
+}
+
+#[doc(hidden)]
+pub fn new_auth_nonce() -> String {
+    format!(
+        "{}{}",
+        ulid::Ulid::generate().to_string().to_lowercase(),
+        ulid::Ulid::generate().to_string().to_lowercase()
+    )
+}
+
+#[doc(hidden)]
+pub fn auth_nonce_is_current(nonce: &str) -> bool {
+    nonce.len() == 52
+        && nonce.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'h'
+                    | b'j'
+                    | b'k'
+                    | b'm'
+                    | b'n'
+                    | b'p'..=b't'
+                    | b'v'..=b'z'
+            )
+        })
+}
+
+fn hmac_sha256(key: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut key_block = [0u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5cu8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for field in fields {
+        inner.update((field.len() as u64).to_be_bytes());
+        inner.update(field);
+    }
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+/// The producer capability cannot be used to compute controller proofs.
+/// Its role prefix also makes legacy controller-file readers reject it.
+pub fn producer_token_from_controller(controller_token: &str) -> String {
+    format!(
+        "broker-producer-{}",
+        hex::encode(hmac_sha256(
+            controller_token.as_bytes(),
+            &[b"emucap-broker-producer"],
+        ))
+    )
+}
+
+fn session_auth_proof(
+    token: &str,
+    direction: &[u8],
+    client_nonce: &str,
+    server_nonce: &str,
+    attach_binding: &str,
+) -> String {
+    hex::encode(hmac_sha256(
+        token.as_bytes(),
+        &[
+            b"emucap-broker-session-auth-v1",
+            direction,
+            client_nonce.as_bytes(),
+            server_nonce.as_bytes(),
+            attach_binding.as_bytes(),
+        ],
+    ))
+}
+
+#[doc(hidden)]
+pub fn session_server_proof(token: &str, client_nonce: &str, server_nonce: &str) -> String {
+    session_auth_proof(token, b"server", client_nonce, server_nonce, "")
+}
+
+#[doc(hidden)]
+pub fn session_client_proof(
+    token: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    attach_binding: &str,
+) -> String {
+    session_auth_proof(token, b"client", client_nonce, server_nonce, attach_binding)
+}
+
+#[doc(hidden)]
+pub fn auth_proof_matches(expected: &str, presented: &str) -> bool {
+    expected.len() == 64
+        && expected.len() == presented.len()
+        && expected
+            .bytes()
+            .zip(presented.bytes())
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
+#[doc(hidden)]
+pub fn session_attach_binding(params: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut bound = params.clone();
+    bound.remove("auth_proof");
+    serde_json::Value::Object(bound).to_string()
+}
 
 struct Emu {
     to_emu: outbound::Outbound, // registration-scoped serialized producer writer
@@ -137,50 +295,44 @@ fn write_line(s: &mut TcpStream, line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Run both listeners. Session accept runs on a dedicated thread; emulator accept runs here.
-pub fn serve(emu_listener: TcpListener, session_listener: TcpListener) {
+// 64 concurrent candidates admit at most 4 MiB of incomplete-frame payloads.
+// Reader buffers, parsed authentication objects and allocation capacity are additional.
+// Capability-rich producer hellos share this bound with session admission.
+pub(crate) const MAX_ADMISSION_FRAME_BYTES: usize = 64 * 1024;
+
+/// Run two independent bounded candidate schedulers. Only authenticated peers get workers.
+/// Invalid or empty authentication state fails closed before either accept loop starts.
+pub fn serve(emu_listener: TcpListener, session_listener: TcpListener, controller_token: String) {
+    if !session_token_is_valid(&controller_token) {
+        return;
+    }
+    let producer_token: Arc<str> = Arc::from(producer_token_from_controller(&controller_token));
     let reg: Shared = Arc::new(Mutex::new(Registry::default()));
     let reg_s = reg.clone();
+    let session_auth: Arc<str> = Arc::from(controller_token);
     std::thread::spawn(move || {
-        for s in session_listener.incoming().flatten() {
-            let reg = reg_s.clone();
-            std::thread::spawn(move || handle_session(s, reg));
+        if let Err(error) = admission::serve(
+            session_listener,
+            reg_s,
+            session_auth,
+            admission::Role::Controller,
+        ) {
+            eprintln!("broker controller admission stopped: {error}");
         }
     });
-    for s in emu_listener.incoming().flatten() {
-        let reg = reg.clone();
-        std::thread::spawn(move || handle_emulator(s, reg));
+    if let Err(error) =
+        admission::serve(emu_listener, reg, producer_token, admission::Role::Producer)
+    {
+        eprintln!("broker producer admission stopped: {error}");
     }
 }
 
-fn handle_emulator(stream: TcpStream, reg: Shared) {
-    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
-        return;
-    }
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
+fn handle_emulator(mut reader: BufReader<TcpStream>, reg: Shared, result: serde_json::Value) {
+    let to_emu = match reader.get_ref().try_clone() {
+        Ok(stream) => stream,
         Err(_) => return,
-    });
-    let mut to_emu = stream;
-    // broker가 서버로서 hello를 보낸다(직접 emucap-mcp와 동일).
-    if write_line(
-        &mut to_emu,
-        &to_line(&Request::new(0, "hello", serde_json::json!({}))),
-    )
-    .is_err()
-    {
-        return;
-    }
+    };
     let mut pending = Vec::new();
-    let hello = match read_ndjson_frame(&mut reader, &mut pending) {
-        Ok(Some(frame)) => frame,
-        Ok(None) | Err(_) => return,
-    };
-    let v: serde_json::Value = match serde_json::from_str(hello.trim()) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let result = v.get("result").cloned().unwrap_or(serde_json::Value::Null);
     let lifecycle_runtime = match control_session::advertised_runtime(&result) {
         Ok(runtime) => runtime,
         Err(_) => return,
@@ -208,26 +360,32 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         Ok(writer) => writer,
         Err(_) => return,
     };
-    let (name, my_gen, old_session) = {
+    let (name, my_gen) = {
         let mut g = lock(&reg);
-        let nm = result
-            .get("name")
-            .and_then(|n| n.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| {
-                g.anon += 1;
-                format!("emu{}", g.anon)
-            });
-        // 같은 name 재등록: 구 Emu를 꺼내되 session만 밖으로 move한다.
-        // 구 to_emu 소켓을 shutdown해 구 리더(handle_emulator 스레드)를 즉시 EOF로 깨운다.
-        // shutdown은 블록하지 않으므로 lock 안에서 OK.
-        // lock 밖에서 알림을 쓴다(lock 쥔 채 소켓 write 금지).
-        let old_session = g.emus.remove(&nm).and_then(|old| {
-            old.to_emu.close();
-            old.session
-        });
-        g.next_gen += 1;
-        let gen = g.next_gen;
+        let nm = if let Some(name) = result.get("name").and_then(|name| name.as_str()) {
+            name.to_owned()
+        } else {
+            loop {
+                let Some(next) = g.anon.checked_add(1) else {
+                    return;
+                };
+                g.anon = next;
+                let name = format!("emu{next}");
+                if !g.emus.contains_key(&name) {
+                    break name;
+                }
+            }
+        };
+        // Names and advertised launch IDs are labels, not ownership credentials.
+        // A producer may reclaim a name only after the previous transport's EOF
+        // cleanup releases it. An occupied registration and its frontend stay intact.
+        if g.emus.contains_key(&nm) {
+            return;
+        }
+        let Some(gen) = g.next_gen.checked_add(1) else {
+            return;
+        };
+        g.next_gen = gen;
         g.emus.insert(
             nm.clone(),
             Emu {
@@ -240,18 +398,8 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
                 session_gen: 0,
             },
         );
-        (nm, gen, old_session)
+        (nm, gen)
     };
-    // lock 해제 후: 구 세션이 있으면 알림 송신 + 소켓 종료.
-    // 종료까지 해야 구 세션 리더가 EOF로 깨어나 종료한다 — 안 그러면 그 리더가 신규
-    // 에뮬레이터로 명령을 계속 주입하고, 뒤늦게 종료하며 신규 세션 페어링을 unpair한다.
-    if let Some(mut old_s) = old_session {
-        let _ = write_line(
-            &mut old_s,
-            r#"{"id":0,"ok":false,"error":{"kind":"not_connected","message":"emulator replaced"}}"#,
-        );
-        let _ = old_s.shutdown(std::net::Shutdown::Both);
-    }
     // 에뮬레이터-리더: 줄을 읽어 페어링 세션으로(없으면 드레인).
     // writer는 lock 안에서 try_clone만 — 쓰기는 lock 밖. 현재 세션 세대로 응답을 펜싱해, steal 이전
     // 옛 세션의 in-flight 응답이 신규 소유자에게 오배달되는 것을 막는다(fence_incoming).
@@ -290,24 +438,12 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
     }
 }
 
-fn handle_session(stream: TcpStream, reg: Shared) {
-    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
-        return;
-    }
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
+fn handle_session(mut reader: BufReader<TcpStream>, reg: Shared, av: serde_json::Value) {
+    let mut to_sess = match reader.get_ref().try_clone() {
+        Ok(stream) => stream,
         Err(_) => return,
-    });
-    let mut to_sess = stream;
+    };
     let mut pending = Vec::new();
-    let attach = match read_ndjson_frame(&mut reader, &mut pending) {
-        Ok(Some(frame)) => frame,
-        Ok(None) | Err(_) => return,
-    };
-    let av: serde_json::Value = match serde_json::from_str(attach.trim()) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
     let req_id = av.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
     let want = av
         .get("params")

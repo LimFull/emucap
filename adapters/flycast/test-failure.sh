@@ -5,7 +5,9 @@ OUT="${TMPDIR:-/tmp}/emucap-flycast-failure-test-$$"
 WIN_OUT="${TMPDIR:-/tmp}/emucap-flycast-failure-windows-test-$$.exe"
 trap 'rm -f "$OUT" "$WIN_OUT"' EXIT INT TERM
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
-  "$HERE/emucap_failure.cpp" "$HERE/emucap_failure_test.cpp" -o "$OUT"
+  -I"$HERE/../_common" \
+  "$HERE/emucap_failure.cpp" "$HERE/../_common/emucap_native_failure.cpp" \
+  "$HERE/emucap_failure_test.cpp" -o "$OUT"
 "$OUT"
 
 if [ "${EMUCAP_FLYCAST_WINDOWS_CROSS:-0}" = "1" ]; then
@@ -16,6 +18,8 @@ if [ "${EMUCAP_FLYCAST_WINDOWS_CROSS:-0}" = "1" ]; then
   }
   "$ZIG_BIN" c++ -target x86_64-windows-gnu -std=c++17 \
     -Wno-nullability-completeness \
-    "$HERE/emucap_failure.cpp" "$HERE/emucap_failure_test.cpp" \
+    -I"$HERE/../_common" \
+    "$HERE/emucap_failure.cpp" "$HERE/../_common/emucap_native_failure.cpp" \
+    "$HERE/emucap_failure_test.cpp" \
     -ladvapi32 -o "$WIN_OUT"
 fi

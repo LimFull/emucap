@@ -1,11 +1,11 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use super::error::PublishError;
-use super::publish::{regular_owned_member, valid_hex_digest, valid_profile_id};
+use super::publish::{valid_hex_digest, valid_profile_id};
 use super::recording_manifest::{
     FinalExecutionState, MemberDescriptor, MemberRole, RecordingRequest, RuntimeIdentity,
     StateArtifactIdentity, StateSnapshotBoundary, StateSnapshotReceipt,
@@ -32,20 +32,14 @@ pub(super) fn write_initial_state(
         ));
     }
     let path = staging_path.join(INITIAL_STATE_MEMBER);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o400);
-    }
-    let mut file = options.open(&path)?;
+    let mut file = crate::private_fs::create_private_file(&path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     let mut permissions = fs::metadata(&path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(&path, permissions)?;
+    crate::private_fs::verify_private_file(&path)?;
     Ok(path)
 }
 
@@ -92,14 +86,16 @@ pub(super) fn validate_initial_state_member(
             "initial state receipt belongs to a different runtime generation".into(),
         ));
     }
-    regular_owned_member(&path)?;
-    let metadata = fs::metadata(&path)?;
-    if metadata.len() != identity.bytes {
+    let bytes = crate::path_safety::read_bounded_regular_member(
+        bundle_path,
+        INITIAL_STATE_MEMBER,
+        identity.bytes,
+    )?;
+    if bytes.len() as u64 != identity.bytes {
         return Err(PublishError::InvalidIdentity(
             "initial state member size mismatch".into(),
         ));
     }
-    let bytes = fs::read(&path)?;
     if identity.sha256 != hex::encode(Sha256::digest(&bytes)) {
         return Err(PublishError::InvalidIdentity(
             "initial state member digest mismatch".into(),

@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Cursor, Write};
+
+#[path = "pc98_bridge/event_tests.rs"]
+mod event_tests;
 
 #[derive(Default)]
 struct FakeGdb {
@@ -50,6 +53,28 @@ impl FakeGdb {
 }
 
 impl GdbTransport for FakeGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.calls.push(payload.into());
         if payload == "qEmucap,features" {
@@ -169,6 +194,28 @@ impl StateSaveGdb {
 }
 
 impl GdbTransport for StateSaveGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -254,6 +301,28 @@ impl StateLoadGdb {
 }
 
 impl GdbTransport for StateLoadGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if self
             .fail_at
@@ -354,21 +423,33 @@ fn write_test_state(path: &Path, regs_hex: &str) {
 }
 
 fn write_test_state_with_items(path: &Path, regs_hex: &str, include_items: bool) {
+    write_state_manifest_fixture(path, Some(json!(regs_hex)), STATE_FORMAT, include_items);
+}
+
+fn write_state_manifest_fixture(
+    path: &Path,
+    registers: Option<Value>,
+    format: &str,
+    include_items: bool,
+) {
     let file = File::create(path).unwrap();
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("tvram.bin", options).unwrap();
     zip.write_all(&[0xAA, 0xBB]).unwrap();
     zip.start_file(SAVE_ITEMS_MANIFEST, options).unwrap();
-    zip.write_all(b"item\n").unwrap();
+    zip.write_all(b"0|1|1|1|item_000000.bin\n").unwrap();
+    zip.start_file("saveitems/item_000000.bin", options)
+        .unwrap();
+    zip.write_all(&[0]).unwrap();
     zip.start_file(FRAMEBUFFER_MEMBER, options).unwrap();
     zip.write_all(&[1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
     zip.start_file("state.json", options).unwrap();
     let mut manifest = json!({
-        "format": STATE_FORMAT,
+        "format": format,
         "system": "pc98",
         "adapter": "mame-pc98-gdb",
-        "registers_hex": regs_hex,
+        "registers_hex": registers,
         "regions": [{
             "name": "tvram",
             "memory_type": "tvram",
@@ -386,12 +467,333 @@ fn write_test_state_with_items(path: &Path, regs_hex: &str, include_items: bool)
         },
         "state_restore": state_restore_info(),
     });
+    if registers.is_none() {
+        manifest.as_object_mut().unwrap().remove("registers_hex");
+    }
     if !include_items {
         manifest.as_object_mut().unwrap().remove("save_items");
     }
     zip.write_all(&serde_json::to_vec(&manifest).unwrap())
         .unwrap();
     zip.finish().unwrap();
+}
+
+fn save_items_archive(manifest: &[u8], members: &[(&str, &[u8])]) -> ZipArchive<Cursor<Vec<u8>>> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file(SAVE_ITEMS_MANIFEST, options).unwrap();
+    zip.write_all(manifest).unwrap();
+    for (name, bytes) in members {
+        zip.start_file(format!("{SAVE_ITEMS_DIR}/{name}"), options)
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    ZipArchive::new(Cursor::new(zip.finish().unwrap().into_inner())).unwrap()
+}
+
+fn write_format_only_state(path: &Path, format: &str) {
+    let file = File::create(path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    zip.start_file("state.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&json!({"format":format})).unwrap())
+        .unwrap();
+    zip.finish().unwrap();
+}
+
+fn write_state_with_unsafe_save_item_manifest(path: &Path) {
+    let mut zip = ZipWriter::new(File::create(path).unwrap());
+    let options = SimpleFileOptions::default();
+    zip.start_file(SAVE_ITEMS_MANIFEST, options).unwrap();
+    zip.write_all(b"0|1|1|1|../../outside.bin\n").unwrap();
+    zip.start_file("saveitems/item.bin", options).unwrap();
+    zip.write_all(&[0]).unwrap();
+    zip.start_file("state.json", options).unwrap();
+    zip.write_all(
+        &serde_json::to_vec(&json!({
+            "format": STATE_FORMAT,
+            "registers_hex": i386_regs_hex(&[]),
+            "save_items": {"dir": SAVE_ITEMS_DIR}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    zip.finish().unwrap();
+}
+
+fn eocd_offset(bytes: &[u8]) -> usize {
+    bytes
+        .windows(4)
+        .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])
+        .expect("test ZIP has EOCD")
+}
+
+#[test]
+fn state_archive_preflight_accepts_supported_v1_and_v2() {
+    let root = tempfile::tempdir().unwrap();
+    for format in [LEGACY_STATE_FORMAT, STATE_FORMAT] {
+        let path = root.path().join(format!("{format}.zip"));
+        write_format_only_state(&path, format);
+        let mut archive = open_pc98_state_archive(&path).unwrap();
+        let manifest = read_state_manifest(&mut archive).unwrap();
+        assert_eq!(state_format(&manifest).unwrap(), format);
+    }
+}
+
+#[test]
+fn state_archive_preflight_rejects_oversize_excess_entries_and_zip64() {
+    let root = tempfile::tempdir().unwrap();
+    let oversized = root.path().join("oversized.zip");
+    File::create(&oversized)
+        .unwrap()
+        .set_len(MAX_STATE_ARCHIVE_BYTES + 1)
+        .unwrap();
+    assert!(matches!(
+        open_pc98_state_archive(&oversized),
+        Err(BridgeError::BadParams(message)) if message.contains("archive exceeds")
+    ));
+
+    let excess = root.path().join("excess.zip");
+    {
+        let mut zip = ZipWriter::new(File::create(&excess).unwrap());
+        for index in 0..=MAX_STATE_ARCHIVE_ENTRIES {
+            zip.start_file(
+                format!("entry-{index:04}.bin"),
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    assert!(matches!(
+        open_pc98_state_archive(&excess),
+        Err(BridgeError::BadParams(message)) if message.contains("entry count")
+    ));
+
+    let zip64 = root.path().join("zip64.zip");
+    write_format_only_state(&zip64, STATE_FORMAT);
+    let mut bytes = fs::read(&zip64).unwrap();
+    let eocd = eocd_offset(&bytes);
+    bytes[eocd + 8..eocd + 12].fill(0xff);
+    fs::write(&zip64, bytes).unwrap();
+    assert!(matches!(
+        open_pc98_state_archive(&zip64),
+        Err(BridgeError::BadParams(message)) if message.contains("Zip64")
+    ));
+
+    let oversized_directory = root.path().join("oversized-directory.zip");
+    write_format_only_state(&oversized_directory, STATE_FORMAT);
+    let mut bytes = fs::read(&oversized_directory).unwrap();
+    let eocd = eocd_offset(&bytes);
+    bytes[eocd + 12..eocd + 16]
+        .copy_from_slice(&(MAX_STATE_CENTRAL_DIRECTORY_BYTES as u32 + 1).to_le_bytes());
+    fs::write(&oversized_directory, bytes).unwrap();
+    assert!(matches!(
+        open_pc98_state_archive(&oversized_directory),
+        Err(BridgeError::BadParams(message)) if message.contains("central directory exceeds")
+    ));
+
+    let shadowed_eocd = root.path().join("shadowed-eocd.zip");
+    write_format_only_state(&shadowed_eocd, STATE_FORMAT);
+    let mut bytes = fs::read(&shadowed_eocd).unwrap();
+    let real_eocd = eocd_offset(&bytes);
+    let fake_directory = [0u8; 46];
+    let fake_eocd_offset = bytes.len() + fake_directory.len();
+    let comment_len = u16::try_from(fake_directory.len() + 22).unwrap();
+    bytes[real_eocd + 20..real_eocd + 22].copy_from_slice(&comment_len.to_le_bytes());
+    bytes.extend_from_slice(&fake_directory);
+    bytes.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&(fake_directory.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&((fake_eocd_offset - fake_directory.len()) as u32).to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    assert!(ZipArchive::new(Cursor::new(bytes.clone())).is_ok());
+    fs::write(&shadowed_eocd, bytes).unwrap();
+    assert!(matches!(
+        open_pc98_state_archive(&shadowed_eocd),
+        Err(BridgeError::BadParams(message)) if message.contains("central directory has an invalid entry")
+    ));
+}
+
+#[test]
+fn state_archive_preflight_does_not_fall_back_from_malformed_selected_extra_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("malformed-selected-extra.zip");
+    write_format_only_state(&path, STATE_FORMAT);
+    let mut bytes = fs::read(&path).unwrap();
+    let real_eocd = eocd_offset(&bytes);
+
+    let mut fake_directory = vec![0u8; 46];
+    fake_directory[..4].copy_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+    fake_directory[4..6].copy_from_slice(&20u16.to_le_bytes());
+    fake_directory[6..8].copy_from_slice(&20u16.to_le_bytes());
+    fake_directory[30..32].copy_from_slice(&4u16.to_le_bytes());
+    // Zip64 extra header claiming 24 bytes but carrying none. zip-rs rejects this selected
+    // directory and, without our preflight, retries the earlier EOCD.
+    fake_directory.extend_from_slice(&[0x01, 0x00, 0x18, 0x00]);
+    let fake_directory_offset = bytes.len();
+    let appended_len = fake_directory.len() + 22;
+    bytes[real_eocd + 20..real_eocd + 22]
+        .copy_from_slice(&u16::try_from(appended_len).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&fake_directory);
+    bytes.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&(fake_directory.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(fake_directory_offset as u32).to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+
+    assert!(ZipArchive::new(Cursor::new(bytes.clone())).is_ok());
+    fs::write(&path, bytes).unwrap();
+    assert!(matches!(
+        open_pc98_state_archive(&path),
+        Err(BridgeError::BadParams(message)) if message.contains("extra fields")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn state_archive_preflight_rejects_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target.zip");
+    write_format_only_state(&target, STATE_FORMAT);
+    let linked = root.path().join("linked.zip");
+    symlink(&target, &linked).unwrap();
+    assert!(matches!(
+        open_pc98_state_archive(&linked),
+        Err(BridgeError::BadParams(message)) if message.contains("non-symlink")
+    ));
+}
+
+#[test]
+fn invalid_state_archives_are_rejected_before_guest_control_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let malformed_zip = root.path().join("malformed.zip");
+    fs::write(&malformed_zip, b"not a ZIP archive").unwrap();
+    let unsafe_manifest = root.path().join("unsafe-manifest.zip");
+    write_state_with_unsafe_save_item_manifest(&unsafe_manifest);
+    for path in [&malformed_zip, &unsafe_manifest] {
+        for method in ["load_state", "probe"] {
+            let mut bridge = Bridge::new(FakeGdb::default(), GdbBridgeEnv::default());
+            bridge.gdb.calls.clear();
+            bridge.gdb.no_reply.clear();
+            bridge.gdb.interrupts = 0;
+            let params = if method == "load_state" {
+                json!({"path":path})
+            } else {
+                json!({"state":path, "memory_type":"tvram", "address":0, "length":1})
+            };
+            let response = bridge.handle_request(Request::new(1, method, params));
+            assert!(
+                response.error.is_some(),
+                "{method} accepted {}",
+                path.display()
+            );
+            assert!(
+                bridge.gdb.calls.is_empty(),
+                "{method} called the guest backend"
+            );
+            assert!(
+                bridge.gdb.no_reply.is_empty(),
+                "{method} sent a guest command"
+            );
+            assert_eq!(bridge.gdb.interrupts, 0, "{method} interrupted the guest");
+        }
+    }
+}
+
+fn extract_test_save_items(
+    manifest: &[u8],
+    members: &[(&str, &[u8])],
+) -> BridgeResult<Option<PathBuf>> {
+    let mut archive = save_items_archive(manifest, members);
+    let output = tempfile::tempdir().unwrap();
+    extract_save_items(
+        &mut archive,
+        &json!({"save_items":{"dir":SAVE_ITEMS_DIR}}),
+        output.path(),
+    )
+}
+
+#[test]
+fn save_item_manifest_rejects_unsafe_or_inconsistent_references() {
+    let traversal =
+        extract_test_save_items(b"0|1|1|1|../../outside.bin\n", &[("item_000000.bin", &[0])]);
+    assert!(matches!(
+        traversal,
+        Err(BridgeError::BadParams(message)) if message.contains("unsafe filename")
+    ));
+
+    let windows_traversal =
+        extract_test_save_items(b"0|1|1|1|..\\outside.bin\n", &[("item.bin", &[0])]);
+    assert!(matches!(
+        windows_traversal,
+        Err(BridgeError::BadParams(message)) if message.contains("unsafe filename")
+    ));
+
+    let unreferenced_windows_path = extract_test_save_items(
+        b"0|1|1|1|item.bin\n",
+        &[("item.bin", &[0]), ("C:/Users/Public/target.bin", &[1])],
+    );
+    assert!(matches!(
+        unreferenced_windows_path,
+        Err(BridgeError::BadParams(message)) if message.contains("unexpected PC-98 save item member")
+    ));
+
+    let wrong_product = extract_test_save_items(b"0|2|2|3|item.bin\n", &[("item.bin", &[0, 1, 2])]);
+    assert!(matches!(
+        wrong_product,
+        Err(BridgeError::BadParams(message)) if message.contains("size * count")
+    ));
+
+    let wrong_member_size = extract_test_save_items(b"0|1|2|2|item.bin\n", &[("item.bin", &[0])]);
+    assert!(matches!(
+        wrong_member_size,
+        Err(BridgeError::BadParams(message)) if message.contains("length does not match")
+    ));
+
+    let duplicate_index = extract_test_save_items(
+        b"0|1|1|1|first.bin\n00|1|1|1|second.bin\n",
+        &[("first.bin", &[0]), ("second.bin", &[0])],
+    );
+    assert!(matches!(
+        duplicate_index,
+        Err(BridgeError::BadParams(message)) if message.contains("repeats index")
+    ));
+
+    let legacy_empty = extract_test_save_items(b"1|1|0|0|empty.bin\n", &[("empty.bin", &[])]);
+    assert!(legacy_empty.is_ok());
+}
+
+#[test]
+fn breakpoint_snapshot_admission_is_bounded() {
+    let exact_count_and_total = (0..MAX_BREAKPOINT_SNAPSHOTS)
+        .map(|_| Value::String("tvram:0:0x400".into()))
+        .collect::<Vec<_>>();
+    let parsed = parse_snapshot_specs(Some(&Value::Array(exact_count_and_total))).unwrap();
+    assert_eq!(parsed.len(), MAX_BREAKPOINT_SNAPSHOTS);
+
+    let too_many = (0..=MAX_BREAKPOINT_SNAPSHOTS)
+        .map(|_| Value::String("tvram:0:1".into()))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        parse_snapshot_specs(Some(&Value::Array(too_many))),
+        Err(BridgeError::BadParams(message)) if message.contains("at most 16")
+    ));
+
+    assert!(matches!(
+        parse_snapshot_specs(Some(&json!(["tvram:0:0x2001", "tvram:$0:8193"]))),
+        Err(BridgeError::BadParams(message)) if message.contains("byte total")
+    ));
+    assert!(parse_snapshot_specs(Some(&json!(["tvram:0:0"]))).is_err());
+    assert!(parse_snapshot_specs(Some(&json!(["tvram:0x3fff:2"]))).is_err());
 }
 
 #[test]
@@ -441,7 +843,7 @@ fn hello_advertises_only_implemented_rust_methods() {
     let result = response.result.unwrap();
     assert_eq!(result["adapter"], "mame-pc98-rust-gdb");
     assert_eq!(result["name"], "pc98");
-    assert_eq!(result["session_token"], "token");
+    assert!(result.get("session_token").is_none());
     assert_eq!(result["build"], "abc123");
     assert_eq!(result["breakpoint_kinds"][3]["kind"], "access");
     assert_eq!(result["breakpoint_kinds"][0]["snapshot"], true);
@@ -749,6 +1151,82 @@ fn read_and_write_memory_map_regions_to_absolute_gdb_addresses() {
 }
 
 #[test]
+fn large_memory_writes_preserve_full_region_and_partial_chunk_data() {
+    for (start, length) in [(0, 0x100000), (0x23, 0x4001)] {
+        let data: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        let mut expected = vec![("?".into(), "S05".into())];
+        for offset in (0..length).step_by(0x4000) {
+            let end = (offset + 0x4000).min(length);
+            expected.push((
+                format!(
+                    "M{:x},{:x}:{}",
+                    start + offset,
+                    end - offset,
+                    hex::encode(&data[offset..end])
+                ),
+                "OK".into(),
+            ));
+        }
+        let mut bridge = Bridge::new(FakeGdb::from_pairs(expected), GdbBridgeEnv::default());
+        let response = bridge.handle_request(Request::new(
+            3,
+            "write_memory",
+            json!({"memory_type":"physical", "address":start, "hex":hex::encode_upper(data)}),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["written"], length);
+        assert!(bridge.gdb.replies.is_empty());
+        assert!(bridge.frozen);
+    }
+}
+
+#[test]
+fn chunked_memory_write_stops_after_backend_failure() {
+    let fake = FakeGdb::from_pairs(vec![
+        ("?".into(), "S05".into()),
+        (format!("M0,4000:{}", "ab".repeat(0x4000)), "OK".into()),
+        (format!("M4000,4000:{}", "ab".repeat(0x4000)), "E00".into()),
+    ]);
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+    let response = bridge.handle_request(Request::new(
+        3,
+        "write_memory",
+        json!({"address":0, "hex":"ab".repeat(0x8001)}),
+    ));
+    assert!(!response.ok);
+    assert!(response.result.is_none());
+    assert_eq!(response.error.unwrap().kind, "emulator_error");
+    assert_eq!(
+        bridge.gdb.calls.len(),
+        3,
+        "stop before the third write chunk"
+    );
+    assert!(bridge.frozen);
+}
+
+#[test]
+fn memory_write_preflights_full_payload_before_first_chunk() {
+    for (start, raw) in [
+        (0, String::new()),
+        (0xfc000, "aa".repeat(0x4001)),
+        (0, "ag".into()),
+    ] {
+        let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
+        let response = bridge.handle_request(Request::new(
+            3,
+            "write_memory",
+            json!({"address":start, "hex":raw}),
+        ));
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert_eq!(
+            bridge.gdb.calls,
+            vec!["?"],
+            "reject the whole request before any chunk"
+        );
+    }
+}
+
+#[test]
 fn read_memory_rejects_access_straddling_region_end() {
     let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
@@ -1016,6 +1494,72 @@ fn breakpoint_methods_set_list_clear_and_enrich_events() {
             "snapshot": [{"memory_type": "tvram", "address": 0, "hex": "aabb"}],
         })
     );
+}
+
+#[test]
+fn breakpoint_budget_is_shared_with_watches_and_reclaimed_only_after_clear() {
+    let mut replies = vec![("?".into(), "S05".into())];
+    for i in 0..128 {
+        replies.push((
+            format!("qEmucap,setpoint,{}", hex::encode(format!("0|{i:x}|1|1|"))),
+            format!("BP:{}", i + 1),
+        ));
+    }
+    let clear = format!("qEmucap,clearpoint,{}", hex::encode("bp|1"));
+    replies.push((clear.clone(), "E02".into()));
+    replies.push((clear, "OK".into()));
+    replies.push((
+        format!("qEmucap,setpoint,{}", hex::encode("0|100|1|1|")),
+        "BP:129".into(),
+    ));
+    let mut bridge = Bridge::new(FakeGdb::from_pairs(replies), GdbBridgeEnv::default());
+    for i in 0..128 {
+        assert_eq!(
+            bridge.set_breakpoint(&json!({"start":i})).unwrap()["id"],
+            i + 1
+        );
+    }
+    let calls = bridge.gdb.calls.len();
+    assert!(bridge
+        .set_breakpoint(&json!({"start":256}))
+        .unwrap_err()
+        .to_string()
+        .contains("128"));
+    assert!(bridge
+        .watch_register(&json!({}))
+        .unwrap_err()
+        .to_string()
+        .contains("128"));
+    assert_eq!(bridge.gdb.calls.len(), calls);
+    assert_eq!(bridge.next_bp, 129);
+    assert!(bridge.clear_breakpoint(&json!({"id":1})).is_err());
+    assert_eq!(bridge.bps.len(), 128);
+    bridge.clear_breakpoint(&json!({"id":1})).unwrap();
+    assert_eq!(
+        bridge.set_breakpoint(&json!({"start":256})).unwrap()["id"],
+        129
+    );
+    assert_eq!(bridge.bps.len(), 128);
+    assert!(bridge.gdb.replies.is_empty());
+}
+
+#[test]
+fn breakpoint_id_exhaustion_precedes_pc98_native_mutation() {
+    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
+    let calls = bridge.gdb.calls.len();
+    bridge.next_bp = u64::MAX;
+    assert!(bridge
+        .set_breakpoint(&json!({"start":0}))
+        .unwrap_err()
+        .to_string()
+        .contains("id space exhausted"));
+    assert!(bridge
+        .watch_register(&json!({}))
+        .unwrap_err()
+        .to_string()
+        .contains("id space exhausted"));
+    assert_eq!(bridge.gdb.calls.len(), calls);
+    assert!(bridge.bps.is_empty());
 }
 
 #[test]
@@ -1390,6 +1934,28 @@ fn step_instructions_rejects_over_sync_cap_before_mutation() {
 struct DasmGdb;
 
 impl GdbTransport for DasmGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -1474,6 +2040,28 @@ impl TraceGdb {
 }
 
 impl GdbTransport for TraceGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -1632,6 +2220,11 @@ fn save_state_writes_python_compatible_zip_bundle() {
     assert!(zip.by_name(SAVE_ITEMS_MANIFEST).is_ok());
     assert!(zip.by_name(FRAMEBUFFER_MEMBER).is_ok());
     let manifest = read_state_manifest(&mut zip).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&out).unwrap().permissions().mode() & 0o077, 0);
+    }
     assert_eq!(manifest["format"], STATE_FORMAT);
     assert_eq!(manifest["registers_hex"], regs);
     assert_eq!(manifest["framebuffer"]["width"], 2);
@@ -1909,6 +2502,39 @@ fn probe_restores_state_and_uses_lua_register_probe() {
 }
 
 #[test]
+fn probe_rejects_unbounded_work_and_invalid_spans_before_guest_mutation() {
+    let max_frames = {
+        let bridge = Bridge::new(FakeGdb::default(), GdbBridgeEnv::default());
+        bridge.max_sync_frame_count()
+    };
+    let ram_size = u64::from(memory_region("ram").unwrap().size);
+    let cases = [
+        json!({"frame": max_frames + 1, "memory_type":"ram", "address":0, "length":1}),
+        json!({"frame": 0, "memory_type":"ram", "address":0, "length":0}),
+        json!({"frame": 0, "memory_type":"ram", "address":0, "length":MAX_READ_CHUNK as u64 + 1}),
+        json!({"frame": 0, "memory_type":"ram", "address":ram_size, "length":1}),
+        json!({"frame": 0, "memory_type":"ram", "address":u64::MAX, "length":1}),
+    ];
+
+    for mut params in cases {
+        params.as_object_mut().unwrap().insert(
+            "state".into(),
+            Value::String("/state-must-not-be-opened.zip".into()),
+        );
+        let mut bridge = Bridge::new(FakeGdb::default(), GdbBridgeEnv::default());
+        bridge.gdb.calls.clear();
+        bridge.gdb.no_reply.clear();
+        bridge.gdb.interrupts = 0;
+        let response = bridge.handle_request(Request::new(27, "probe", params));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert!(bridge.gdb.calls.is_empty());
+        assert!(bridge.gdb.no_reply.is_empty());
+        assert_eq!(bridge.gdb.interrupts, 0);
+    }
+}
+
+#[test]
 fn get_state_decodes_i386_register_packet_and_segmented_pc() {
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234), ("esp", 0xAA55)]);
     let mut bridge = Bridge::new(
@@ -1951,6 +2577,28 @@ fn unknown_method_uses_protocol_unknown_method_kind() {
 struct SnapshotGdb;
 
 impl GdbTransport for SnapshotGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -2010,6 +2658,28 @@ struct StaleStopGdb {
 }
 
 impl GdbTransport for StaleStopGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -2055,6 +2725,28 @@ struct StaleStopReadGdb {
 }
 
 impl GdbTransport for StaleStopReadGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -2165,6 +2857,28 @@ struct StepStaleGdb {
 }
 
 impl GdbTransport for StepStaleGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -2242,6 +2956,28 @@ struct CallStackFpGdb {
 }
 
 impl GdbTransport for CallStackFpGdb {
+    fn send_with_timeout(
+        &mut self,
+        payload: &str,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.send(payload)
+    }
+
+    fn recv_reply_with_timeout(&mut self, budget: Duration) -> crate::gdb_rsp::GdbResult<String> {
+        assert!(!budget.is_zero());
+        self.recv_reply()
+    }
+
+    fn recv_nonblocking_with_timeout(
+        &mut self,
+        budget: Duration,
+    ) -> crate::gdb_rsp::GdbResult<Option<String>> {
+        assert!(!budget.is_zero());
+        self.recv_nonblocking()
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
@@ -2420,5 +3156,214 @@ fn native_batch_rejection_publishes_no_partial_result() {
         assert_eq!(value["reads"][0]["hex"], "aabb");
         assert_eq!(value["reads"][1]["hex"], "cc");
         assert!(bridge.gdb.replies.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_staging_directory_is_private_at_creation() {
+    // Isolate umask changes from the parallel test runner, and ensure this test fails
+    // for ambient-permission directory creation even on a restrictive host.
+    const CHILD: &str = "EMUCAP_TEST_PC98_PRIVATE_STAGING";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pc98_bridge::tests::state_staging_directory_is_private_at_creation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    unsafe {
+        libc::umask(0);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let path = unique_temp_dir("emucap-private-test-").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+    fs::remove_dir(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn extracted_and_native_save_items_remain_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let output = tempfile::tempdir().unwrap();
+    let mut archive = save_items_archive(b"0|1|1|1|item.bin\n", &[("item.bin", &[7])]);
+    let extracted = extract_save_items(
+        &mut archive,
+        &json!({"save_items":{"dir":SAVE_ITEMS_DIR}}),
+        output.path(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        fs::metadata(&extracted).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert_eq!(
+        fs::metadata(extracted.join("item.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+
+    let native = unique_temp_dir("emucap-private-native-test-").unwrap();
+    let nested = native.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let item = nested.join("item.bin");
+    fs::write(&item, b"native").unwrap();
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&item, fs::Permissions::from_mode(0o644)).unwrap();
+    let members = save_item_members(&native).unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(
+        fs::metadata(&nested).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert_eq!(fs::metadata(&item).unwrap().permissions().mode() & 0o077, 0);
+    fs::remove_dir_all(native).unwrap();
+}
+
+#[test]
+fn state_register_admission_precedes_all_emulator_calls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("invalid.zip");
+    let cases = vec![
+        None,
+        Some(Value::Null),
+        Some(json!(7)),
+        Some(json!("")),
+        Some(json!("00".repeat(4))),
+        Some(json!("0".repeat(120))),
+        Some(json!("0".repeat(127))),
+        Some(json!("0".repeat(129))),
+        Some(json!("0".repeat(136))),
+        Some(json!("z".repeat(128))),
+        Some(json!("가".repeat(43))),
+    ];
+    for format in [STATE_FORMAT, LEGACY_STATE_FORMAT] {
+        for regs in &cases {
+            write_state_manifest_fixture(&path, regs.clone(), format, false);
+            for method in ["load_state", "probe"] {
+                if format == LEGACY_STATE_FORMAT
+                    && method == "load_state"
+                    && (regs.is_none() || regs.as_ref() == Some(&json!("")))
+                {
+                    continue;
+                }
+                let mut bridge =
+                    Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
+                bridge.gdb.calls.clear();
+                bridge.gdb.interrupts = 0;
+                let reply = bridge.handle_request(Request::new(
+                    1,
+                    method,
+                    json!({
+                        "path": path, "state": path, "frame": 0,
+                        "memory_type": "tvram", "address": 0, "length": 2
+                    }),
+                ));
+                assert!(!reply.ok, "{format} {method} {regs:?}");
+                assert_eq!(reply.error.unwrap().kind, "bad_params");
+                assert!(bridge.gdb.calls.is_empty());
+                assert!(bridge.gdb.no_reply.is_empty());
+                assert_eq!(bridge.gdb.interrupts, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_memory_only_restore_reports_non_exact_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("legacy.zip");
+    for regs in [None, Some(json!(""))] {
+        write_state_manifest_fixture(&path, regs, LEGACY_STATE_FORMAT, false);
+        let mut bridge = Bridge::new(
+            StateLoadGdb::new(i386_regs_hex(&[])),
+            GdbBridgeEnv::default(),
+        );
+        let reply = bridge.handle_request(Request::new(1, "load_state", json!({"path": path})));
+        assert!(reply.ok, "{:?}", reply.error);
+        let result = reply.result.unwrap();
+        assert_eq!(result["post_restore_instruction_exact"], false);
+        assert_eq!(
+            result["state_restore"]["post_restore_instruction_exact"],
+            false
+        );
+    }
+}
+
+#[test]
+fn register_restore_requires_full_matching_readback() {
+    let target = i386_regs_hex(&[("eax", 0xaabb), ("eip", 0x123456)]);
+    let mut replies = vec![
+        String::new(),
+        "00".into(),
+        "z".repeat(128),
+        format!("{target}00"),
+        i386_regs_hex(&[("eax", 0xaabc), ("eip", 0x123456)]),
+    ];
+    replies.push(target.to_uppercase());
+    for (index, observed) in replies.into_iter().enumerate() {
+        let command = format!("qEmucap,regload,{}", hex::encode(&target));
+        let gdb = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (command, format!("OK|{observed}")),
+        ]);
+        let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
+        let result = bridge.restore_regs_after_state_load(&target);
+        if index == 5 {
+            assert_eq!(
+                result.unwrap()["observed_register_packet_matches_target"],
+                true
+            );
+        } else {
+            assert!(result.is_err(), "{observed}");
+        }
+    }
+}
+
+#[test]
+fn probe_reply_requires_complete_registers() {
+    for response in [
+        "HEX:cafe|FRAME:0".to_string(),
+        "HEX:cafe|FRAME:0|REGS:00".into(),
+        format!("HEX:cafe|FRAME:0|REGS:{}", "가".repeat(43)),
+        format!("HEX:cafe|FRAME:0|REGS:{}", "z".repeat(128)),
+    ] {
+        assert!(parse_register_probe_response(&response).is_err());
+    }
+    let regs = i386_regs_hex(&[]);
+    assert!(parse_register_probe_response(&format!("HEX:cafe|FRAME:0|REGS:{regs}")).is_ok());
+}
+#[test]
+fn demultiplexing_flood_quarantines_stops_and_stale_ok() {
+    for (packet, polling, delayed) in [
+        ("S05", false, false),
+        ("OK", false, false),
+        ("S05", true, false),
+        ("S05", false, true),
+    ] {
+        let gdb = crate::gdb_rsp::tests::DemuxFlood::new(packet, polling, delayed);
+        let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
+        let result = if polling {
+            bridge.drain_buffered_stops().map(|_| String::new())
+        } else if packet == "OK" {
+            bridge.send_cmd_data("g")
+        } else {
+            bridge.send_cmd("g")
+        };
+        assert!(result.is_err());
+        assert!(bridge.backend_terminal());
+        assert!(bridge.gdb.budgets.len() <= 1025);
+        assert!(bridge.send_cmd("g").is_err());
     }
 }

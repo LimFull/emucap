@@ -1,0 +1,31 @@
+--- a/sdl/dosio.c
++++ b/sdl/dosio.c
+@@ -3,6 +3,10 @@
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <time.h>
++#if defined(_WIN32) && defined(__LIBRETRO__)
++#include <windows.h>
++#include <encodings/utf.h>
++#endif
+ #if defined(_WINDOWS) && !defined(__LIBRETRO__)
+ #include "oemtext.h"
+ #include <codecnv/codecnv.h>
+@@ -444,7 +448,16 @@
+ 
+ BOOL file_islink(const OEMCHAR *path) {
+ 
+-#if defined(_WINDOWS) && !defined(__LIBRETRO__)
++#if defined(_WIN32) && defined(__LIBRETRO__)
++	wchar_t *wide_path = utf8_to_utf16_string_alloc(path);
++	DWORD attr;
++	if (wide_path == NULL) {
++		return(FALSE);
++	}
++	attr = GetFileAttributesW(wide_path);
++	free(wide_path);
++	return((attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) ? TRUE : FALSE);
++#elif defined(_WINDOWS) && !defined(__LIBRETRO__)
+ 	DWORD attr = GetFileAttributesA(path);
+ 	return((attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) ? TRUE : FALSE);
+ #else

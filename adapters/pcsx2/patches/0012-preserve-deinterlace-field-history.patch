@@ -1,5 +1,78 @@
+diff --git c/pcsx2/GS/GSState.cpp i/pcsx2/GS/GSState.cpp
+index 9d2f9db..b08b1c9 100644
+--- c/pcsx2/GS/GSState.cpp
++++ i/pcsx2/GS/GSState.cpp
+@@ -3552,11 +3552,15 @@ int GSState::Freeze(freezeData* fd, bool sizeonly)
+ 	const u32 version = STATE_VERSION;
+ 	if (sizeonly)
+ 	{
+-		fd->size = GetSaveStateSize(version);
++		GSDeinterlaceHistory history;
++		if (!g_gs_device->CaptureDeinterlaceHistory(history)) return -1;
++		m_saved_deinterlace_history = history.Encode();
++		fd->size = GetSaveStateSize(version) + static_cast<int>(m_saved_deinterlace_history.size());
+ 		return 0;
+ 	}
+ 
+-	if (!fd->data || fd->size < GetSaveStateSize(version))
++	if (!fd->data || m_saved_deinterlace_history.empty() ||
++		fd->size != GetSaveStateSize(version) + static_cast<int>(m_saved_deinterlace_history.size()))
+ 		return -1;
+ 
+ 	Flush(GSFlushReason::SAVESTATE);
+@@ -3637,13 +3641,15 @@ int GSState::Freeze(freezeData* fd, bool sizeonly)
+ 	}
+ 
+ 	WriteState(data, &m_q);
++	WriteState(data, m_saved_deinterlace_history.data(), m_saved_deinterlace_history.size());
++	m_saved_deinterlace_history.clear();
+ 
+ 	return 0;
+ }
+ 
+ int GSState::Defrost(const freezeData* fd)
+ {
+-	if (!fd || !fd->data || fd->size == 0)
++	if (!fd || !fd->data || fd->size < static_cast<int>(sizeof(u32)))
+ 		return -1;
+ 
+ 	u8* data = fd->data;
+@@ -3661,6 +3667,10 @@ int GSState::Defrost(const freezeData* fd)
+ 		return -1;
+ 	}
+ 
++	GSDeinterlaceHistory history;
++	const int base_size = GetSaveStateSize(version);
++	if (!GSDeinterlaceHistory::Decode(fd->data + base_size, fd->size - base_size, history)) return -1;
++
+ 	Flush(GSFlushReason::LOADSTATE);
+ 
+ 	Reset(true);
+@@ -3786,6 +3796,7 @@ int GSState::Defrost(const freezeData* fd)
+ 
+ 	ResetPCRTC();
+ 	m_restored_display_pending[0] = m_restored_display_pending[1] = true;
++	if (!g_gs_device->RestoreDeinterlaceHistory(history)) return -1;
+ 
+ 	return 0;
+ }
+diff --git c/pcsx2/GS/GSState.h i/pcsx2/GS/GSState.h
+index 9bc672c..039061c 100644
+--- c/pcsx2/GS/GSState.h
++++ i/pcsx2/GS/GSState.h
+@@ -127,6 +127,7 @@ private:
+ 
+ protected:
+ 	bool m_restored_display_pending[2] = {};
++	std::vector<u8> m_saved_deinterlace_history;
+ 	static constexpr int INVALID_ALPHA_MINMAX = 500;
+ 	static constexpr int MAX_DRAW_BUFFERS = 3;
+ 
+diff --git c/pcsx2/GS/Renderers/Common/GSDeinterlaceHistory.h i/pcsx2/GS/Renderers/Common/GSDeinterlaceHistory.h
+new file mode 100644
+index 0000000..8d84911
 --- /dev/null
-+++ b/pcsx2/GS/Renderers/Common/GSDeinterlaceHistory.h
++++ i/pcsx2/GS/Renderers/Common/GSDeinterlaceHistory.h
 @@ -0,0 +1,53 @@
 +// SPDX-License-Identifier: GPL-3.0+
 +#pragma once
@@ -54,36 +127,11 @@
 +  output = std::move(result); return true;
 + }
 +};
---- a/pcsx2/GS/Renderers/Common/GSDevice.h
-+++ b/pcsx2/GS/Renderers/Common/GSDevice.h
-@@ -2,6 +2,7 @@
- // SPDX-License-Identifier: GPL-3.0+
- 
- #pragma once
-+#include "GSDeinterlaceHistory.h"
- 
- #include "common/HashCombine.h"
- #include "common/WindowInfo.h"
-@@ -920,6 +921,7 @@
- 	GSTexture* m_weavebob = nullptr;
- 	GSTexture* m_blend = nullptr;
- 	GSTexture* m_mad = nullptr;
-+	int m_deinterlace_index = 0;
- 	GSTexture* m_target_tmp = nullptr;
- 	GSTexture* m_current = nullptr;
- 	GSTexture* m_cas = nullptr;
-@@ -1093,6 +1095,8 @@
- 
- 	virtual void ClearSamplerCache() = 0;
- 
-+	bool CaptureDeinterlaceHistory(GSDeinterlaceHistory& history);
-+	bool RestoreDeinterlaceHistory(const GSDeinterlaceHistory& history);
- 	void ClearCurrent();
- 	void Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c);
- 	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset);
---- a/pcsx2/GS/Renderers/Common/GSDevice.cpp
-+++ b/pcsx2/GS/Renderers/Common/GSDevice.cpp
-@@ -788,9 +788,52 @@
+diff --git c/pcsx2/GS/Renderers/Common/GSDevice.cpp i/pcsx2/GS/Renderers/Common/GSDevice.cpp
+index a4f70a9..ef6cbd6 100644
+--- c/pcsx2/GS/Renderers/Common/GSDevice.cpp
++++ i/pcsx2/GS/Renderers/Common/GSDevice.cpp
+@@ -920,9 +920,52 @@ void GSDevice::SortMultiStretchRects(MultiStretchRect* rects, u32 num_rects)
  	});
  }
  
@@ -136,7 +184,7 @@
  
  	delete m_merge;
  	delete m_weavebob;
-@@ -817,7 +860,7 @@
+@@ -949,7 +992,7 @@ void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, con
  
  void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset)
  {
@@ -145,69 +193,32 @@
  	float offset = yoffset * static_cast<float>(field);
  	offset = GSConfig.DisableInterlaceOffset ? 0.0f : offset;
  
---- a/pcsx2/GS/GSState.h
-+++ b/pcsx2/GS/GSState.h
-@@ -127,6 +127,7 @@
+diff --git c/pcsx2/GS/Renderers/Common/GSDevice.h i/pcsx2/GS/Renderers/Common/GSDevice.h
+index 9ef0233..5005817 100644
+--- c/pcsx2/GS/Renderers/Common/GSDevice.h
++++ i/pcsx2/GS/Renderers/Common/GSDevice.h
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0+
  
- protected:
- 	bool m_restored_display_pending[2] = {};
-+	std::vector<u8> m_saved_deinterlace_history;
- 	static constexpr int INVALID_ALPHA_MINMAX = 500;
+ #pragma once
++#include "GSDeinterlaceHistory.h"
  
- 	GSVertex m_v = {};
---- a/pcsx2/GS/GSState.cpp
-+++ b/pcsx2/GS/GSState.cpp
-@@ -2991,11 +2991,15 @@
- 	const u32 version = STATE_VERSION;
- 	if (sizeonly)
- 	{
--		fd->size = GetSaveStateSize(version);
-+		GSDeinterlaceHistory history;
-+		if (!g_gs_device->CaptureDeinterlaceHistory(history)) return -1;
-+		m_saved_deinterlace_history = history.Encode();
-+		fd->size = GetSaveStateSize(version) + static_cast<int>(m_saved_deinterlace_history.size());
- 		return 0;
- 	}
+ #include "common/HashCombine.h"
+ #include "common/WindowInfo.h"
+@@ -1480,6 +1481,7 @@ protected:
+ 	GSTexture* m_weavebob = nullptr;
+ 	GSTexture* m_blend = nullptr;
+ 	GSTexture* m_mad = nullptr;
++	int m_deinterlace_index = 0;
+ 	GSTexture* m_target_tmp = nullptr;
+ 	GSTexture* m_current = nullptr;
+ 	GSTexture* m_cas = nullptr;
+@@ -1699,6 +1701,8 @@ public:
  
--	if (!fd->data || fd->size < GetSaveStateSize(version))
-+	if (!fd->data || m_saved_deinterlace_history.empty() ||
-+		fd->size != GetSaveStateSize(version) + static_cast<int>(m_saved_deinterlace_history.size()))
- 		return -1;
+ 	virtual void ClearSamplerCache() = 0;
  
- 	Flush(GSFlushReason::SAVESTATE);
-@@ -3076,13 +3080,15 @@
- 	}
- 
- 	WriteState(data, &m_q);
-+	WriteState(data, m_saved_deinterlace_history.data(), m_saved_deinterlace_history.size());
-+	m_saved_deinterlace_history.clear();
- 
- 	return 0;
- }
- 
- int GSState::Defrost(const freezeData* fd)
- {
--	if (!fd || !fd->data || fd->size == 0)
-+	if (!fd || !fd->data || fd->size < static_cast<int>(sizeof(u32)))
- 		return -1;
- 
- 	u8* data = fd->data;
-@@ -3099,6 +3105,10 @@
- 		Console.Error("GS: Savestate version is incompatible.  Load aborted.");
- 		return -1;
- 	}
-+
-+	GSDeinterlaceHistory history;
-+	const int base_size = GetSaveStateSize(version);
-+	if (!GSDeinterlaceHistory::Decode(fd->data + base_size, fd->size - base_size, history)) return -1;
- 
- 	Flush(GSFlushReason::LOADSTATE);
- 
-@@ -3225,6 +3235,7 @@
- 
- 	ResetPCRTC();
- 	m_restored_display_pending[0] = m_restored_display_pending[1] = true;
-+	if (!g_gs_device->RestoreDeinterlaceHistory(history)) return -1;
- 
- 	return 0;
- }
++	bool CaptureDeinterlaceHistory(GSDeinterlaceHistory& history);
++	bool RestoreDeinterlaceHistory(const GSDeinterlaceHistory& history);
+ 	void ClearCurrent();
+ 	void Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c);
+ 	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset);

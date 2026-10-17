@@ -138,7 +138,7 @@ pub fn summarize_runs(root: &Path, filter: &SummaryFilter) -> Result<RunsSummary
         })
         .collect();
 
-    Ok(RunsSummary {
+    let summary = RunsSummary {
         total: matched.len() as u64,
         skipped: skipped.len() as u64,
         skipped_runs,
@@ -148,5 +148,7 @@ pub fn summarize_runs(root: &Path, filter: &SummaryFilter) -> Result<RunsSummary
         intervention_ops,
         metric_keys: metric_set.into_iter().collect(),
         runs,
-    })
+    };
+    super::budget::check_result(&summary)?;
+    Ok(summary)
 }

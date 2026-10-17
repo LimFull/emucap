@@ -33,17 +33,26 @@ pub(super) struct StateScratch {
 }
 
 impl StateScratch {
-    pub(super) fn new(session: &PreparedSession) -> BridgeResult<Self> {
-        let parent = session
-            .user_data
-            .parent()
-            .ok_or_else(|| invalid("missing generation root"))?;
-        let root = parent.join(format!("state-{}", ulid::Ulid::generate()));
+    pub(super) fn new(runtime_home: &Path) -> BridgeResult<Self> {
+        let parent = runtime_home.join("state");
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(invalid("state scratch parent is not a real directory"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&parent)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let root = parent.join(ulid::Ulid::generate().to_string().to_ascii_lowercase());
         fs::create_dir(&root)?;
-        Ok(Self {
+        let scratch = Self {
             root,
             retained: false,
-        })
+        };
+        scratch.require_native_paths()?;
+        Ok(scratch)
     }
 
     pub(super) fn machine(&self) -> PathBuf {
@@ -51,6 +60,11 @@ impl StateScratch {
     }
     pub(super) fn disk(&self) -> PathBuf {
         self.root.join("disk.dsk")
+    }
+
+    fn require_native_paths(&self) -> BridgeResult<()> {
+        require_native_path(&self.machine())?;
+        require_native_path(&self.disk())
     }
 
     // After activation the native board owns an open disk in this directory.
@@ -110,10 +124,14 @@ pub(super) fn publish(
     Ok(())
 }
 
-pub(super) fn prepare(path: &Path, session: &PreparedSession) -> BridgeResult<StateScratch> {
+pub(super) fn prepare(
+    path: &Path,
+    session: &PreparedSession,
+    runtime_home: &Path,
+) -> BridgeResult<StateScratch> {
     let bytes = crate::path_safety::read_bounded_regular_file_no_follow(path, MAX_ARCHIVE)?;
     if !bytes.starts_with(b"PK") {
-        return prepare_legacy(bytes, session);
+        return prepare_legacy(bytes, session, runtime_home);
     }
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| invalid(format!("invalid snapshot archive: {error}")))?;
@@ -145,13 +163,17 @@ pub(super) fn prepare(path: &Path, session: &PreparedSession) -> BridgeResult<St
     {
         return Err(invalid("snapshot payload digest mismatch"));
     }
-    let scratch = StateScratch::new(session)?;
+    let scratch = StateScratch::new(runtime_home)?;
     fs::write(scratch.machine(), machine)?;
     fs::write(scratch.disk(), disk)?;
     Ok(scratch)
 }
 
-fn prepare_legacy(machine: Vec<u8>, session: &PreparedSession) -> BridgeResult<StateScratch> {
+fn prepare_legacy(
+    machine: Vec<u8>,
+    session: &PreparedSession,
+    runtime_home: &Path,
+) -> BridgeResult<StateScratch> {
     if machine.len() as u64 > MAX_PAYLOAD
         || !(machine.starts_with(b"\x1f\x8b") || machine.starts_with(b"<?xml"))
     {
@@ -169,7 +191,7 @@ fn prepare_legacy(machine: Vec<u8>, session: &PreparedSession) -> BridgeResult<S
             "legacy restore requires unchanged admitted source bytes",
         ));
     }
-    let scratch = StateScratch::new(session)?;
+    let scratch = StateScratch::new(runtime_home)?;
     fs::write(scratch.machine(), machine)?;
     fs::write(scratch.disk(), disk)?;
     Ok(scratch)
@@ -212,6 +234,23 @@ fn validate_disk(bytes: &[u8]) -> BridgeResult<()> {
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(windows)]
+fn require_native_path(path: &Path) -> BridgeResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    if path.as_os_str().encode_wide().count() >= 260 {
+        return Err(invalid(format!(
+            "native state path exceeds the Windows 259-unit limit: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn require_native_path(_path: &Path) -> BridgeResult<()> {
+    Ok(())
 }
 fn invalid(message: impl std::fmt::Display) -> OpenMsxBridgeError {
     OpenMsxBridgeError::BadParams(format!("openMSX disk state: {message}"))

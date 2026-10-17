@@ -20,6 +20,7 @@ use crate::{analysis_surface, invalid_request_result, recording, tool_output_res
 const OPERATIONS: &[&str] = &[
     "execution_speed",
     "set_input",
+    "read_input_polls",
     "hold_touch",
     "release_touch",
     "pulse_touch_while_running",
@@ -95,7 +96,7 @@ pub(crate) fn describe(status: &Value) -> Value {
         &mut operations,
         status,
         "dump_memory",
-        "Write the backend's standard memory dump set to a local path.",
+        "Write the backend's standard memory dump set to a new local directory.",
     );
     add::<ProbeArgs>(
         &mut operations,
@@ -228,7 +229,8 @@ pub(crate) async fn execute(
     }
     let operation = arguments.operation;
     match operation.as_str() {
-        "set_input"
+        "read_input_polls"
+        | "set_input"
         | "hold_touch"
         | "release_touch"
         | "pulse_touch_while_running"

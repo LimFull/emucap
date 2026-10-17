@@ -1,0 +1,282 @@
+diff --git a/Source/Core/Common/ChunkFile.h b/Source/Core/Common/ChunkFile.h
+--- a/Source/Core/Common/ChunkFile.h
++++ b/Source/Core/Common/ChunkFile.h
+@@ -20,6 +20,7 @@
+ #include <map>
+ #include <optional>
+ #include <set>
++#include <span>
+ #include <string>
+ #include <type_traits>
+ #include <utility>
+@@ -72,6 +73,14 @@
+   bool IsMeasureMode() const { return m_mode == Mode::Measure; }
+   bool IsVerifyMode() const { return m_mode == Mode::Verify; }
+ 
++  // A separate preflight cursor can inspect input without advancing this reader.
++  std::optional<std::span<u8>> GetRemainingReadBytes() const
++  {
++    if (!IsReadMode() || HasError())
++      return std::nullopt;
++    return std::span<u8>(*m_ptr_current, m_ptr_end);
++  }
++
+   template <typename K, class V>
+   void Do(std::map<K, V>& x)
+   {
+@@ -229,6 +238,13 @@
+   [[nodiscard]] u8* DoExternal(u32& count)
+   {
+     Do(count);
++    if (HasError())
++      return nullptr;
++    if (IsReadMode() && count > static_cast<size_t>(m_ptr_end - *m_ptr_current))
++    {
++      SetError();
++      return nullptr;
++    }
+     u8* current = *m_ptr_current;
+     *m_ptr_current += count;
+     if (!IsMeasureMode() && *m_ptr_current > m_ptr_end)
+@@ -370,6 +386,13 @@
+ 
+   DOLPHIN_FORCE_INLINE void DoVoid(void* data, u32 size)
+   {
++    if (HasError())
++      return;
++    if (IsReadMode() && size > static_cast<size_t>(m_ptr_end - *m_ptr_current))
++    {
++      SetError();
++      return;
++    }
+     if (!IsMeasureMode() && (*m_ptr_current + size) > m_ptr_end)
+     {
+       // trying to read/write past the end of the buffer, prevent this
+diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -573,6 +573,116 @@
+     DoLoadState(p, restored_entries);
+ }
+ 
++namespace
++{
++struct TextureStateBudget
++{
++  static constexpr u32 MaxEntries = 4096;
++  static constexpr u64 MaxBytes = u64{1} << 30;
++  static constexpr u64 MaxUploads = 65536;
++  static constexpr u32 MaxAssociations = 65536;
++  u64 serialized = 0;
++  u64 native = 0;
++  u64 uploads = 0;
++
++  bool Admit(const TextureConfig& config, u32 serialized_size)
++  {
++    const auto expected = config.GetSerializedSize(g_backend_info.MaxTextureSize);
++    if (!expected || *expected != serialized_size || serialized_size > MaxBytes - serialized)
++      return false;
++    const u64 subresources = u64{config.layers} * config.levels;
++    if (subresources > MaxUploads - uploads)
++      return false;
++    // A bounded representation estimate, not physical driver allocation size.
++    u64 layer_bytes = 0;
++    for (u32 level = 0; level < config.levels; ++level)
++    {
++      const u64 row = u64{std::max(config.width >> level, 1u)} * 8;
++      const u64 height = std::max(config.height >> level, 1u);
++      if (height > (MaxBytes - layer_bytes) / row)
++        return false;
++      layer_bytes += row * height;
++    }
++    // OpenGL cube storage allocates six faces even when fewer layers are serialized.
++    const u64 storage_layers = config.type == AbstractTextureType::Texture_CubeMap ?
++                                   std::max(u64{config.layers}, u64{6}) :
++                                   config.layers;
++    if (layer_bytes > MaxBytes / storage_layers)
++      return false;
++    const u64 native_bytes = std::max(layer_bytes * storage_layers, u64{65536});
++    if (native_bytes > MaxBytes - native)
++      return false;
++    serialized += serialized_size;
++    native += native_bytes;
++    uploads += subresources;
++    return true;
++  }
++};
++
++bool PreflightTextureState(PointerWrap& input, u64 last_entry_id, size_t bound_slots)
++{
++  const auto bytes = input.GetRemainingReadBytes();
++  if (!bytes)
++    return false;
++  u8* cursor = bytes->data();
++  PointerWrap p(&cursor, bytes->size(), PointerWrap::Mode::Read);
++  u32 entry_count = 0;
++  p.Do(entry_count);
++  if (p.HasError() || entry_count > TextureStateBudget::MaxEntries)
++    return false;
++
++  TextureStateBudget budget;
++  std::array<u64, TextureStateBudget::MaxEntries> logical_ids{};
++  for (u32 i = 0; i < entry_count; ++i)
++  {
++    TextureConfig config{};
++    p.Do(config);
++    u32 size = 0;
++    const u8* data = p.DoExternal(size);
++    if (p.HasError() || !data || !budget.Admit(config, size))
++      return false;
++    // Reuse the real field sequence without retaining a native texture or cache entry.
++    TCacheEntry metadata(nullptr, nullptr);
++    metadata.DoState(p);
++    if (p.HasError() || metadata.id >= last_entry_id)
++      return false;
++    logical_ids[i] = metadata.id;
++  }
++  std::sort(logical_ids.begin(), logical_ids.begin() + entry_count);
++  if (std::adjacent_find(logical_ids.begin(), logical_ids.begin() + entry_count) !=
++      logical_ids.begin() + entry_count)
++    return false;
++  p.DoMarker("TextureCacheEntries");
++  if (!p.IsReadMode() || p.HasError())
++    return false;
++
++  u32 remaining = TextureStateBudget::MaxAssociations;
++  for (unsigned list = 0; list < 4; ++list)
++  {
++    u32 count = 0;
++    p.Do(count);
++    if (p.HasError() || (list == 3 ? count > bound_slots : count > remaining))
++      return false;
++    if (list != 3)
++      remaining -= count;
++    for (u32 i = 0; i < count; ++i)
++    {
++      u32 first = 0, id = 0;
++      u64 hash = 0;
++      if (list == 2)
++        p.Do(hash);
++      else
++        p.Do(first);
++      p.Do(id);
++      if (p.HasError() || id >= entry_count || (list == 0 && first >= entry_count) ||
++          (list == 3 && first >= bound_slots))
++        return false;
++    }
++  }
++  return p.IsReadMode() && !p.HasError();
++}
++}  // namespace
++
+ void TextureCacheBase::DoSaveState(PointerWrap& p)
+ {
+   // Flush all stale binds
+@@ -700,6 +810,52 @@
+       bound_textures_list.push_back(mapping);
+   }
+ 
++  // Save references for each cache entry.
++  // As references are circular, we need to have everything created before linking entries.
++  std::set<std::pair<u32, u32>> reference_pairs;
++  for (const auto& it : entry_map)
++  {
++    const TCacheEntry* entry = it.first;
++    auto id1 = GetCacheEntryId(entry);
++    if (!id1)
++      continue;
++
++    for (const TCacheEntry* referenced_entry : entry->references)
++    {
++      auto id2 = GetCacheEntryId(referenced_entry);
++      if (!id2)
++        continue;
++
++      auto refpair1 = std::make_pair(*id1, *id2);
++      auto refpair2 = std::make_pair(*id2, *id1);
++      if (!reference_pairs.contains(refpair2))
++        reference_pairs.insert(std::move(refpair1));
++    }
++  }
++
++  // Apply the same admission policy to saves and undo snapshots before readback.
++  if (entries_to_save.size() > TextureStateBudget::MaxEntries ||
++      reference_pairs.size() > TextureStateBudget::MaxAssociations ||
++      textures_by_address_list.size() > TextureStateBudget::MaxAssociations - reference_pairs.size() ||
++      textures_by_hash_list.size() > TextureStateBudget::MaxAssociations - reference_pairs.size() -
++                                         textures_by_address_list.size() ||
++      bound_textures_list.size() > m_bound_textures.size())
++  {
++    p.SetError();
++    return;
++  }
++  TextureStateBudget budget;
++  for (const TCacheEntry* entry : entries_to_save)
++  {
++    const auto& config = entry->texture->GetConfig();
++    const auto size = config.GetSerializedSize(g_backend_info.MaxTextureSize);
++    if (!size || !budget.Admit(config, *size))
++    {
++      p.SetError();
++      return;
++    }
++  }
++
+   // Save the texture cache entries out in the order the were referenced.
+   u32 size = static_cast<u32>(entries_to_save.size());
+   p.Do(size);
+@@ -710,29 +866,6 @@
+   }
+   p.DoMarker("TextureCacheEntries");
+ 
+-  // Save references for each cache entry.
+-  // As references are circular, we need to have everything created before linking entries.
+-  std::set<std::pair<u32, u32>> reference_pairs;
+-  for (const auto& it : entry_map)
+-  {
+-    const TCacheEntry* entry = it.first;
+-    auto id1 = GetCacheEntryId(entry);
+-    if (!id1)
+-      continue;
+-
+-    for (const TCacheEntry* referenced_entry : entry->references)
+-    {
+-      auto id2 = GetCacheEntryId(referenced_entry);
+-      if (!id2)
+-        continue;
+-
+-      auto refpair1 = std::make_pair(*id1, *id2);
+-      auto refpair2 = std::make_pair(*id2, *id1);
+-      if (!reference_pairs.contains(refpair2))
+-        reference_pairs.insert(std::move(refpair1));
+-    }
+-  }
+-
+   auto doList = [&p](const auto& list) {
+     u32 list_size = static_cast<u32>(list.size());
+     p.Do(list_size);
+@@ -755,6 +888,11 @@
+ 
+ void TextureCacheBase::DoLoadState(PointerWrap& p, std::vector<RcTcacheEntry>& restored_entries)
+ {
++  if (p.IsReadMode() && !PreflightTextureState(p, m_last_entry_id, m_bound_textures.size()))
++  {
++    p.SetError();
++    return;
++  }
+   // Helper for getting a cache entry from an ID.
+   std::map<u32, RcTcacheEntry> id_map;
+   std::set<u64> logical_ids;
+diff --git a/Source/Core/VideoCommon/TextureCacheBase.h b/Source/Core/VideoCommon/TextureCacheBase.h
+--- a/Source/Core/VideoCommon/TextureCacheBase.h
++++ b/Source/Core/VideoCommon/TextureCacheBase.h
+@@ -204,6 +204,9 @@
+   // This texture entry is used by the other entry as a sub-texture
+   void CreateReference(TCacheEntry* other_entry)
+   {
++    // A self-link carries no dependency and would invalidate destruction iteration.
++    if (other_entry == this)
++      return;
+     // References are two-way, so they can easily be destroyed later
+     this->references.emplace(other_entry);
+     other_entry->references.emplace(this);

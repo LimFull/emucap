@@ -3,7 +3,10 @@ use super::*;
 use std::time::Instant;
 
 pub(super) const STOP_BUDGET: Duration = Duration::from_millis(5000);
-const FRAME_EXCHANGE: Duration = Duration::from_millis(35);
+// Every bounded PINE exchange borrows from the operation or cleanup deadline.
+// Keep this separate from the 5 ms receipt-poll cadence: synchronous CPU-thread
+// dispatch can be delayed by host scheduling even while native control remains healthy.
+pub(super) const PINE_EXCHANGE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PROTOCOL: u8 = 0x98;
 const BEGIN: u8 = 0x99;
@@ -94,7 +97,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             PROTOCOL,
             &[],
             Instant::now() + Duration::from_secs(1),
-            FRAME_EXCHANGE,
+            PINE_EXCHANGE,
         )?;
         let mut expected = Vec::new();
         for value in [
@@ -147,10 +150,27 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
                 ) {
                     self.control_unverified = true;
                 }
+            })
+            .map_err(|error| match error {
+                Pcsx2BridgeError::Io(error) => Pcsx2BridgeError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "PINE opcode 0x{opcode:02x} exchange ({} ms): {error}",
+                        budget.as_millis()
+                    ),
+                )),
+                Pcsx2BridgeError::Protocol(message) => Pcsx2BridgeError::Protocol(format!(
+                    "PINE opcode 0x{opcode:02x} exchange ({} ms): {message}",
+                    budget.as_millis()
+                )),
+                other => other,
             })?;
         if let Err(error) = remaining(exchange_end) {
             self.control_unverified = true;
-            return Err(error);
+            return Err(Pcsx2BridgeError::Emulator(format!(
+                "PINE opcode 0x{opcode:02x} exchange exceeded {} ms: {error}",
+                budget.as_millis()
+            )));
         }
         Ok(reply)
     }
@@ -183,7 +203,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         deadline: Instant,
     ) -> BridgeResult<Receipt> {
         let next = Receipt::parse(
-            &self.bounded_command(opcode, &previous.id.to_le_bytes(), deadline, FRAME_EXCHANGE)?,
+            &self.bounded_command(opcode, &previous.id.to_le_bytes(), deadline, PINE_EXCHANGE)?,
             previous.requested,
         )?;
         next.follows(previous)?;
@@ -216,7 +236,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         deadline: Instant,
     ) -> BridgeResult<Receipt> {
         let receipt = Receipt::parse(
-            &self.bounded_command(opcode, body, deadline, FRAME_EXCHANGE)?,
+            &self.bounded_command(opcode, body, deadline, PINE_EXCHANGE)?,
             requested,
         )?;
         if receipt.id <= self.last_native_id
