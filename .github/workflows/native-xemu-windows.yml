@@ -30,6 +30,10 @@ jobs:
       NATIVE_CONTAINER: ghcr.io/xemu-project/xemu-win64-toolchain-gcc@sha256:5bb480ccba1009cc45d2de3e9f49456b83cc7f003b354dcdd361525f64637832
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Trust the runner checkout inside the build container
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Build pinned Windows source
         run: |
           set -euo pipefail
