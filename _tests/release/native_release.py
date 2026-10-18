@@ -7,9 +7,8 @@ import shutil
 import tarfile
 import tomllib
 
-from collect_native import ADAPTERS, PREBUILT_PLATFORMS
 from native_payload import PARENTS, RECORD, SIGNATURE, bounded_read, digest_file, payload_files
-from native_producer import parse_json
+from native_producer import NATIVE_TARGETS, parse_json
 from native_provenance import fetch
 
 
@@ -28,7 +27,7 @@ def native_assets(verified):
     index = parse_json(bounded_read(directory / 'NATIVE-PACKAGES.json'))
     if set(index) != {'core_revision', 'packages'} or index['core_revision'] != record['release_revision']:
         raise ValueError('native assembly index revision mismatch')
-    expected = {(a, p) for a in ADAPTERS for p in PREBUILT_PLATFORMS[a]}
+    expected = NATIVE_TARGETS
     selected = [(p['adapter'], p['platform']) for p in index['packages']]
     if set(selected) != expected or len(selected) != len(expected):
         raise ValueError('native assembly index matrix mismatch')

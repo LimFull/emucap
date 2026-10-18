@@ -11,7 +11,7 @@ import subprocess
 
 from native_payload import (PARENTS, RECORD, SIGNATURE, MAX_RECORD_BYTES, bounded_read,
                             digest_file, download_payload, payload_files, validate_file_map)
-from native_producer import (ADAPTERS, SHA, admit_source, command, current_producer,
+from native_producer import (NATIVE_TARGETS, SHA, admit_source, command, current_producer,
                              native_inputs, parse_json, pipeline_blobs, producer_spec, resolve_producer)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -149,8 +149,7 @@ class Verifier:
                     or runtimes[0]['platform'] != 'windows' or native != runtimes[0]['native']):
                 raise ValueError('Windows packaging requires its runtime and source parents')
         else:
-            expected = {(a, p) for a in ADAPTERS for p in ('linux', 'macos', 'windows')
-                        if (a, p) != ('pcsx2', 'linux')}
+            expected = NATIVE_TARGETS
             actual = [(p['adapter'], p['platform']) for p in parents if p['purpose'] == 'package']
             if (native is not None or not SHA.fullmatch(record['release_revision'] or '')
                     or len(actual) != len(parents) or len(actual) != len(expected) or set(actual) != expected):

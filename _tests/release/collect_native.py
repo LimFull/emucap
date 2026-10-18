@@ -9,17 +9,14 @@ import tomllib
 import zipfile
 
 from package_native import run, sha
-from native_producer import MSVC
+from native_producer import ADAPTERS, PLATFORMS, NATIVE_TARGETS, MSVC
 from native_provenance import create_record, fetch, retain_parents
 
-ADAPTERS = ('mesen2', 'dolphin', 'ppsspp', 'mednafen', 'flycast', 'np2kai',
-            'mupen64plus', 'openmsx', 'mame-pc98', 'mame-neogeo', 'pcsx2', 'desmume-nds', 'xemu')
-PLATFORMS = ('linux', 'macos', 'windows')
 PREBUILT_PLATFORMS = {a: PLATFORMS for a in ADAPTERS}
 
 
 def validate_selection(selection):
-    expected = {(a, p) for a in ADAPTERS for p in PREBUILT_PLATFORMS[a]}
+    expected = NATIVE_TARGETS
     actual = [(r['adapter'], r['platform']) for r in selection]
     if set(actual) != expected or len(actual) != len(expected):
         raise ValueError('release requires one package for every adapter and selected platform')

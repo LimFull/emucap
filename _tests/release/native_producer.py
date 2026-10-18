@@ -13,6 +13,8 @@ MSVC = {'mesen2', 'dolphin', 'ppsspp'}
 MSYS2 = {'mednafen', 'flycast', 'np2kai', 'mupen64plus', 'openmsx',
          'mame-pc98', 'mame-neogeo', 'pcsx2', 'desmume-nds'}
 ADAPTERS = MSVC | MSYS2 | {'xemu'}
+PLATFORMS = ('linux', 'macos', 'windows')
+NATIVE_TARGETS = frozenset((adapter, platform) for adapter in ADAPTERS for platform in PLATFORMS)
 TRUSTED_REFS = {'refs/heads/main', 'refs/heads/next'}
 SHA = re.compile(r'[0-9a-f]{40}')
 MAX_METADATA_BYTES = 16 * 1024 * 1024
@@ -21,6 +23,8 @@ MAX_METADATA_BYTES = 16 * 1024 * 1024
 # scoped to an exact repository, revision and map; all remaining admission checks
 # still apply. Never infer approval from ancestry or a successful workflow alone.
 APPROVED_PIPELINES = {
+    ('mcpads/emucap', '8587968a5e77acb51fdd76caa2bf04d17ce56082'):
+        'fba05968bf99217a4c6dfe1ee571d6d4cbce8dc1ecd14614c6690e64ca40be19',
     ('mcpads/emucap', '4b07ebd56acb706c65a8f12e947bd8fc6b424100'):
         '37cfd56f138aaab864bf807eef794e8251cafd920ca9017464455b9cacbdf29b',
     ('mcpads/emucap', 'ebc59d84f62ad452fd8e9fca7d15af3926f0bed9'):
@@ -86,7 +90,7 @@ def producer_spec(purpose, adapter=None, platform=None):
         if adapter is not None or platform is not None:
             raise ValueError('assembly has no adapter or platform')
         return 'native-unix.yml', 'assemble', 'native-release-packages'
-    if adapter not in ADAPTERS or platform not in ('linux', 'macos', 'windows'):
+    if adapter not in ADAPTERS or platform not in PLATFORMS:
         raise ValueError('unknown native producer matrix entry')
     if purpose == 'package':
         job = 'package' if platform == 'windows' else f'build ({adapter}, {platform})'

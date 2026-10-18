@@ -8,7 +8,7 @@ import unittest
 
 from collect_native import ADAPTERS, PREBUILT_PLATFORMS
 from native_payload import RECORD, SIGNATURE, payload_files
-from native_provenance import VerifiedPayload, canonical
+from native_provenance import VerifiedPayload, Verifier, canonical
 from native_release import core_assets, native_assets, prepare
 
 
@@ -46,7 +46,8 @@ def assembly(root):
     (root / 'NATIVE-PACKAGES.json').write_bytes(canonical(index))
     files = payload_files(root)
     (root / 'NATIVE-SHA256SUMS').write_text(''.join(f'{f["sha256"]}  {n}\n' for n, f in sorted(files.items())))
-    record = dict(parents=parents, release_revision='c' * 40, files=payload_files(root))
+    record = dict(purpose='assembly', adapter=None, platform=None, native=None,
+                  parents=parents, release_revision='c' * 40, files=payload_files(root))
     (root / RECORD).write_bytes(canonical(record))
     (root / SIGNATURE).write_bytes(b'synthetic signature; verifier tested separately')
     return VerifiedPayload(root, record, 'd' * 64, proofs)
@@ -68,6 +69,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             verified = assembly(root / 'native')
+            Verifier.validate_lineage(verified.record, [v[0] for v in verified.proofs.values()])
             core(root / 'core')
             names = prepare(verified, root / 'core', root / 'prepared', '1.0.0')
             self.assertEqual(set(names), {p.name for p in (root / 'prepared').iterdir()})
