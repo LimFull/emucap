@@ -11,7 +11,11 @@ from package_native import source_archive, files_manifest, sha
 class CollectionTests(unittest.TestCase):
     def test_missing_or_duplicate_platform_refuses_release(self):
         selection = [dict(adapter=a, platform=p, run=1) for a in ADAPTERS for p in PREBUILT_PLATFORMS[a]]
+        self.assertEqual(len(selection), 39)
         validate_selection(selection)
+        without_linux_pcsx2 = [r for r in selection if (r['adapter'], r['platform']) != ('pcsx2', 'linux')]
+        with self.assertRaisesRegex(ValueError, 'every adapter'):
+            validate_selection(without_linux_pcsx2)
         with self.assertRaisesRegex(ValueError, 'every adapter'): validate_selection(selection[:-1])
         with self.assertRaisesRegex(ValueError, 'every adapter'): validate_selection(selection + [selection[0]])
 

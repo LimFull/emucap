@@ -15,9 +15,7 @@ from native_provenance import create_record, fetch, retain_parents
 ADAPTERS = ('mesen2', 'dolphin', 'ppsspp', 'mednafen', 'flycast', 'np2kai',
             'mupen64plus', 'openmsx', 'mame-pc98', 'mame-neogeo', 'pcsx2', 'desmume-nds', 'xemu')
 PLATFORMS = ('linux', 'macos', 'windows')
-# Linux PCSX2 remains available through its source recipe; its binary follows later.
 PREBUILT_PLATFORMS = {a: PLATFORMS for a in ADAPTERS}
-PREBUILT_PLATFORMS['pcsx2'] = ('macos', 'windows')
 
 
 def validate_selection(selection):
