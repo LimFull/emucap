@@ -201,7 +201,7 @@ def admit_run(info, jobs, repository, workflow, purpose, adapter=None, platform=
     repo = repository['full_name']
     path = f'.github/workflows/{filename}'
     events = {'workflow_dispatch'} if filename == 'native-unix.yml' else {'push', 'workflow_dispatch'}
-    if (info.get('status') != 'completed' or info.get('event') not in events
+    if (info.get('status') not in ('queued', 'in_progress', 'completed') or info.get('event') not in events
             or info.get('repository', {}).get('id') != repository['id']
             or info.get('repository', {}).get('full_name') != repo
             or info.get('head_repository', {}).get('id') != repository['id']

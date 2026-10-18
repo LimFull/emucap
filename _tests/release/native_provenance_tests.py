@@ -57,8 +57,18 @@ class ProducerTests(unittest.TestCase):
         args = producer_fixture()
         self.assertEqual(producer.admit_run(*args, 'package', 'ppsspp', 'linux'), identity())
 
+    def test_completed_job_is_admitted_while_siblings_are_active(self):
+        for status in ('queued', 'in_progress'):
+            args = producer_fixture()
+            args[0]['status'] = status
+            args[1][1].update(status='in_progress', conclusion=None)
+            self.assertEqual(producer.admit_run(*args, 'package', 'ppsspp', 'linux'), identity())
+            args[1][0]['status'] = 'in_progress'
+            with self.assertRaisesRegex(ValueError, 'exact native producer job'):
+                producer.admit_run(*args, 'package', 'ppsspp', 'linux')
+
     def test_wrong_workflow_event_repository_ref_and_status_are_rejected(self):
-        mutations = [('status', 'in_progress'), ('event', 'pull_request'), ('event', 'pull_request_target'),
+        mutations = [('status', 'unknown'), ('event', 'pull_request'), ('event', 'pull_request_target'),
                      ('event', 'workflow_run'), ('head_branch', 'unreviewed'), ('head_sha', 'bad'),
                      ('workflow_id', 4), ('path', '.github/workflows/other.yml'),
                      ('repository', dict(id=11, full_name=REPO)),
