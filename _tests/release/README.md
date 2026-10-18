@@ -3,8 +3,8 @@
 `package_core.py` packages the core release executables.
 
 The **Native adapter builds** workflow compiles the pinned Windows Mesen, Dolphin,
-and PPSSPP recipes when native inputs change, or through manual dispatch. Core
-version changes do not trigger these builds. Its exact cache key includes adapter
+and PPSSPP recipes through manual dispatch. Select changed native inputs for a fresh
+build; core version changes alone do not require these builds. Its exact cache key includes adapter
 sources, patches, recipe, target and runner toolchain version. The three PowerShell
 recipes do not consume MSYS2 shared helpers, so those helpers do not invalidate them.
 Every retained runtime file and its signed producer lineage are verified before reuse. Missing or invalid cache
@@ -41,8 +41,7 @@ separately from the local admission fixtures.
 The **Native MSYS2 adapter builds** workflow compiles Mednafen, Flycast, NP2kai,
 Mupen64Plus, openMSX, MAME PC-98, MAME Neo Geo, PCSX2, and DeSmuME on Windows from their shell
 recipes. MAME builds only the adapter's drivers. It records compiler/package versions,
-build output, and the resulting executable or core DLL hash. These additional checks have
-no game-runtime qualification yet. Successful builds retain runnable payloads with
+build output, and the resulting executable or core DLL hash. Build results and game-runtime qualification are separate evidence. Successful builds retain runnable payloads with
 native DLL dependencies and required assets for seven days; core-only changes do
 not trigger them. Manual dispatch can select one adapter for a targeted retry.
 PCSX2's shell recipe holds the work-tree lock while its PowerShell helper builds
@@ -84,3 +83,32 @@ archive bytes stay off the operator-to-host transfer path. Its local ledger
 retains command IDs so interrupted observation resumes the same command; only a
 terminal failed attempt permits a retry with a new URL. Supply a complete
 `deploy_windows_payloads.py` plan with each Actions entry's `artifact_id`.
+
+## Release and recovery
+
+Use the public **Release binaries** manual workflow. Create the draft and immutable
+product tag first, and select the completed native assembly as `native_run`. The
+workflow checks draft visibility and tag identity before building. The preflight
+job requires `contents: write` because GitHub hides drafts from read-only tokens.
+
+For a failed publication with successful core builds, pass the original release
+run as `core_run`. The workflow requires all three producing jobs from its latest
+attempt to have succeeded, then checks downloaded package version, source, target
+and digests. It skips compilation even when that run's publisher failed.
+
+```sh
+gh workflow run release-core.yml --repo OWNER/REPO --ref REVIEWED_PIPELINE_BRANCH \
+  -f tag=VERSION -f native_run=ASSEMBLY_RUN -f core_run=CORE_RUN \
+  -f validate_only=false
+```
+
+Keep the tag and selected producers fixed during recovery. A packaging correction
+can run from a reviewed work branch; merge after successful publication. Native
+producer admission continues to require its approved branches and signed lineage.
+
+Preparation produces deterministic proof bytes. The publisher uploads missing
+assets, accepts identical existing assets, rejects conflicts, and publishes only
+after the full remote inventory matches. The `release-inventory` Actions artifact
+retains the prepared checksums and native index even if publication fails.
+Expired producer artifacts require restoring an admitted source of bytes or rebuilding
+the affected producer; an absent artifact is not a reason to waive admission.
