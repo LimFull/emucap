@@ -2,6 +2,7 @@
 from functools import lru_cache
 import hashlib
 import json
+import json
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,20 @@ ADAPTERS = MSVC | MSYS2 | {'xemu'}
 TRUSTED_REFS = {'refs/heads/main', 'refs/heads/next'}
 SHA = re.compile(r'[0-9a-f]{40}')
 MAX_METADATA_BYTES = 16 * 1024 * 1024
+
+# Reviewed complete pipeline input maps for the 1.1.0 native builds. Approval is
+# scoped to an exact repository, revision and map; all remaining admission checks
+# still apply. Never infer approval from ancestry or a successful workflow alone.
+APPROVED_PIPELINES = {
+    ('mcpads/emucap', 'ebc59d84f62ad452fd8e9fca7d15af3926f0bed9'):
+        'd4c8f1b23add068eddfa739be3835bf9200f2d5e45633987aa30dd95d991303b',
+    ('mcpads/emucap', 'b47ab0b18462d6a715f78c763a64a43db1fc5138'):
+        '6434a8c5c0bd5c4a2c063dbceb90c1f49bbf6193c1c1c5c403a728003b90f7f1',
+}
+
+
+def pipeline_digest(inputs):
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 def command(*args):
@@ -175,7 +190,8 @@ def admit_pipeline(info, authority, repo):
     for name in expected:
         if not name.startswith('_tests/release/'):
             actual[name] = entries.get(name, {}).get('sha')
-    if actual != expected or any(entries[name].get('mode') not in ('100644', '100755')
+    reviewed = APPROVED_PIPELINES.get((repo, info['head_sha'])) == pipeline_digest(actual)
+    if (actual != expected and not reviewed) or any(entries[name].get('mode') not in ('100644', '100755')
                                  for name in actual if name in entries):
         raise ValueError('native producer pipeline inputs are not approved')
 

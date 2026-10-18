@@ -181,6 +181,27 @@ class InputTests(unittest.TestCase):
             with self.subTest(mutation=mutation), patch.object(producer, 'github', return_value=bad), self.assertRaises(ValueError):
                 producer.admit_pipeline({'head_sha': REVISION}, self.root, REPO)
 
+    def test_reviewed_pipeline_requires_exact_repository_revision_and_input_map(self):
+        previous = producer.pipeline_blobs(self.root)
+        previous['_tests/release/native_producer.py'] = 'b' * 40
+        tree = dict(truncated=False, tree=[dict(path=name, sha=digest, mode='100644', type='blob')
+                                           for name, digest in previous.items()])
+        approvals = {(REPO, REVISION): producer.pipeline_digest(previous)}
+        with patch.object(producer, 'APPROVED_PIPELINES', approvals), patch.object(producer, 'github', return_value=tree):
+            producer.admit_pipeline({'head_sha': REVISION}, self.root, REPO)
+            for repo, revision in [('other/emucap', REVISION), (REPO, 'c' * 40)]:
+                with self.assertRaises(ValueError):
+                    producer.admit_pipeline({'head_sha': revision}, self.root, repo)
+        for mutation in ('change', 'remove', 'extra', 'symlink', 'truncated'):
+            bad = copy.deepcopy(tree)
+            if mutation == 'change': bad['tree'][0]['sha'] = 'c' * 40
+            elif mutation == 'remove': bad['tree'].pop(0)
+            elif mutation == 'extra': bad['tree'].append(dict(path='_tests/release/extra.py', sha='c' * 40, mode='100644', type='blob'))
+            elif mutation == 'symlink': bad['tree'][0]['mode'] = '120000'
+            else: bad['truncated'] = True
+            with self.subTest(mutation=mutation), patch.object(producer, 'APPROVED_PIPELINES', approvals), patch.object(producer, 'github', return_value=bad), self.assertRaises(ValueError):
+                producer.admit_pipeline({'head_sha': REVISION}, self.root, REPO)
+
     def test_private_workflow_overlay_has_public_identity(self):
         before = producer.pipeline_blobs(self.root)
         public = self.root / '.github/workflows/native-unix.yml'
