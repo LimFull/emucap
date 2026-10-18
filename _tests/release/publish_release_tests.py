@@ -35,7 +35,11 @@ class PublishTests(unittest.TestCase):
             return list(self.assets)
         if '/git/ref/' in path:
             return dict(object=dict(type='commit', sha=REVISION))
-        return dict(self.release)
+        if '/releases?' in path:
+            return [dict(self.release)]
+        if path.endswith('/releases/7'):
+            return dict(self.release)
+        raise AssertionError('unexpected API request: ' + path)
 
     def command(self, args, **_):
         self.calls.append(args)

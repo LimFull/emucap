@@ -14,6 +14,22 @@ def github(path):
     return parse_json(command('gh', 'api', path))
 
 
+def find_release(repo, tag):
+    # The tag endpoint only returns published releases. List with authenticated
+    # access to locate the draft, then keep using its immutable release ID.
+    matches = []
+    for page in range(1, 17):
+        releases = github(f'repos/{repo}/releases?per_page=100&page={page}')
+        if not isinstance(releases, list):
+            raise ValueError('invalid release list response')
+        matches.extend(release for release in releases if release.get('tag_name') == tag)
+        if len(releases) < 100:
+            if len(matches) != 1:
+                raise ValueError('expected one release for the selected tag')
+            return matches[0]
+    raise ValueError('release list exceeds limit')
+
+
 def release_assets(repo, release_id):
     assets = []
     for page in range(1, 17):
@@ -75,7 +91,7 @@ def publish(repo, tag, revision, asset_list):
             raise ValueError('prepared release assets exceed byte limit')
         expected[name] = (size, 'sha256:' + digest_file(path))
         selected[name] = str(path)
-    release = github(f'repos/{repo}/releases/tags/{quote(tag, safe="")}')
+    release = find_release(repo, tag)
     release_id = positive_id(release['id'])
     check_draft(repo, release, tag, revision)
     present = check_assets(release_assets(repo, release_id), expected, complete=False)

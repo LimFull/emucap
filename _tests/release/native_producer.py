@@ -23,6 +23,8 @@ MAX_METADATA_BYTES = 16 * 1024 * 1024
 # scoped to an exact repository, revision and map; all remaining admission checks
 # still apply. Never infer approval from ancestry or a successful workflow alone.
 APPROVED_PIPELINES = {
+    ('mcpads/emucap', 'b9ec415e3dc5be65c6d95c88ca84ce810c5e2a73'):
+        '03b913c34741f0e41b20328b6a77057bd7597b03c6f0a5ac0541b1623f5069a0',
     ('mcpads/emucap', '8587968a5e77acb51fdd76caa2bf04d17ce56082'):
         'fba05968bf99217a4c6dfe1ee571d6d4cbce8dc1ecd14614c6690e64ca40be19',
     ('mcpads/emucap', '4b07ebd56acb706c65a8f12e947bd8fc6b424100'):
