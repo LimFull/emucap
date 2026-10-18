@@ -1,5 +1,6 @@
 """Prepare an exact release asset set from authenticated native assembly and core outputs."""
 import argparse
+import gzip
 import json
 from pathlib import Path
 import re
@@ -103,7 +104,9 @@ def prepare(verified, core, output, version):
                 raise ValueError('native asset changed during release preparation')
     # Preserve signed lineage without uploading one GitHub release asset per proof.
     proof_names = [RECORD, SIGNATURE, *sorted(n for n in verified.record['files'] if n.startswith(PARENTS + '/'))]
-    with tarfile.open(output / 'NATIVE-PROVENANCE.tar.gz', 'w:gz') as archive:
+    with (output / 'NATIVE-PROVENANCE.tar.gz').open('wb') as raw, \
+            gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as compressed, \
+            tarfile.open(fileobj=compressed, mode='w') as archive:
         for name in proof_names:
             path = verified.directory / name
             info = archive.gettarinfo(path, arcname=name)

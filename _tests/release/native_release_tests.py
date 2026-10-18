@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from collect_native import ADAPTERS, PREBUILT_PLATFORMS
 from native_payload import RECORD, SIGNATURE, payload_files
@@ -65,6 +66,20 @@ def core(root):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_repreparation_preserves_bytes_for_partial_upload_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            verified = assembly(root / 'native')
+            core(root / 'core')
+            with patch('gzip.time.time', return_value=1000):
+                first = prepare(verified, root / 'core', root / 'first', '1.0.0')
+            with patch('gzip.time.time', return_value=2000):
+                second = prepare(verified, root / 'core', root / 'second', '1.0.0')
+            self.assertEqual(first, second)
+            for name in first:
+                self.assertEqual((root / 'first' / name).read_bytes(),
+                                 (root / 'second' / name).read_bytes(), name)
+
     def test_complete_matrix_prepares_exact_assets_and_retained_proof_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
