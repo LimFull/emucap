@@ -57,9 +57,9 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     fn batch_capability(&self) -> MemoryBatchCapability {
-        let (_, size) = self.profile.ram();
+        let (memory_type, _, size) = self.profile.memory();
         let mut capability = mame::batch_capability(vec![MemoryWindow {
-            memory_type: "ram".into(),
+            memory_type: memory_type.into(),
             address: 0,
             length: size,
         }]);
@@ -96,7 +96,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             .map_err(BridgeError::BadParams)?;
         self.drain_breakpoint_packets()?;
         self.require_frozen("read_memory_batch")?;
-        let (base, _) = self.profile.ram();
+        let (_, base, _) = self.profile.memory();
         let absolute: Vec<_> = ranges
             .iter()
             .map(|range| (base + range.address, range.length))

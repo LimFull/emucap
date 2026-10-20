@@ -1389,6 +1389,36 @@ fn launch_plan_for_neogeo_mvs_uses_dedicated_adapter_without_zip_inference() {
 }
 
 #[test]
+fn launch_plan_for_taitof2_uses_its_own_adapter_without_zip_inference_or_bios() {
+    for alias in ["taitof2", "taito_f2", "taito-f2", "Taito-F2"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "taitof2", "alias {alias}");
+    }
+    assert_eq!(adapter_for_system("taitof2"), ("mame_taitof2", None));
+    let plan = make_launch_plan(
+        Some(47803),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/pulirula.zip".into()),
+            system: Some("taitof2".into()),
+            pc98_backend: None,
+            indirect_media_approval: None,
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "taitof2");
+    assert_eq!(plan["adapter"], "mame_taitof2");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "taitof2");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .starts_with("No BIOS"));
+    assert_eq!(plan["button_hint"]["system"], "taitof2");
+
+    let inferred = infer_system(Some("/tmp/pulirula.zip"), None);
+    assert_eq!(inferred["system"], serde_json::Value::Null);
+}
+
+#[test]
 fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
     let plan = make_launch_plan(
         Some(47804),
@@ -2791,6 +2821,7 @@ fn launch_sound_admission_matches_the_documented_adapters() {
     for adapter in [
         "mesen2",
         "mame_neogeo",
+        "mame_taitof2",
         "mupen64plus",
         "np2kai",
         "desmume_nds",

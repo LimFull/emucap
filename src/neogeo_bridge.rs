@@ -1,4 +1,4 @@
-//! Neo Geo MVS, AES, and CD bridge for the repository-owned MAME Lua debugger plugin.
+//! Neo Geo MVS, AES, CD, and Taito F2 68000 bridge for the repository-owned MAME Lua debugger plugin.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
@@ -73,6 +73,9 @@ const MVS_RAM_BASE: u64 = 0x10_0000;
 const MVS_RAM_SIZE: u64 = 0x1_0000;
 const CD_RAM_BASE: u64 = 0;
 const CD_RAM_SIZE: u64 = 0x20_0000;
+// Taito F2 work RAM moves between games, so the profile exposes the whole 24-bit 68000 program
+// space through MAME's side-effect-free debugger view instead of guessing one RAM window.
+const PROGRAM_SPACE_SIZE: u64 = 0x100_0000;
 const MAX_READ: u64 = 0x4000;
 const MAX_INPUT_FRAMES: u64 = 120;
 const FRAME_OPERATION_STARTUP_MS: u64 = 5_000;
@@ -88,12 +91,17 @@ const MVS_INPUT_BUTTONS: &[&str] = &[
 const CD_INPUT_BUTTONS: &[&str] = &[
     "a", "b", "c", "d", "start", "select", "up", "down", "left", "right",
 ];
+const TAITO_F2_INPUT_BUTTONS: &[&str] = &[
+    "button1", "button2", "button3", "button4", "start", "coin", "service", "up", "down", "left",
+    "right",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeoGeoProfile {
     Mvs,
     Aes,
     Cd,
+    TaitoF2,
 }
 
 impl NeoGeoProfile {
@@ -102,16 +110,19 @@ impl NeoGeoProfile {
             "neogeo_mvs" => Ok(Self::Mvs),
             "neogeo_aes" => Ok(Self::Aes),
             "neogeo_cd" => Ok(Self::Cd),
+            "taitof2" => Ok(Self::TaitoF2),
             _ => Err(BridgeError::BadParams(format!(
-                "unsupported Neo Geo system: {system}"
+                "unsupported MAME 68000 system: {system}"
             ))),
         }
     }
 
-    fn ram(self) -> (u64, u64) {
+    /// Public memory type name, absolute base, and size of the profile's one memory window.
+    fn memory(self) -> (&'static str, u64, u64) {
         match self {
-            Self::Mvs | Self::Aes => (MVS_RAM_BASE, MVS_RAM_SIZE),
-            Self::Cd => (CD_RAM_BASE, CD_RAM_SIZE),
+            Self::Mvs | Self::Aes => ("ram", MVS_RAM_BASE, MVS_RAM_SIZE),
+            Self::Cd => ("ram", CD_RAM_BASE, CD_RAM_SIZE),
+            Self::TaitoF2 => ("program", 0, PROGRAM_SPACE_SIZE),
         }
     }
 
@@ -119,6 +130,7 @@ impl NeoGeoProfile {
         match self {
             Self::Mvs => MVS_INPUT_BUTTONS,
             Self::Aes | Self::Cd => CD_INPUT_BUTTONS,
+            Self::TaitoF2 => TAITO_F2_INPUT_BUTTONS,
         }
     }
 
@@ -127,6 +139,7 @@ impl NeoGeoProfile {
             Self::Mvs => "mvs",
             Self::Aes => "aes",
             Self::Cd => "cdz",
+            Self::TaitoF2 => "taitof2",
         }
     }
 }
@@ -306,7 +319,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn hello(&mut self) -> BridgeResult<Value> {
         let methods = self.advertised_methods();
-        let (_, ram_size) = self.profile.ram();
+        let (memory_type, _, memory_size) = self.profile.memory();
         let input_buttons = self.profile.input_buttons();
         let state_restore = json!({
             "supported": methods.contains(&"save_state"),
@@ -324,13 +337,13 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "backend": "lua-gdbstub",
             "debugger": true,
             "methods": methods,
-            "memory_types": ["ram"],
+            "memory_types": [memory_type],
             "state_groups": ["M68K"],
             "cpu_targets": [{
                 "id":"main", "aliases":["m68000", "m68k", "68k"], "default":true,
                 "disassembly_modes":["auto", "m68k"]
             }],
-            "region_sizes": {"ram": ram_size},
+            "region_sizes": {memory_type: memory_size},
             "breakpoint_kinds": breakpoint_kinds(),
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
             "input_buttons": {"system": self.system, "buttons": input_buttons},
@@ -378,7 +391,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         } else {
             None
         };
-        let (_, ram_size) = self.profile.ram();
+        let (memory_type, _, memory_size) = self.profile.memory();
         let input_buttons = self.profile.input_buttons();
         let frame = self.current_frame()?;
         let fields = self.input_fields()?;
@@ -393,8 +406,8 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "frame": frame,
             "execution_speed": execution_speed,
             "methods": methods,
-            "memory_types": ["ram"],
-            "region_sizes": {"ram": ram_size},
+            "memory_types": [memory_type],
+            "region_sizes": {memory_type: memory_size},
             "breakpoint_kinds": breakpoint_kinds(),
             "input_buttons": {"system": self.system, "buttons": input_buttons, "available": fields},
             "input_override": input_override,
@@ -420,7 +433,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             )));
         }
         match self.profile {
-            NeoGeoProfile::Mvs | NeoGeoProfile::Aes => {
+            NeoGeoProfile::Mvs | NeoGeoProfile::Aes | NeoGeoProfile::TaitoF2 => {
                 let mut file = File::open(content)?;
                 let mut hasher = Sha1::new();
                 let mut size = 0_u64;
@@ -1118,7 +1131,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             Ok(())
         } else {
             Err(BridgeError::BadState(format!(
-                "{operation} requires a frozen Neo Geo machine; call pause first"
+                "{operation} requires a frozen machine; call pause first"
             )))
         }
     }

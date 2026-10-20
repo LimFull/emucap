@@ -1522,3 +1522,91 @@ fn batch_rejection_precedes_native_dispatch() {
         }
     }
 }
+
+#[test]
+fn taitof2_hello_advertises_program_space_and_generic_buttons() {
+    let mut bridge =
+        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "taitof2").unwrap();
+    let value = bridge.hello().unwrap();
+    assert_eq!(value["system"], "taitof2");
+    assert_eq!(value["memory_types"], json!(["program"]));
+    assert_eq!(
+        value["region_sizes"],
+        json!({"program": PROGRAM_SPACE_SIZE})
+    );
+    assert_eq!(
+        value["input_buttons"]["buttons"],
+        json!(TAITO_F2_INPUT_BUTTONS)
+    );
+    assert_eq!(value["capability_notes"]["initial_scope"], "taitof2");
+    let advertisement = crate::contracts::advertisement_from_hello(&value);
+    let methods = METHODS
+        .iter()
+        .map(|method| (*method).to_string())
+        .collect::<Vec<_>>();
+    let status = crate::contracts::validate_advertisement(
+        &advertisement,
+        Some("mame-neogeo-rust-gdb"),
+        Some("taitof2"),
+        &methods,
+    );
+    assert_eq!(status.state, "validated", "{:?}", status.errors);
+}
+
+#[test]
+fn taitof2_program_space_is_absolute_and_bounded() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["aabb", ""]),
+        GdbBridgeEnv::default(),
+        "taitof2",
+    )
+    .unwrap();
+    bridge.frozen = true;
+    let work_ram = bridge.handle_request(request(
+        1,
+        "read_memory",
+        json!({"memory_type":"program", "address":0x30_0000, "length":2}),
+    ));
+    assert!(work_ram.ok, "{:?}", work_ram.error);
+    assert_eq!(work_ram.result.unwrap()["hex"], "aabb");
+    for rejected in [
+        json!({"memory_type":"program", "address":0xff_ffff, "length":2}),
+        json!({"memory_type":"ram", "address":0, "length":1}),
+    ] {
+        let response = bridge.handle_request(request(2, "read_memory", rejected));
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+    }
+    let neogeo_button = bridge.handle_request(request(3, "set_input", json!({"buttons":["a"]})));
+    assert_eq!(neogeo_button.error.unwrap().kind, "bad_params");
+    let held = bridge.handle_request(request(
+        4,
+        "set_input",
+        json!({"buttons":["button3", "coin"]}),
+    ));
+    assert!(held.ok, "{:?}", held.error);
+    assert_eq!(
+        bridge.gdb.sent,
+        vec![
+            "m300000,2".to_string(),
+            format!("qEmucap,setinput,{}", hex::encode("button3,coin")),
+        ]
+    );
+
+    let exec = bridge.set_breakpoint(&json!({
+        "kind":"exec", "start":0x1000, "memory_type":"program", "pause_on_hit":true,
+    }));
+    assert!(!matches!(exec, Err(BridgeError::BadParams(_))), "{exec:?}");
+    let ram = bridge.set_breakpoint(&json!({"kind":"exec", "start":0x1000, "memory_type":"ram"}));
+    assert!(matches!(ram, Err(BridgeError::BadParams(_))));
+
+    let mut batch = featured("taitof2", &["OK|2@1.5|30|0102,ff"]);
+    batch
+        .read_memory_batch(&json!({"ranges":[
+            {"memory_type":"program","address":0x30_0010,"length":2},
+            {"memory_type":"program","address":0xff_ffff,"length":1}]}))
+        .unwrap();
+    assert_eq!(
+        batch.gdb.sent.last().unwrap(),
+        &format!("qEmucap,peekbatch,{}", hex::encode("300010:2,ffffff:1"))
+    );
+}

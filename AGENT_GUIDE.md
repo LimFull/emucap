@@ -419,6 +419,15 @@ The emucap patches provide native control while the guest is halted.
   frame control, frozen-frame screenshots, port-0 input, and native save/load (CDZ through
   a maintained MAME patch).
   → `adapters/mame-neogeo/README.md`
+- **MAME (Taito F2)** — build the dedicated pinned MAME subset with
+  `adapters/mame-taitof2/build.sh`, then build `emucap-mame-neogeo-bridge`; Taito F2 reuses
+  that 68000 bridge. Launch requires `system=taitof2` and a game `.zip` whose stem is the MAME
+  driver name; there is no BIOS, and a clone needs its parent set beside it. Memory is the whole
+  24-bit 68000 `program` space because work RAM moves between games. The profile shares the Neo
+  Geo debugger, frame, screenshot and native save/load surface, with port-0 `button1`..`button4`,
+  `start`, `coin`, `service` and directions. `EMUCAP_TAITOF2_MAME_BIN` selects another
+  maintained build.
+  → `adapters/mame-taitof2/README.md`
 - **Mupen64Plus (Nintendo 64)** — run
   `adapters/mupen64plus/build.sh`, then build `emucap-mupen64plus`. Standard cartridge
   ROMs need no BIOS. The current pure-interpreter adapter supports isolated headless or

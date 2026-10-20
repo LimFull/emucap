@@ -4,6 +4,16 @@ Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Unreleased
 
+### Added
+- Add the Taito F2 profile (`system=taitof2`) on a dedicated pinned MAME subset build. It reuses
+  the Neo Geo 68000 bridge with the whole 24-bit `program` space as memory, generic
+  `button1`..`button4` arcade inputs, and native save/load. Rebuild MAME adapters: patch `0020`
+  extends native raster-state preservation to palette-indexed screens.
+
+### Fixed
+- Stop owned MAME frame steps after exactly the requested frames on screens without a VBLANK
+  period, whose frame counter advances in the same callback as the frame notifier.
+
 ## 1.1.0
 
 ### Added

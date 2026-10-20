@@ -123,6 +123,34 @@ machine.state_io_boundary = true
 writes = {}; callbacks.periodic()
 assert(#writes == 0)
 assert(request("framefinish", "deadline") == "FRAME|deadline|interrupted|0|120|host_deadline")
+-- A screen without a VBLANK period increments its counter after the notifier in the same
+-- callback. One requested frame stops at that boundary instead of running a second frame.
+local until_vblank_end = 1 / 60
+screen.frame_period = 1 / 60
+screen.time_until_vblank_end = function()
+  return { as_double = function() return until_vblank_end end }
+end
+assert(request("framebegin", "zero:1:1000") == "FRAME|zero|running|0|1|none")
+machine.paused, machine.state_io_boundary = false, false
+writes = {}; callbacks.frame()
+assert(machine.paused and #writes == 0, "zero-VBLANK boundary did not complete the frame")
+screen.frame_number = 13
+machine.state_io_boundary = true
+callbacks.periodic()
+assert(request("framefinish", "zero") == "FRAME|zero|completed|1|1|none")
+-- A screen still inside VBLANK at its notifier keeps the counter it shows.
+until_vblank_end = 0.15 / 60
+assert(request("framebegin", "vblank:1:1000") == "FRAME|vblank|running|0|1|none")
+machine.paused, machine.state_io_boundary = false, false
+callbacks.frame()
+assert(not machine.paused, "in-VBLANK boundary was counted before its counter moved")
+screen.frame_number = 14
+callbacks.frame()
+assert(machine.paused)
+machine.state_io_boundary = true
+callbacks.periodic()
+assert(request("framefinish", "vblank") == "FRAME|vblank|completed|1|1|none")
+screen.time_until_vblank_end = nil
 -- Old native hosts cannot advertise or admit owned frames.
 machine.state_io_boundary = nil
 if profile == "neogeo_aes" then

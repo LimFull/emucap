@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "usage: emucap-mame-neogeo-bridge <EMUCAP_PORT> <neogeo_mvs|neogeo_aes|neogeo_cd> [GDB_HOST:PORT]"
+            "usage: emucap-mame-neogeo-bridge <EMUCAP_PORT> <neogeo_mvs|neogeo_aes|neogeo_cd|taitof2> [GDB_HOST:PORT]"
         );
         std::process::exit(2);
     }

@@ -71,15 +71,24 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                         "Neo Geo exec breakpoints require an exact address".into(),
                     ));
                 }
+                // A memory type spanning the whole program space is the same absolute view.
+                let (name, base, size) = self.profile.memory();
+                let program_view = base == 0 && size == PROGRAM_SPACE_SIZE;
                 if params
                     .get("memory_type")
                     .and_then(Value::as_str)
-                    .is_some_and(|memory_type| memory_type != "cpu")
+                    .is_some_and(|memory_type| {
+                        memory_type != "cpu" && !(program_view && memory_type == name)
+                    })
                 {
-                    return Err(BridgeError::BadParams(
-                        "Neo Geo exec breakpoints use an absolute 68000 address; memory_type may only be cpu"
-                            .into(),
-                    ));
+                    let allowed = if program_view {
+                        format!("cpu or {name}")
+                    } else {
+                        "cpu".into()
+                    };
+                    return Err(BridgeError::BadParams(format!(
+                        "exec breakpoints use an absolute 68000 address; memory_type may only be {allowed}"
+                    )));
                 }
                 if start > 0x00ff_ffff {
                     return Err(BridgeError::BadParams(
@@ -89,16 +98,6 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 (start, "bp")
             }
             "read" | "write" => {
-                let memory_type = params
-                    .get("memory_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("ram");
-                if memory_type != "ram" {
-                    return Err(BridgeError::BadParams(
-                        "Neo Geo read/write breakpoints currently support memory_type=ram only"
-                            .into(),
-                    ));
-                }
                 let span = end
                     .checked_sub(start)
                     .and_then(|value| value.checked_add(1))
@@ -106,7 +105,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 (
                     region_address(
                         self.profile,
-                        &json!({"memory_type":"ram", "address":start}),
+                        &json!({"memory_type":params.get("memory_type"), "address":start}),
                         span,
                     )?,
                     "wp",

@@ -61,7 +61,7 @@ The core exposes two MCP servers: **Control** drives the emulator, while optiona
 | PCSX2 | PlayStation 2 |
 | Dolphin | GameCube, Wii |
 | MAME / NP2kai | PC-98 |
-| MAME | Neo Geo MVS / AES / CD |
+| MAME | Neo Geo MVS / AES / CD, Taito F2 |
 | Mupen64Plus | Nintendo 64 |
 | openMSX | MSX1 / MSX2 / MSX2+ |
 | xemu | Original Xbox |

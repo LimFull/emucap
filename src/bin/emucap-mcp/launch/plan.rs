@@ -223,10 +223,33 @@ pub(super) fn dolphin_binary_precondition(root: &Path, display: bool) -> serde_j
 }
 
 pub(super) fn mame_neogeo_binary_precondition(root: &Path) -> serde_json::Value {
-    let repo_work = root.join("adapters/mame-neogeo/work");
-    simple_binary_precondition(mame_neogeo_launch::resolve_binary(root), |path| {
-        if env_path_matches("EMUCAP_NEOGEO_MAME_BIN", path) {
-            "EMUCAP_NEOGEO_MAME_BIN"
+    mame_68k_binary_precondition(
+        root,
+        mame_neogeo_launch::resolve_binary(root),
+        "EMUCAP_NEOGEO_MAME_BIN",
+        "adapters/mame-neogeo/work",
+    )
+}
+
+pub(super) fn mame_taitof2_binary_precondition(root: &Path) -> serde_json::Value {
+    mame_68k_binary_precondition(
+        root,
+        mame_neogeo_launch::resolve_taitof2_binary(root),
+        "EMUCAP_TAITOF2_MAME_BIN",
+        "adapters/mame-taitof2/work",
+    )
+}
+
+fn mame_68k_binary_precondition(
+    root: &Path,
+    binary: Option<PathBuf>,
+    env_key: &'static str,
+    work: &str,
+) -> serde_json::Value {
+    let repo_work = root.join(work);
+    simple_binary_precondition(binary, |path| {
+        if env_path_matches(env_key, path) {
+            env_key
         } else if env_path_matches("MAME_BIN", path) {
             "MAME_BIN"
         } else if path.starts_with(&repo_work) {
@@ -400,6 +423,7 @@ pub(super) fn adapter_binary_precondition_for(
         "dolphin" => dolphin_binary_precondition(root, display),
         "mame_pc98" => mame_binary_precondition(root),
         "mame_neogeo" => mame_neogeo_binary_precondition(root),
+        "mame_taitof2" => mame_taitof2_binary_precondition(root),
         "mupen64plus" => mupen64plus_precondition(root, display),
         "np2kai" => np2kai_precondition(root),
         "openmsx" => super::openmsx::precondition(root),
@@ -453,6 +477,12 @@ pub(super) fn build_required_precondition(
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/mame-neogeo/build.sh")
+        )),
+        "mame_taitof2" => serde_json::json!(format!(
+            "Build the pinned MAME with {} and build emucap-mame-neogeo-bridge.",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/mame-taitof2/build.sh")
         )),
         "mupen64plus" => serde_json::json!(format!(
             "Build the pinned debugger-enabled Mupen64Plus bundle with {} and build emucap-mupen64plus.",
@@ -995,7 +1025,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     let content_exists = Path::new(content_path).exists();
     let bridge = match adapter {
         "mame_pc98" => mame_bridge_precondition(&root),
-        "mame_neogeo" => neogeo_bridge_precondition(&root),
+        "mame_neogeo" | "mame_taitof2" => neogeo_bridge_precondition(&root),
         _ => serde_json::Value::Null,
     };
     let mut launch_blockers = launch_blockers(content_exists, &adapter_binary);
@@ -1063,12 +1093,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             }
         }
     }
-    let bridge_label = if adapter == "mame_neogeo" {
-        "mame_neogeo bridge"
-    } else {
-        "mame_pc98 bridge"
-    };
-    push_unavailable_precondition(&mut launch_blockers, bridge_label, &bridge);
+    let bridge_label = format!("{adapter} bridge");
+    push_unavailable_precondition(&mut launch_blockers, &bridge_label, &bridge);
     let ready_to_launch = launch_blockers.is_empty() && media_review_action.is_none();
     let next_action = if let Some(action) = media_review_action {
         action
@@ -1092,6 +1118,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "neogeo_mvs" => serde_json::json!("Requires MAME neogeo.zip BIOS and a game-specific MVS .zip ROM set. Set EMUCAP_NEOGEO_BIOS or place neogeo.zip beside the game set."),
         "neogeo_aes" => serde_json::json!("Requires MAME aes.zip and an AES-compatible cartridge .zip whose stem matches the pinned Neo Geo software list. Set EMUCAP_NEOGEO_AES_BIOS or place aes.zip beside the cartridge set."),
         "neogeo_cd" => serde_json::json!("Requires MAME neocdz.zip and a CUE whose referenced files all exist. Set EMUCAP_NEOGEO_CD_BIOS or place neocdz.zip beside the CUE."),
+        "taitof2" => serde_json::json!("No BIOS. Requires a game-specific MAME .zip set whose stem is the driver name; a clone also needs its parent set in the same directory."),
         "msx1" | "msx2" | "msx2p" => serde_json::json!("Requires the exact system ROMs for the pinned real-machine profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute directory, or place them under <emucap-data>/firmware/openmsx. The launcher verifies the pinned SHA-1 manifest before spawn."),
         "n64" => serde_json::Value::Null,
         "xbox" => serde_json::json!("Requires operator-owned mcpx_1.0.bin, Complex_4627.bin, and xbox_hdd.qcow2. An optional xemu_eeprom.bin seeds each generation; otherwise xemu creates a generation-local EEPROM. No machine files are distributed."),
@@ -1131,6 +1158,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It keeps pc9801rs cbus:0 empty unless pc98_sound_board is selected; do not run work/mame.raw or system mame directly."
         } else if adapter == "mame_neogeo" {
             "Neo Geo MVS, AES, and CD launch headless by default and use profile-specific emucap-owned MAME homes. launch(display:true) opens a window without reading or changing the user's MAME configuration."
+        } else if adapter == "mame_taitof2" {
+            "Taito F2 launches headless by default and uses an emucap-owned MAME home. launch(display:true) opens a window without reading or changing the user's MAME configuration."
         } else if adapter == "mupen64plus" {
             "Nintendo 64 launch is headless by default and uses an emucap-owned Mupen64Plus configuration. Both modes load the pinned Rice renderer; display controls window visibility."
         } else if adapter == "mednafen" {

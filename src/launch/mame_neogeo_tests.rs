@@ -113,7 +113,7 @@ fn headless_spec_uses_isolated_home_and_neogeo_profile() {
         bridge: Path::new("/bridge"),
         repo_root: root.path(),
         content: &game,
-        bios: &bios,
+        bios: Some(&bios),
         system: "neogeo_mvs",
         log_path: &log,
         port: 47822,
@@ -175,7 +175,7 @@ fn bridge_uses_the_runtime_generation_for_temporary_artifacts() {
         bridge: Path::new("/bridge"),
         repo_root: root.path(),
         content: &game,
-        bios: &bios,
+        bios: Some(&bios),
         system: "neogeo_mvs",
         log_path: &log,
         port: 47822,
@@ -207,7 +207,7 @@ fn visible_spec_explicitly_authorizes_the_safe_wrapper() {
         bridge: Path::new("/bridge"),
         repo_root: root.path(),
         content: &game,
-        bios: &bios,
+        bios: Some(&bios),
         system: "neogeo_mvs",
         log_path: &log,
         port: 47823,
@@ -263,7 +263,7 @@ fn aes_spec_uses_software_list_cartridge_and_a_separate_home() {
         bridge: Path::new("/bridge"),
         repo_root: root.path(),
         content: &game,
-        bios: &bios,
+        bios: Some(&bios),
         system: "neogeo_aes",
         log_path: &log,
         port: 47824,
@@ -309,7 +309,7 @@ fn aes_spec_rejects_missing_or_mvs_only_software_before_launch() {
         bridge: Path::new("/bridge"),
         repo_root: root.path(),
         content: &game,
-        bios: &bios,
+        bios: Some(&bios),
         system: "neogeo_aes",
         log_path: &log,
         port: 47824,
@@ -346,7 +346,7 @@ fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
         bridge: Path::new("/bridge"),
         repo_root: root.path(),
         content: &cue,
-        bios: &bios,
+        bios: Some(&bios),
         system: "neogeo_cd",
         log_path: &log,
         port: 47825,
@@ -370,4 +370,65 @@ fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
         .contains(&("EMUCAP_MAME_PROFILE".into(), "neogeo_cd".into())));
     assert!(spec.args.iter().any(|value| Path::new(value)
         .starts_with(root.path().join("emucap/mame-neogeo-cd/47825/manual"))));
+}
+
+#[test]
+fn taitof2_spec_needs_no_bios_and_uses_its_own_build_home_and_profile() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_TAITOF2_MAME_BIN", "MAME_BIN"]);
+    std::env::remove_var("EMUCAP_TAITOF2_MAME_BIN");
+    std::env::remove_var("MAME_BIN");
+    let root = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", root.path().join("emucap"));
+    let name = if cfg!(windows) { "mame.exe" } else { "mame" };
+    let neogeo = root.path().join("adapters/mame-neogeo/work").join(name);
+    let taitof2 = root.path().join("adapters/mame-taitof2/work").join(name);
+    std::fs::create_dir_all(neogeo.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(taitof2.parent().unwrap()).unwrap();
+    make_runnable(&neogeo);
+    make_runnable(&taitof2);
+    assert_eq!(resolve_taitof2_binary(root.path()), Some(taitof2));
+
+    let roms = root.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let game = roms.join("pulirulaj.zip");
+    std::fs::write(&game, b"game").unwrap();
+    assert_eq!(taitof2_driver(&game).unwrap(), "pulirulaj");
+    assert!(taitof2_driver(&roms.join("pulirula.7z")).is_err());
+    assert!(default_bios_candidates(&game, "taitof2").is_empty());
+    assert!(resolve_bios(&game, "taitof2").is_none());
+
+    let log = root.path().join("mame.log");
+    let launch = Launch {
+        binary: Path::new("/mame"),
+        bridge: Path::new("/bridge"),
+        repo_root: root.path(),
+        content: &game,
+        bios: None,
+        system: "taitof2",
+        log_path: &log,
+        port: 47822,
+        name: None,
+        session_token: None,
+        runtime: None,
+        display: false,
+    };
+    let spec = mame_spec(&launch, "pulirulaj", 48822, "native-token").unwrap();
+    // A clone resolves its parent set from the same rompath.
+    assert_eq!(
+        spec.args[..3],
+        [
+            "pulirulaj".to_string(),
+            "-rompath".into(),
+            roms.to_string_lossy().into_owned()
+        ]
+    );
+    assert!(!spec.args.iter().any(|v| v == "-bios"));
+    assert!(spec
+        .env
+        .contains(&("EMUCAP_MAME_PROFILE".into(), "taitof2".into())));
+    assert!(spec
+        .args
+        .iter()
+        .any(|v| Path::new(v).starts_with(root.path().join("emucap/mame-taitof2/47822/manual"))));
 }

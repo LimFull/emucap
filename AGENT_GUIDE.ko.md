@@ -344,6 +344,14 @@ emucap 패치는 guest가 정지한 상태에서도 네이티브 제어 요청�
   입력, native save/load(CDZ는 유지보수 MAME patch로)를 제공한다. 파일 확장자만 보고 어느
   Neo Geo profile로도 자동 판정하지 않는다.
   → `adapters/mame-neogeo/README.md`
+- **MAME Taito F2** — `adapters/mame-taitof2/build.sh`로 전용 고정 MAME subset을 빌드하고
+  `emucap-mame-neogeo-bridge`를 빌드한다. Taito F2는 이 68000 bridge를 재사용한다. 실행에는
+  `system=taitof2`와 ZIP stem이 MAME 드라이버 이름인 게임 `.zip`이 필요하다. BIOS는 없고,
+  clone set은 부모 set이 같은 디렉터리에 있어야 한다. 워크 RAM 위치가 게임마다 달라 메모리는
+  24-bit 68000 `program` 공간 전체로 노출한다. Neo Geo와 같은 debugger·프레임·스크린샷·native
+  save/load 범위를 제공하며 입력은 port-0 `button1`..`button4`, `start`, `coin`, `service`와
+  방향키다. 다른 유지보수 빌드는 `EMUCAP_TAITOF2_MAME_BIN`으로 지정한다.
+  → `adapters/mame-taitof2/README.md`
 - **Mupen64Plus Nintendo 64** — `adapters/mupen64plus/build.sh`를 실행하고
   `emucap-mupen64plus`를 빌드한다. 일반 카트리지 ROM은 BIOS가 필요 없다. 현재 pure interpreter로
   격리된 headless/창 실행, pause/resume, R4300 명령 스텝, CPU 상태, frozen RDRAM 제한 읽기·쓰기를

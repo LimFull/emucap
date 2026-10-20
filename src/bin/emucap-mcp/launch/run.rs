@@ -212,12 +212,12 @@ pub(crate) fn make_launch(
             if !bridge["available"].as_bool().unwrap_or(false) {
                 return missing_mame_bridge_response(system, port, &root, adapter_binary, bridge);
             }
-        } else if adapter == "mame_neogeo" {
+        } else if adapter == "mame_neogeo" || adapter == "mame_taitof2" {
             let bridge = neogeo_bridge_precondition(&root);
             if !bridge["available"].as_bool().unwrap_or(false) {
                 return serde_json::json!({
                     "launched": false,
-                    "reason": "mame_neogeo bridge is unavailable",
+                    "reason": format!("{adapter} bridge is unavailable"),
                     "system": system,
                     "adapter": adapter,
                     "preconditions": {
@@ -452,7 +452,7 @@ pub(crate) fn make_launch(
         "flycast" => launch_flycast(port, producer_key, runtime, effective_args),
         "mame_pc98" => launch_mame(port, producer_key, runtime, effective_args),
         "np2kai" => launch_np2kai(port, producer_key, runtime, effective_args),
-        "mame_neogeo" => super::mame_neogeo::launch_mame_neogeo(
+        "mame_neogeo" | "mame_taitof2" => super::mame_neogeo::launch_mame_neogeo(
             port,
             producer_key,
             runtime,

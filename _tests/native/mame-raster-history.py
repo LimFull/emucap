@@ -18,8 +18,8 @@ code = r'''
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
-using s32=int32_t; using u32=uint32_t; using u8=uint8_t;
-enum { BITMAP_FORMAT_RGB32=1, BLENDMODE_NONE=0 };
+using s32=int32_t; using u32=uint32_t; using u16=uint16_t; using u8=uint8_t;
+enum { BITMAP_FORMAT_RGB32=1, BITMAP_FORMAT_IND16=2, BLENDMODE_NONE=0 };
 #define PRIMFLAG_BLENDMODE(x) (x)
 #define PRIMFLAG_SCREENTEX(x) (x)
 struct emu_fatalerror : std::runtime_error {
@@ -34,9 +34,11 @@ template<class T> struct bitmap {
     T& pix(int y){return data.at(y*w);}
 };
 struct screen_bitmap : bitmap<u32> {
-    int kind=BITMAP_FORMAT_RGB32;
+    int kind=BITMAP_FORMAT_RGB32; bitmap<u16> ind16;
     int format()const{return kind;} int texformat()const{return 1;}
+    void resize(int width,int height){ bitmap<u32>::resize(width,height); ind16.resize(width,height); }
     bitmap<u32>& as_rgb32(){assert(kind==BITMAP_FORMAT_RGB32);return *this;}
+    bitmap<u16>& as_ind16(){assert(kind==BITMAP_FORMAT_IND16);return ind16;}
 };
 struct texture { screen_bitmap* source=nullptr; int bindings=0;
     void set_bitmap(screen_bitmap& b,rectangle,int){source=&b;++bindings;}
@@ -54,6 +56,7 @@ struct screen_device {
     bool m_changed=true;
     int m_partial_scan_hpos=2,reallocations=0;
     rgb_t m_color;
+    int m_format=BITMAP_FORMAT_RGB32; int format()const{return m_format;}
     std::vector<u32> m_state_bitmap[2]={std::vector<u32>(12),std::vector<u32>(12)};
     std::vector<u8> m_state_priority=std::vector<u8>(12);
     screen_bitmap m_bitmap[2]; bitmap<u8> m_priority;
@@ -106,6 +109,23 @@ int main(){
         bool failed=false;try{s.device_post_load();}catch(emu_fatalerror&){failed=true;}
         assert(failed && s.reallocations==0 && s.display.clears==0);
     }
+    {
+        // Indexed screens keep palette indices, not converted colors, across the same storage.
+        screen_device s;s.m_format=BITMAP_FORMAT_IND16;
+        for(auto& b:s.m_bitmap)b.kind=BITMAP_FORMAT_IND16;
+        s.m_bitmap[0].ind16.data={1,2,3,4,0x1fff,6};s.m_bitmap[1].ind16.data={11,12,13,14,15,0xffff};
+        s.device_pre_save();
+        for(auto& b:s.m_bitmap){b.resize(4,3);std::fill(b.ind16.data.begin(),b.ind16.data.end(),99);}
+        s.device_post_load();
+        assert((s.m_bitmap[0].ind16.data==std::vector<u16>{1,2,3,4,0x1fff,6}));
+        assert((s.m_bitmap[1].ind16.data==std::vector<u16>{11,12,13,14,15,0xffff}));
+        assert(s.display.presented==s.m_texture[s.m_curtexture]);
+    }
+    {
+        screen_device mixed;mixed.m_format=BITMAP_FORMAT_IND16;
+        bool failed=false;try{mixed.device_pre_save();}catch(emu_fatalerror&){failed=true;}
+        assert(failed);
+    }
     screen_device inconsistent;inconsistent.m_bitmap[1].resize(2,2);
     bool failed=false;try{inconsistent.device_pre_save();}catch(emu_fatalerror&){failed=true;}
     assert(failed && inconsistent.m_bitmap[0].width()==3);
@@ -118,4 +138,4 @@ with tempfile.TemporaryDirectory(prefix='mame-raster-history-') as temp:
     cpp=Path(temp)/'test.cpp';exe=Path(temp)/'test';cpp.write_text(code)
     subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(cpp),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-print('Native raster preservation, both display indices, stable storage and geometry rejection pass')
+print('Native raster preservation, both display indices, indexed pixels, stable storage and geometry rejection pass')

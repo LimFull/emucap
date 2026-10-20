@@ -23,8 +23,8 @@ Flycast
 MAME
   Upstream: https://github.com/mamedev/mame
   License:  GPL-2.0-or-later as a whole (majority of files BSD-3-Clause)
-  Used by:  adapters/mame-pc98 and adapters/mame-neogeo
-            (patches + Lua plugin + GDB bridges; PC-98 and Neo Geo MVS/AES/CD)
+  Used by:  adapters/mame-pc98, adapters/mame-neogeo and adapters/mame-taitof2
+            (patches + Lua plugin + GDB bridges; PC-98, Neo Geo MVS/AES/CD and Taito F2)
   Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
 
 NP2kai

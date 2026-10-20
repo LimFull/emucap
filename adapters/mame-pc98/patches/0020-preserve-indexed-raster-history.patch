@@ -1,0 +1,80 @@
+--- a/src/emu/screen.cpp
++++ b/src/emu/screen.cpp
+@@ -893,7 +893,7 @@
+ 	save_item(NAME(m_frame_number));
+ 	if (m_state_max_width > 0 && m_state_max_height > 0)
+ 	{
+-		if (m_type != SCREEN_TYPE_RASTER || format() != BITMAP_FORMAT_RGB32 ||
++		if (m_type != SCREEN_TYPE_RASTER || (format() != BITMAP_FORMAT_RGB32 && format() != BITMAP_FORMAT_IND16) ||
+ 				(m_video_attributes & (VIDEO_SELF_RENDER | VIDEO_VARIABLE_WIDTH)))
+ 			throw emu_fatalerror("%s: unsupported native raster-state format", tag());
+ 		size_t const pixels = size_t(m_state_max_width) * size_t(m_state_max_height);
+@@ -972,7 +972,7 @@
+ 		throw emu_fatalerror("%s: invalid native raster-state geometry", tag());
+ 	for (unsigned i = 0; i != 2; ++i)
+ 	{
+-		if (m_bitmap[i].format() != BITMAP_FORMAT_RGB32 ||
++		if (m_bitmap[i].format() != format() ||
+ 				m_bitmap[i].width() != m_state_bitmap_width || m_bitmap[i].height() != m_state_bitmap_height)
+ 			throw emu_fatalerror("%s: inconsistent native raster buffers", tag());
+ 	}
+@@ -982,8 +982,14 @@
+ 	{
+ 		std::fill(m_state_bitmap[i].begin(), m_state_bitmap[i].end(), 0);
+ 		for (s32 y = 0; y != m_state_bitmap_height; ++y)
+-			std::copy_n(&m_bitmap[i].as_rgb32().pix(y), m_state_bitmap_width,
+-				&m_state_bitmap[i][size_t(y) * m_state_max_width]);
++		{
++			// Indexed pixels are widened into the same stable registration.
++			u32 *const dest = &m_state_bitmap[i][size_t(y) * m_state_max_width];
++			if (format() == BITMAP_FORMAT_IND16)
++				std::copy_n(&m_bitmap[i].as_ind16().pix(y), m_state_bitmap_width, dest);
++			else
++				std::copy_n(&m_bitmap[i].as_rgb32().pix(y), m_state_bitmap_width, dest);
++		}
+ 	}
+ 	std::fill(m_state_priority.begin(), m_state_priority.end(), 0);
+ 	for (s32 y = 0; y != m_state_bitmap_height; ++y)
+@@ -1010,8 +1016,14 @@
+ 	{
+ 		for (unsigned i = 0; i != 2; ++i)
+ 			for (s32 y = 0; y != m_state_bitmap_height; ++y)
+-				std::copy_n(&m_state_bitmap[i][size_t(y) * m_state_max_width], m_state_bitmap_width,
+-					&m_bitmap[i].as_rgb32().pix(y));
++			{
++				u32 const *const src = &m_state_bitmap[i][size_t(y) * m_state_max_width];
++				if (format() == BITMAP_FORMAT_IND16)
++					std::transform(src, src + m_state_bitmap_width, &m_bitmap[i].as_ind16().pix(y),
++						[] (u32 pixel) { return u16(pixel); });
++				else
++					std::copy_n(src, m_state_bitmap_width, &m_bitmap[i].as_rgb32().pix(y));
++			}
+ 		for (s32 y = 0; y != m_state_bitmap_height; ++y)
+ 			std::copy_n(&m_state_priority[size_t(y) * m_state_max_width], m_state_bitmap_width, &m_priority.pix(y));
+ 		publish_restored_raster();
+--- a/src/mame/taito/taito_f2.cpp
++++ b/src/mame/taito/taito_f2.cpp
+@@ -2788,6 +2788,7 @@
+ 	m_screen->set_vblank_time(ATTOSECONDS_IN_USEC(0));  /* frames per second, vblank duration */
+ 	m_screen->set_size(40*8, 32*8);
+ 	m_screen->set_visarea(0*8, 40*8-1, 2*8, 30*8-1);
++	m_screen->set_raster_state_bounds(40*8, 32*8);
+ 	m_screen->set_screen_update(FUNC(taitof2_state::screen_update));
+ 	m_screen->screen_vblank().set(FUNC(taitof2_state::screen_vblank_no_buffer));
+ 	m_screen->set_palette(m_palette);
+@@ -3506,6 +3507,7 @@
+ 	m_screen->set_vblank_time(ATTOSECONDS_IN_USEC(0));
+ 	m_screen->set_size(40*8, 32*8);
+ 	m_screen->set_visarea(0*8, 40*8-1, 2*8, 30*8-1);
++	m_screen->set_raster_state_bounds(40*8, 32*8);
+ 	m_screen->set_screen_update(FUNC(cameltry_state::screen_update_pri_roz));
+ 	m_screen->screen_vblank().set(FUNC(cameltry_state::screen_vblank_partial_buffer_delayed));
+ 	m_screen->set_palette(m_palette);
+@@ -3568,6 +3570,7 @@
+ 	m_screen->set_vblank_time(ATTOSECONDS_IN_USEC(0));
+ 	m_screen->set_size(40*8, 32*8);
+ 	m_screen->set_visarea(0*8, 40*8-1, 2*8, 30*8-1);
++	m_screen->set_raster_state_bounds(40*8, 32*8);
+ 	m_screen->set_screen_update(FUNC(driveout_state::screen_update_pri_roz));
+ 	m_screen->screen_vblank().set(FUNC(driveout_state::screen_vblank_no_buffer));
+ 	m_screen->set_palette(m_palette);

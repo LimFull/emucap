@@ -195,7 +195,7 @@ fn neogeo_call_stack_advertises_frozen_best_effort_boundary() {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    for system in ["neogeo_mvs", "neogeo_aes", "neogeo_cd"] {
+    for system in ["neogeo_mvs", "neogeo_aes", "neogeo_cd", "taitof2"] {
         let status =
             validate_advertisement(&ad, Some("mame-neogeo-rust-gdb"), Some(system), &methods);
         assert_eq!(status.state, "validated", "{:?}", status.errors);

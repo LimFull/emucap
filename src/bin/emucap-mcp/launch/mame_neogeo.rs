@@ -1,7 +1,8 @@
 use super::plan::adapter_log_path;
 use super::*;
 
-/// Neo Geo MVS/AES/CD leg of `make_launch`: spawn isolated MAME and the dedicated 68000 bridge.
+/// Neo Geo MVS/AES/CD and Taito F2 leg of `make_launch`: spawn isolated MAME and the shared
+/// 68000 bridge.
 pub(super) fn launch_mame_neogeo(
     port: u16,
     token: Option<&str>,
@@ -13,13 +14,24 @@ pub(super) fn launch_mame_neogeo(
         return serde_json::json!({ "launched": false, "error": "emucap repo root not found; set EMUCAP_REPO_ROOT" });
     };
     let content = Path::new(&args.content_path);
-    let Some(binary) = mame_neogeo_launch::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "Neo Geo MAME binary not found; run adapters/mame-neogeo/build.sh or set EMUCAP_NEOGEO_MAME_BIN" });
+    let taitof2 = system == "taitof2";
+    let binary = if taitof2 {
+        mame_neogeo_launch::resolve_taitof2_binary(&root)
+    } else {
+        mame_neogeo_launch::resolve_binary(&root)
+    };
+    let Some(binary) = binary else {
+        return if taitof2 {
+            serde_json::json!({ "launched": false, "reason": "Taito F2 MAME binary not found; run adapters/mame-taitof2/build.sh or set EMUCAP_TAITOF2_MAME_BIN" })
+        } else {
+            serde_json::json!({ "launched": false, "reason": "Neo Geo MAME binary not found; run adapters/mame-neogeo/build.sh or set EMUCAP_NEOGEO_MAME_BIN" })
+        };
     };
     let Some(bridge) = mame_neogeo_launch::resolve_bridge(&root) else {
         return serde_json::json!({ "launched": false, "reason": "Neo Geo bridge binary not found; build emucap-mame-neogeo-bridge or set EMUCAP_NEOGEO_BRIDGE_BIN" });
     };
-    let Some(bios) = mame_neogeo_launch::resolve_bios(content, system) else {
+    let bios = mame_neogeo_launch::resolve_bios(content, system);
+    if bios.is_none() && !taitof2 {
         return match system {
             "neogeo_aes" => serde_json::json!({
                 "launched": false,
@@ -37,8 +49,13 @@ pub(super) fn launch_mame_neogeo(
                 "next_action": "set EMUCAP_NEOGEO_BIOS to neogeo.zip or place it beside the game ROM set",
             }),
         };
+    }
+    let log_name = if taitof2 {
+        "mame-taitof2.log"
+    } else {
+        "mame-neogeo.log"
     };
-    let log = match adapter_log_path(port, runtime, "mame-neogeo.log") {
+    let log = match adapter_log_path(port, runtime, log_name) {
         Ok(path) => path,
         Err(error) => return serde_json::json!({"launched": false, "error": error.to_string()}),
     };
@@ -48,7 +65,7 @@ pub(super) fn launch_mame_neogeo(
         bridge: &bridge,
         repo_root: &root,
         content,
-        bios: &bios,
+        bios: bios.as_deref(),
         system,
         log_path: &log,
         port,
@@ -60,7 +77,7 @@ pub(super) fn launch_mame_neogeo(
     match mame_neogeo_launch::launch(&launch) {
         Ok(launched) => serde_json::json!({
             "launched": true,
-            "adapter": "mame_neogeo",
+            "adapter": if taitof2 { "mame_taitof2" } else { "mame_neogeo" },
             "pid": launched.mame_pid,
             "mame_pid": launched.mame_pid,
             "bridge_pid": launched.bridge_pid,
@@ -69,7 +86,7 @@ pub(super) fn launch_mame_neogeo(
             "gdb_port": launched.gdb_port,
             "port": port,
             "binary": binary.display().to_string(),
-            "bios": bios.display().to_string(),
+            "bios": bios.as_ref().map(|path| path.display().to_string()),
             "log": log.display().to_string(),
             "next_action": "launch returns after the adapter connects",
         }),

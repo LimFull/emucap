@@ -1,4 +1,4 @@
-//! Isolated MAME launcher for the Neo Geo MVS, AES, and CD adapters.
+//! Isolated MAME launcher for the Neo Geo MVS, AES, CD, and Taito F2 adapters.
 
 use super::{
     find_on_path, first_existing_file, spawn_detached, terminate_detached, LaunchSpec, RuntimeEnv,
@@ -12,7 +12,8 @@ pub struct Launch<'a> {
     pub bridge: &'a Path,
     pub repo_root: &'a Path,
     pub content: &'a Path,
-    pub bios: &'a Path,
+    /// System BIOS set; Taito F2 boards have none.
+    pub bios: Option<&'a Path>,
     pub system: &'a str,
     pub log_path: &'a Path,
     pub port: u16,
@@ -27,6 +28,7 @@ enum NeoGeoSystem {
     Mvs,
     Aes,
     Cd,
+    TaitoF2,
 }
 
 impl NeoGeoSystem {
@@ -35,18 +37,21 @@ impl NeoGeoSystem {
             "neogeo_mvs" => Ok(Self::Mvs),
             "neogeo_aes" => Ok(Self::Aes),
             "neogeo_cd" => Ok(Self::Cd),
+            "taitof2" => Ok(Self::TaitoF2),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("unsupported Neo Geo system: {system}"),
+                format!("unsupported MAME 68000 system: {system}"),
             )),
         }
     }
 
-    fn bios_name(self) -> &'static str {
+    /// Display label and file name of the required BIOS set.
+    fn bios(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Self::Mvs => "neogeo.zip",
-            Self::Aes => "aes.zip",
-            Self::Cd => "neocdz.zip",
+            Self::Mvs => Some(("MVS", "neogeo.zip")),
+            Self::Aes => Some(("AES", "aes.zip")),
+            Self::Cd => Some(("CDZ", "neocdz.zip")),
+            Self::TaitoF2 => None,
         }
     }
 
@@ -61,6 +66,7 @@ impl NeoGeoSystem {
                 crate::cue::validate_graph(content)?;
                 Ok("neocdz".into())
             }
+            Self::TaitoF2 => taitof2_driver(content),
         }
     }
 
@@ -69,6 +75,7 @@ impl NeoGeoSystem {
             Self::Mvs => "mame-neogeo",
             Self::Aes => "mame-neogeo-aes",
             Self::Cd => "mame-neogeo-cd",
+            Self::TaitoF2 => "mame-taitof2",
         }
     }
 
@@ -77,6 +84,7 @@ impl NeoGeoSystem {
             Self::Mvs => "neogeo_mvs",
             Self::Aes => "neogeo_aes",
             Self::Cd => "neogeo_cd",
+            Self::TaitoF2 => "taitof2",
         }
     }
 }
@@ -90,27 +98,39 @@ pub struct Launched {
 }
 
 pub fn resolve_binary(repo_root: &Path) -> Option<PathBuf> {
-    for key in ["EMUCAP_NEOGEO_MAME_BIN", "MAME_BIN"] {
+    resolve_binary_in(
+        repo_root,
+        "EMUCAP_NEOGEO_MAME_BIN",
+        "adapters/mame-neogeo/work",
+    )
+}
+
+/// Taito F2 owns a separate MAME subset build, so a Neo Geo build never satisfies it.
+pub fn resolve_taitof2_binary(repo_root: &Path) -> Option<PathBuf> {
+    resolve_binary_in(
+        repo_root,
+        "EMUCAP_TAITOF2_MAME_BIN",
+        "adapters/mame-taitof2/work",
+    )
+}
+
+fn resolve_binary_in(repo_root: &Path, env_key: &str, work: &str) -> Option<PathBuf> {
+    for key in [env_key, "MAME_BIN"] {
         if let Some(explicit) = std::env::var_os(key).map(PathBuf::from) {
             if super::is_runnable_file(&explicit) {
                 return Some(explicit);
             }
         }
     }
-    if let Some(local) = repo_local_binary(repo_root) {
+    let name = if cfg!(windows) { "mame.exe" } else { "mame" };
+    let local = repo_root.join(work).join(name);
+    if super::is_runnable_file(&local) {
         return Some(local);
     }
     if let Some(default) = first_existing_file(super::mame::default_install_candidates()) {
         return Some(default);
     }
     find_on_path("mame")
-}
-
-fn repo_local_binary(repo_root: &Path) -> Option<PathBuf> {
-    let work = repo_root.join("adapters/mame-neogeo/work");
-    let name = if cfg!(windows) { "mame.exe" } else { "mame" };
-    let path = work.join(name);
-    super::is_runnable_file(&path).then_some(path)
 }
 
 pub fn resolve_bridge(repo_root: &Path) -> Option<PathBuf> {
@@ -138,10 +158,12 @@ pub fn resolve_bridge(repo_root: &Path) -> Option<PathBuf> {
 }
 
 pub fn default_bios_candidates(content: &Path, system: &str) -> Vec<PathBuf> {
-    let Ok(system) = NeoGeoSystem::parse(system) else {
+    let Some((_, bios_name)) = NeoGeoSystem::parse(system)
+        .ok()
+        .and_then(NeoGeoSystem::bios)
+    else {
         return Vec::new();
     };
-    let bios_name = system.bios_name();
     let mut candidates = Vec::new();
     if content.file_name().and_then(|v| v.to_str()) == Some(bios_name) {
         candidates.push(content.to_path_buf());
@@ -171,6 +193,7 @@ pub fn resolve_bios(content: &Path, system: &str) -> Option<PathBuf> {
         NeoGeoSystem::Mvs => "EMUCAP_NEOGEO_BIOS",
         NeoGeoSystem::Aes => "EMUCAP_NEOGEO_AES_BIOS",
         NeoGeoSystem::Cd => "EMUCAP_NEOGEO_CD_BIOS",
+        NeoGeoSystem::TaitoF2 => return None,
     };
     if let Some(explicit) = std::env::var_os(env_key) {
         let path = PathBuf::from(explicit);
@@ -182,18 +205,26 @@ pub fn resolve_bios(content: &Path, system: &str) -> Option<PathBuf> {
 }
 
 pub fn mvs_driver(content: &Path) -> std::io::Result<String> {
-    zip_stem(content, "MVS ROM set", "MAME driver")
+    zip_stem(content, "Neo Geo MVS ROM set", "MAME driver")
+}
+
+pub fn taitof2_driver(content: &Path) -> std::io::Result<String> {
+    zip_stem(content, "Taito F2 ROM set", "MAME driver")
 }
 
 pub fn aes_software_name(content: &Path) -> std::io::Result<String> {
-    zip_stem(content, "AES cartridge software-list set", "MAME software")
+    zip_stem(
+        content,
+        "Neo Geo AES cartridge software-list set",
+        "MAME software",
+    )
 }
 
 fn zip_stem(content: &Path, media_name: &str, stem_name: &str) -> std::io::Result<String> {
     if !content.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Neo Geo {media_name} not found: {}", content.display()),
+            format!("{media_name} not found: {}", content.display()),
         ));
     }
     if !content
@@ -203,7 +234,7 @@ fn zip_stem(content: &Path, media_name: &str, stem_name: &str) -> std::io::Resul
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("Neo Geo {media_name} must be a MAME .zip set"),
+            format!("{media_name} must be a MAME .zip set"),
         ));
     }
     let driver = content
@@ -297,13 +328,17 @@ fn gdb_port(port: u16) -> std::io::Result<u16> {
     })
 }
 
-fn rompath(content: &Path, bios: &Path) -> std::io::Result<String> {
+fn rompath(content: &Path, bios: Option<&Path>) -> std::io::Result<String> {
     let content_dir = content.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Neo Geo content has no parent directory",
+            "MAME content has no parent directory",
         )
     })?;
+    // Clone sets resolve their parent set from the same directory.
+    let Some(bios) = bios else {
+        return Ok(content_dir.to_string_lossy().into_owned());
+    };
     let bios_dir = bios.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -354,10 +389,12 @@ fn mame_spec_in_home(
     let pluginspath = launch.repo_root.join("adapters/mame-pc98/plugins");
     let mut args = vec![driver.into(), "-rompath".into()];
     args.push(match system {
-        NeoGeoSystem::Mvs | NeoGeoSystem::Aes => rompath(launch.content, launch.bios)?,
+        NeoGeoSystem::Mvs | NeoGeoSystem::Aes | NeoGeoSystem::TaitoF2 => {
+            rompath(launch.content, launch.bios)?
+        }
         NeoGeoSystem::Cd => launch
             .bios
-            .parent()
+            .and_then(Path::parent)
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -511,22 +548,19 @@ fn bridge_spec_in_home(
 pub fn launch(launch: &Launch<'_>) -> std::io::Result<Launched> {
     let system = NeoGeoSystem::parse(launch.system)?;
     let driver = system.driver(launch.content)?;
-    if launch.bios.file_name().and_then(|v| v.to_str()) != Some(system.bios_name())
-        || !launch.bios.is_file()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "Neo Geo {} BIOS must be an existing {}: {}",
-                match system {
-                    NeoGeoSystem::Mvs => "MVS",
-                    NeoGeoSystem::Aes => "AES",
-                    NeoGeoSystem::Cd => "CDZ",
-                },
-                system.bios_name(),
-                launch.bios.display()
-            ),
-        ));
+    if let Some((label, bios_name)) = system.bios() {
+        let valid = launch.bios.is_some_and(|bios| {
+            bios.file_name().and_then(|v| v.to_str()) == Some(bios_name) && bios.is_file()
+        });
+        if !valid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Neo Geo {label} BIOS must be an existing {bios_name}: {}",
+                    launch.bios.unwrap_or(Path::new("")).display()
+                ),
+            ));
+        }
     }
     let port = gdb_port(launch.port)?;
     let native_debug_token = super::new_native_debug_token();

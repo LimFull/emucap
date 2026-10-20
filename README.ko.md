@@ -59,7 +59,7 @@ Intel macOS는 소스 빌드로 사용할 수 있습니다. 에뮬레이터 어�
 | PCSX2 | PlayStation 2 |
 | Dolphin | GameCube, Wii |
 | MAME / NP2kai | PC-98 |
-| MAME | Neo Geo MVS / AES / CD |
+| MAME | Neo Geo MVS / AES / CD, Taito F2 |
 | Mupen64Plus | Nintendo 64 |
 | openMSX | MSX1 / MSX2 / MSX2+ |
 | xemu | 원본 Xbox |

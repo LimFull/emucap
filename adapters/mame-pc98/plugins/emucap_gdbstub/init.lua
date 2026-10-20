@@ -59,11 +59,13 @@ regmaps.pentium = regmaps.i386
 local reset_subscription, stop_subscription, frame_subscription
 local pre_save_subscription, post_load_subscription
 local mame_profile = os.getenv("EMUCAP_MAME_PROFILE") or "pc98"
-local is_neogeo_profile =
+-- Profiles served by the 68000 bridge: native state I/O, owned frames and arcade input names.
+local is_m68k_profile =
   mame_profile == "neogeo"
   or mame_profile == "neogeo_mvs"
   or mame_profile == "neogeo_aes"
   or mame_profile == "neogeo_cd"
+  or mame_profile == "taitof2"
 local input_aliases = {
   escape = "esc",
   return_key = "enter",
@@ -167,10 +169,10 @@ end
 local function norm_key(str)
   local s = trim(str):lower()
   s = s:gsub("%s+", " ")
-  if is_neogeo_profile and (s == "start" or s == "select") then
+  if is_m68k_profile and (s == "start" or s == "select") then
     return s
   end
-  if not is_neogeo_profile then
+  if not is_m68k_profile then
     local digit = s:match("^([0-9]) %(pad%)$")
       or s:match("^numpad([0-9])$")
       or s:match("^kp_?([0-9])$")
@@ -185,13 +187,16 @@ end
 -- starting MAME. Runtime field discovery below uses the same function.
 exports.canonical_input_name = norm_key
 
-local function neogeo_input_name(field)
+local function m68k_input_name(field)
   if field.player ~= 0 then
     return nil
   end
   local name = trim(field.name):lower()
   local button = name:match("^p1 ([abcd])$")
   if button then return button end
+  -- Taito F2 keeps MAME's generic button names.
+  local number = name:match("^p1 button ([1-4])$")
+  if number then return "button" .. number end
   local direction = name:match("^p1 (%a+)$")
   if direction == "up" or direction == "down" or direction == "left" or direction == "right" then
     return direction
@@ -301,10 +306,10 @@ function emucap_gdbstub.startplugin()
 
   -- frame-target 명령은 응답 수명주기와 임시 입력 소유권을 함께 끝낸다. press가 완료되거나
   -- breakpoint/stop/reset으로 중단될 때 입력만 남아 네이티브 키보드를 덮지 않게 한 곳에서 해제한다.
-  local function clear_frame_wait()
+  local function clear_frame_wait(observed_frame)
     local release_input = frame_wait_release_input
     if frame_owner and frame_wait_target then
-      local done = current_frame() - frame_owner.start_frame
+      local done = (observed_frame or current_frame()) - frame_owner.start_frame
       if done < 0 or done > frame_owner.requested then
         control_unverified = true
       else
@@ -452,8 +457,8 @@ function emucap_gdbstub.startplugin()
     local discovered_pointers = {}
     for tag, port in pairs(manager.machine.ioport.ports) do
       for _, field in pairs(port.fields) do
-        if is_neogeo_profile then
-          local key = neogeo_input_name(field)
+        if is_m68k_profile then
+          local key = m68k_input_name(field)
           if key and not discovered_inputs[key] then
             discovered_inputs[key] = field
           end
@@ -544,7 +549,7 @@ function emucap_gdbstub.startplugin()
       finish_pending_reset_reply("E05")
       return
     end
-    if is_neogeo_profile then
+    if is_m68k_profile then
       local stack_ok, stack_error = pcall(function()
         cpu.debug:callstack_enable(true)
         cpu.debug:callstack_clear(true)
@@ -689,7 +694,7 @@ function emucap_gdbstub.startplugin()
   end)
 
   post_load_subscription = emu.add_machine_post_load_notifier(function()
-    if is_neogeo_profile and cpu then
+    if is_m68k_profile and cpu then
       local stack_ok, stack_error = pcall(function() cpu.debug:callstack_clear(false) end)
       if not stack_ok then
         print("emucap_gdbstub: call stack clear after load failed " .. tostring(stack_error))
@@ -1152,6 +1157,24 @@ function emucap_gdbstub.startplugin()
     return 0
   end
 
+  -- Frame completed by the boundary whose notifier is running. A screen without a VBLANK period,
+  -- or one that updates after VBLANK, increments its counter later in this same callback, so a
+  -- settled stop observes one frame more than the counter shows here. Other screens are still
+  -- inside VBLANK, and their counter moves only after the stop.
+  local function boundary_frame()
+    local frame = current_frame()
+    local screen = first_screen()
+    if screen and screen.time_until_vblank_end then
+      local ok, pending = pcall(function()
+        return screen:time_until_vblank_end():as_double() >= screen.frame_period / 2
+      end)
+      if ok and pending then
+        return frame + 1
+      end
+    end
+    return frame
+  end
+
   local function start_frame_wait(frames, stop_on_done, release_input_on_done)
     if frame_wait_target or frame_owner then
       return false
@@ -1183,11 +1206,11 @@ function emucap_gdbstub.startplugin()
     if not frame_wait_target then
       return
     end
-    local reached, done
+    local reached, done, frame_now
     if frame_wait_stop and frame_wait_screen_start then
-      local frame_now = current_frame()
+      frame_now = boundary_frame()
       if frame_now < frame_wait_screen_start then
-        clear_frame_wait()
+        clear_frame_wait(frame_now)
         if native_state_io_available() then
           request_settled_stop({ payload = "E15" })
           return
@@ -1207,7 +1230,7 @@ function emucap_gdbstub.startplugin()
     end
     if not reached then
       if frame_wait_deadline and emu.osd_ticks() >= frame_wait_deadline then
-        clear_frame_wait()
+        clear_frame_wait(frame_now)
         if native_state_io_available() then
           request_settled_stop({ payload = "DEADLINE:" .. tostring(done) })
           return
@@ -1224,7 +1247,7 @@ function emucap_gdbstub.startplugin()
 
     local should_stop = frame_wait_stop
     local probe = frame_wait_probe
-    clear_frame_wait()
+    clear_frame_wait(frame_now)
     if should_stop and native_state_io_available() then
       request_settled_stop({ probe = probe, payload = "OK" })
       return
@@ -1579,7 +1602,7 @@ function emucap_gdbstub.startplugin()
       local spec = hex_to_string(rest or "") or ""
       local id, count, budget = spec:match("^([%w_%-]+):(%d+):(%d+)$")
       count, budget = tonumber(count), tonumber(budget)
-      if (is_neogeo_profile and not native_state_io_available()) or not id or #id > 128 or not count or count < 1 or count > 5000
+      if (is_m68k_profile and not native_state_io_available()) or not id or #id > 128 or not count or count < 1 or count > 5000
           or not budget or budget < 100 or budget > 240000 then
         ack_packet(socket, "E00")
       elseif frame_owner or frame_wait_target or running or not manager.machine.paused then
@@ -1636,7 +1659,7 @@ function emucap_gdbstub.startplugin()
       local space = cpu and cpu.spaces["program"]
       local video = manager.machine.video
       local features = {}
-      if not is_neogeo_profile or native_state_io_available() then
+      if not is_m68k_profile or native_state_io_available() then
         features[#features + 1] = "owned_frames_v1"
         features[#features + 1] = "halt_state_v1"
       end
@@ -1894,7 +1917,7 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E03")
       end
       return true
-    elseif (name == "savesync" or name == "loadsync") and is_neogeo_profile then
+    elseif (name == "savesync" or name == "loadsync") and is_m68k_profile then
       local path = hex_to_string(rest or "")
       if not native_state_io_available() or not native_raster_state_available() then
         ack_packet(socket, "STATE:unsupported")
@@ -2235,7 +2258,7 @@ function emucap_gdbstub.startplugin()
       service_frozen_socket()
       return true
     elseif name == "callstack" then
-      if not is_neogeo_profile or not cpu or running then
+      if not is_m68k_profile or not cpu or running then
         ack_packet(socket, "E1A")
         return true
       end
@@ -2456,14 +2479,14 @@ function emucap_gdbstub.startplugin()
       end
       -- Cancelling a legacy PC-98 wait must remove its target before entering the
       -- frozen socket loop, otherwise that target immediately releases the pause.
-      if not is_neogeo_profile or frame_owner then
+      if not is_m68k_profile or frame_owner then
         clear_frame_wait()
         if frame_owner then frame_reply("CANCELLED") end
       end
       debugger.execution_state = "stop"
       running = false
       hold_requested = true
-      if not is_neogeo_profile and not in_frozen_socket_service then
+      if not is_m68k_profile and not in_frozen_socket_service then
         pending_interrupt_reply = "S05"
         service_frozen_socket()
       else

@@ -466,6 +466,10 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "build": abs_path_json(&root, &["adapters", "mame-neogeo", "build.sh"]),
                 "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
             },
+            "mame_taitof2": {
+                "build": abs_path_json(&root, &["adapters", "mame-taitof2", "build.sh"]),
+                "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
+            },
             "mupen64plus": {
                 "build": abs_path_json(&root, &["adapters", "mupen64plus", "build.sh"]),
                 "adapter_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mupen64plus.exe" } else { "emucap-mupen64plus" }]),
@@ -657,6 +661,13 @@ fn build_supported_systems_value() -> serde_json::Value {
             "content": ["cue"],
             "required_firmware": ["neocdz.zip"],
             "notes": "CUE is ambiguous; pass system=neogeo_cd explicitly. The content identity covers the CUE and every referenced file. Native save/load is not advertised."
+        },
+        {
+            "system": "taitof2",
+            "aliases": ["taito_f2", "taito-f2"],
+            "adapter": "mame_taitof2",
+            "content": ["zip"],
+            "notes": ".zip is not auto-inferred; pass system=taitof2 explicitly. The ZIP stem selects the MAME driver; a clone needs its parent set beside it. Memory is the whole 24-bit 68000 program space because work RAM moves between games."
         },
         {
             "system": "dc",

@@ -72,25 +72,24 @@ pub(super) fn region_address(
     params: &Value,
     length: u64,
 ) -> BridgeResult<u64> {
+    let (name, base, size) = profile.memory();
     let memory_type = params
         .get("memory_type")
         .and_then(Value::as_str)
-        .unwrap_or("ram");
-    if memory_type != "ram" {
+        .unwrap_or(name);
+    if memory_type != name {
         return Err(BridgeError::BadParams(format!(
-            "unsupported Neo Geo memory_type: {memory_type}"
+            "unsupported memory_type: {memory_type}; this profile supports {name}"
         )));
     }
     let offset = required_num(params, "address")?;
-    let (ram_base, ram_size) = profile.ram();
-    if !matches!(offset.checked_add(length), Some(end) if end <= ram_size) {
+    if !matches!(offset.checked_add(length), Some(end) if end <= size) {
         return Err(BridgeError::BadParams(format!(
-            "ram access out of range: offset {offset:#x}+{length:#x} exceeds {ram_size:#x}"
+            "{name} access out of range: offset {offset:#x}+{length:#x} exceeds {size:#x}"
         )));
     }
-    ram_base
-        .checked_add(offset)
-        .ok_or_else(|| BridgeError::BadParams("ram address overflow".into()))
+    base.checked_add(offset)
+        .ok_or_else(|| BridgeError::BadParams(format!("{name} address overflow")))
 }
 
 pub(super) fn require_port_zero(params: &Value) -> BridgeResult<()> {
@@ -98,7 +97,7 @@ pub(super) fn require_port_zero(params: &Value) -> BridgeResult<()> {
         Ok(())
     } else {
         Err(BridgeError::BadParams(
-            "Neo Geo input currently supports port 0 only".into(),
+            "input currently supports port 0 only".into(),
         ))
     }
 }
@@ -107,7 +106,7 @@ pub(super) fn require_main_cpu(params: &Value) -> BridgeResult<()> {
     match params.get("cpu").and_then(Value::as_str) {
         None | Some("main" | "maincpu" | "m68000" | "m68k" | "68k") => Ok(()),
         Some(cpu) => Err(BridgeError::BadParams(format!(
-            "Neo Geo execution control currently supports the m68000 main CPU only, got {cpu}"
+            "execution control currently supports the m68000 main CPU only, got {cpu}"
         ))),
     }
 }
@@ -133,9 +132,7 @@ pub(super) fn normalize_buttons(
             if profile.input_buttons().contains(&key.as_str()) {
                 Ok(key)
             } else {
-                Err(BridgeError::BadParams(format!(
-                    "unsupported Neo Geo button: {key}"
-                )))
+                Err(BridgeError::BadParams(format!("unsupported button: {key}")))
             }
         })
         .collect()

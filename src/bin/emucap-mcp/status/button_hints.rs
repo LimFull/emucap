@@ -66,6 +66,11 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "buttons": ["a", "b", "c", "d", "start", "select", "up", "down", "left", "right"],
             "notes": "Neo Geo CD controller port 0. CD media uses a CUE entry file and all referenced tracks."
         }),
+        "taitof2" => serde_json::json!({
+            "system": "taitof2",
+            "buttons": ["button1", "button2", "button3", "button4", "start", "coin", "service", "up", "down", "left", "right"],
+            "notes": "Taito F2 player-one controls on port 0, named after MAME's P1 Button 1-4. Button count varies by game; status.input_buttons.available lists the running game's inputs."
+        }),
         "dc" | "dreamcast" => serde_json::json!({
             "system": "dreamcast",
             "buttons": ["a", "b", "c", "x", "y", "z", "d", "start", "up", "down", "left", "right"],
