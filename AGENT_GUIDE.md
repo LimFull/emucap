@@ -459,7 +459,9 @@ The emucap patches provide native control while the guest is halted.
   `.3dsx` select `system=3ds`; titles must be decrypted and need no BIOS. The headless direct
   host exposes application virtual memory, application-core registers, exact frame control,
   buttons and Circle Pad directions, bottom-screen touch, frozen screenshots and frozen
-  save/load. Breakpoints and disassembly are not exposed.
+  save/load. The core runs its interpreter, so exec/read/write/access breakpoints and
+  instruction steps stop at exact instruction boundaries; ARM/Thumb disassembly and a
+  PC-and-link-register call stack are available.
   → `adapters/azahar-3ds/README.md`
 - **xemu (original Xbox)** — build the pinned GPLv2 fork with
   `adapters/xemu/build.sh`, then build `emucap-xemu-bridge`. Set

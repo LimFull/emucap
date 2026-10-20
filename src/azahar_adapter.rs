@@ -3,7 +3,7 @@
 //! The host owns the only `retro_run` loop. Every request is serviced between frames on that
 //! thread, so the guest never runs while memory, registers or state are accessed.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
+mod debug;
 mod ffi;
 mod observation;
 mod operations;
@@ -60,6 +61,14 @@ const METHODS: &[&str] = &[
     "load_state",
     "reset",
     "execution_speed",
+    "step_instructions",
+    "set_breakpoint",
+    "clear_breakpoint",
+    "list_breakpoints",
+    "clear_all_breakpoints",
+    "poll_events",
+    "disassemble",
+    "call_stack",
 ];
 const ACTIVE_EXCEPTIONS: &[&str] = &[
     "azahar.input-hold.port-zero-only",
@@ -67,6 +76,8 @@ const ACTIVE_EXCEPTIONS: &[&str] = &[
     "azahar.screenshot.frozen-only",
     "azahar.state-save.frozen-only",
     "azahar.state-load.frozen-only",
+    "azahar.breakpoint.subset",
+    "azahar.call-stack.best-effort",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +139,10 @@ pub struct AzaharHost {
     loaded: bool,
     core_initialized: bool,
     pacer: observation::FramePacer,
+    breakpoints: BTreeMap<u64, debug::DebugBreakpoint>,
+    next_breakpoint_id: u64,
+    pending_events: VecDeque<Value>,
+    dropped_events: u64,
     request_cancellation: crate::live::link::RequestCancellation,
     producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
     control_unverified: bool,
@@ -242,6 +257,10 @@ impl AzaharHost {
             loaded: true,
             core_initialized: true,
             pacer: observation::FramePacer::new(),
+            breakpoints: BTreeMap::new(),
+            next_breakpoint_id: 1,
+            pending_events: VecDeque::new(),
+            dropped_events: 0,
             request_cancellation: Default::default(),
             producer_ownership: None,
             control_unverified: false,
@@ -259,7 +278,8 @@ impl AzaharHost {
 
     pub fn run_scheduled_frame(&mut self) -> AzaharResult<()> {
         if !self.frozen {
-            self.run_one_frame()?;
+            // A pausing breakpoint freezes the running machine at its boundary.
+            self.run_native()?;
         }
         Ok(())
     }
@@ -309,6 +329,14 @@ impl AzaharHost {
             "load_state" => self.load_state(params),
             "reset" => self.reset(),
             "execution_speed" => self.execution_speed(params),
+            "step_instructions" => self.step_instructions(params),
+            "set_breakpoint" => self.set_breakpoint(params),
+            "clear_breakpoint" => self.clear_breakpoint(params),
+            "list_breakpoints" => self.list_breakpoints(),
+            "clear_all_breakpoints" => self.clear_all_breakpoints(),
+            "poll_events" => self.poll_events(params),
+            "disassemble" => self.disassemble(params),
+            "call_stack" => self.call_stack(),
             other => Err(AzaharError::Unsupported(other.into())),
         };
         match result {

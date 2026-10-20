@@ -1,11 +1,6 @@
 use super::observation::AdvanceStop;
 use super::*;
 
-const REGISTER_NAMES: [&str; REGISTER_COUNT] = [
-    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp", "lr",
-    "pc", "cpsr",
-];
-
 impl AzaharHost {
     fn execution_limits() -> Value {
         json!({
@@ -18,14 +13,19 @@ impl AzaharHost {
     fn capability_notes() -> Value {
         json!({
             "implemented_methods": METHODS,
-            "step_units": ["frames"],
+            "step_units": ["frames", "instructions"],
+            "cpu": "the dyncom interpreter, so breakpoints and steps stop before the exact instruction",
             "frame_boundary": "one retro_run, which ends at the next presented VBlank",
             "memory": "virtual is the application's 32-bit address space; unmapped pages reject the access",
             "registers": "r0-r15 and CPSR of the application core (core 0) at the frame boundary",
             "touch": {"screen": "bottom", "width": TOUCH_WIDTH, "height": TOUCH_HEIGHT},
             "screenshot_layout": "top screen above the centered bottom screen",
-            "breakpoints": false,
-            "disassembly": false,
+            "breakpoints": {
+                "scope": "application process loads, stores and instructions on any core",
+                "not_observed": "DMA, GPU and HLE service copies into application memory"
+            },
+            "disassembly": "dynarmic A32 decoder; 32-bit Thumb is decoded only for BL/BLX",
+            "call_stack": "PC and link register only",
             "audio_output": false
         })
     }
@@ -41,10 +41,11 @@ impl AzaharHost {
             "memory_types": ["virtual"],
             "state_groups": ["cpu"],
             "cpu_targets": [{
-                "id":"main", "aliases":["arm11", "core0"], "default":true, "disassembly_modes":[]
+                "id":"main", "aliases":["arm11", "core0"], "default":true,
+                "disassembly_modes":["auto", "arm", "thumb"]
             }],
             "region_sizes": {"virtual": VIRTUAL_SPACE_SIZE},
-            "breakpoint_kinds": [],
+            "breakpoint_kinds": debug::breakpoint_kinds(),
             "input_buttons": input_buttons(),
             "execution_limits": Self::execution_limits(),
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
@@ -81,6 +82,7 @@ impl AzaharHost {
             "methods": METHODS,
             "memory_types": ["virtual"],
             "region_sizes": {"virtual": VIRTUAL_SPACE_SIZE},
+            "breakpoint_kinds": debug::breakpoint_kinds(),
             "input_buttons": {"buttons": input_buttons(), "available": input_buttons()},
             "input_override": {
                 "engaged": !self.held_buttons.is_empty() || self.held_touch.is_some(),
@@ -155,18 +157,7 @@ impl AzaharHost {
     }
 
     pub(super) fn get_state(&self) -> AzaharResult<Value> {
-        let mut registers = [0_u32; REGISTER_COUNT];
-        if unsafe { (self.api.get_registers)(registers.as_mut_ptr(), REGISTER_COUNT) } == 0 {
-            return Err(AzaharError::BadState(
-                "the application core is not available".into(),
-            ));
-        }
-        let cpu = REGISTER_NAMES
-            .iter()
-            .zip(registers)
-            .map(|(name, value)| ((*name).to_string(), json!(value)))
-            .collect::<serde_json::Map<_, _>>();
-        Ok(json!({"cpu": cpu, "frame": self.frame}))
+        Ok(json!({"cpu": debug::registers_value(&self.registers()?), "frame": self.frame}))
     }
 
     pub(super) fn pause(&mut self) -> AzaharResult<Value> {
@@ -198,6 +189,9 @@ impl AzaharHost {
     }
 
     pub(super) fn step(&mut self, params: &Value) -> AzaharResult<Value> {
+        if params.get("unit").and_then(Value::as_str) == Some("instructions") {
+            return self.step_instructions(params);
+        }
         require_frame_unit(params)?;
         let count = frame_count(params)?;
         let before = self.frame;
@@ -407,21 +401,43 @@ impl AzaharHost {
         )
     }
 
-    pub(super) fn run_one_frame(&mut self) -> AzaharResult<()> {
+    /// One `retro_run`: whether it presented a frame, and the reason a debugger stop ended it.
+    /// A stopped run resumes mid-frame; the next run presents the interrupted frame.
+    pub(super) fn run_native(&mut self) -> AzaharResult<(bool, Option<u32>)> {
         let before = callback_count()?;
-        unsafe { (self.api.run)() };
-        let after = callback_count()?;
-        if after != before + 1 {
+        unsafe {
+            (self.api.resume)();
+            (self.api.run)();
+        }
+        let presented = callback_count()? - before;
+        let stopped = unsafe { (self.api.stop_requested)() } != 0;
+        if presented > 1 || (presented == 0 && !stopped) {
             return Err(AzaharError::Core(format!(
-                "retro_run did not produce exactly one video callback: before={before}, after={after}"
+                "retro_run presented {presented} frames (stopped={stopped}); expected one frame or a debugger stop"
             )));
         }
-        self.frame = self
-            .frame
-            .checked_add(1)
-            .ok_or_else(|| AzaharError::Core("frontend frame counter overflow".into()))?;
-        self.video_fresh = true;
-        Ok(())
+        if presented == 1 {
+            self.frame = self
+                .frame
+                .checked_add(1)
+                .ok_or_else(|| AzaharError::Core("frontend frame counter overflow".into()))?;
+            self.video_fresh = true;
+        }
+        if !self.breakpoints.is_empty() {
+            self.drain_native_events()?;
+        }
+        if !stopped {
+            return Ok((presented == 1, None));
+        }
+        self.frozen = true;
+        self.pacer.reanchor();
+        let reason = unsafe { (self.api.take_stop_reason)() };
+        if reason != STOP_BREAKPOINT && reason != STOP_STEP {
+            return Err(AzaharError::Core(format!(
+                "retro_run stopped for unknown reason {reason}"
+            )));
+        }
+        Ok((presented == 1, Some(reason)))
     }
 
     pub(super) fn require_frozen(&self, operation: &str) -> AzaharResult<()> {

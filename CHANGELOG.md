@@ -7,7 +7,9 @@ Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
 ### Added
 - Add a Nintendo 3DS profile (`system=3ds`, this fork only): a direct host for the pinned
   Azahar libretro core with application memory and registers, exact frame control, buttons,
-  Circle Pad and touch input, frozen screenshots, and frozen save/load.
+  Circle Pad and touch input, frozen screenshots, and frozen save/load. The core runs its
+  interpreter for exact breakpoints, watchpoints and instruction steps, plus ARM/Thumb
+  disassembly and a best-effort call stack.
 - Add the Taito F2 profile (`system=taitof2`) on a dedicated pinned MAME subset build. It reuses
   the Neo Geo 68000 bridge with the whole 24-bit `program` space as memory, generic
   `button1`..`button4` arcade inputs, and native save/load. Rebuild MAME adapters: patch `0020`

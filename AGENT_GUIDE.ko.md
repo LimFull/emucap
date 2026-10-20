@@ -378,8 +378,9 @@ emucap 패치는 guest가 정지한 상태에서도 네이티브 제어 요청�
   코어를 빌드하고 `emucap-azahar`를 빌드한다. `.3ds`, `.cci`, `.cxi`, `.3dsx`는
   `system=3ds`로 판정되며, 타이틀은 복호화돼 있어야 하고 BIOS는 필요 없다. 헤드리스 직접
   호스트가 애플리케이션 가상 메모리, 애플리케이션 코어 레지스터, 정확한 프레임 제어, 버튼과
-  서클패드 방향, 하단 화면 터치, frozen 스크린샷과 frozen save/load를 제공한다. breakpoint와
-  disassemble은 제공하지 않는다.
+  서클패드 방향, 하단 화면 터치, frozen 스크린샷과 frozen save/load를 제공한다. 코어가
+  인터프리터로 실행되므로 exec/read/write/access breakpoint와 명령 스텝이 정확한 명령 경계에서
+  멈추며, ARM/Thumb disassemble과 PC·LR 기반 call stack을 제공한다.
   → `adapters/azahar-3ds/README.md`
 - **xemu 원본 Xbox** — `adapters/xemu/build.sh`로 고정된 GPLv2 포크를 빌드하고
   `emucap-xemu-bridge`를 빌드한다. 사용자가 준비한 MCPX·flash ROM·HDD template 디렉터리를

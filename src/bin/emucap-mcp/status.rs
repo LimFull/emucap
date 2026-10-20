@@ -728,7 +728,7 @@ fn build_supported_systems_value() -> serde_json::Value {
             "aliases": ["n3ds", "nintendo-3ds", "nintendo3ds", "azahar"],
             "adapter": "azahar_3ds",
             "content": ["3ds", "cci", "cxi", "3dsx"],
-            "notes": "Decrypted titles only; CIA installers are not accepted. Headless Azahar libretro host with the software renderer. Memory is the application's virtual address space, registers are the application core's, and frames end at a presented VBlank. Breakpoints and disassembly are not exposed."
+            "notes": "Decrypted titles only; CIA installers are not accepted. Headless Azahar libretro host with the software renderer. Memory is the application's virtual address space, registers are the application core's, and frames end at a presented VBlank. The interpreter CPU gives exact exec/read/write/access breakpoints and instruction steps; disassembly is ARM/Thumb and the call stack is PC plus link register."
         }
     ])
 }

@@ -73,6 +73,7 @@ impl FramePacer {
 /// Why a synchronous frame advance stopped before its requested count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AdvanceStop {
+    Breakpoint,
     HostDeadline,
     Cancelled,
 }
@@ -81,6 +82,7 @@ impl AdvanceStop {
     pub(super) fn reason(stop: Option<Self>) -> Value {
         match stop {
             None => Value::Null,
+            Some(Self::Breakpoint) => json!("breakpoint"),
             Some(Self::HostDeadline) => json!("host_deadline"),
             Some(Self::Cancelled) => json!("cancelled"),
         }
@@ -201,8 +203,12 @@ impl AzaharHost {
                     break;
                 }
             }
-            self.run_one_frame()?;
-            completed += 1;
+            let (presented, native_stop) = self.run_native()?;
+            completed += u64::from(presented);
+            if native_stop.is_some() {
+                stop = Some(AdvanceStop::Breakpoint);
+                break;
+            }
         }
         self.pacer.reanchor();
         Ok((completed, stop))

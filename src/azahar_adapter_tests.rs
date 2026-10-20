@@ -90,3 +90,43 @@ fn advertised_exceptions_validate_for_the_3ds_adapter() {
     );
     assert_eq!(status.state, "validated", "{:?}", status.errors);
 }
+
+#[test]
+fn breakpoint_snapshots_are_bounded_virtual_ranges() {
+    use super::debug::parse_snapshots;
+    assert_eq!(
+        parse_snapshots(Some(&json!([
+            "virtual:0x08000000:0x10",
+            "virtual:0x100000:4"
+        ])))
+        .unwrap(),
+        vec![(0x0800_0000, 0x10), (0x10_0000, 4)]
+    );
+    for invalid in [
+        json!(["ram:0:4"]),
+        json!(["virtual:0:0"]),
+        json!(["virtual:0xfffffffe:4"]),
+        json!(["virtual:0"]),
+        json!(["virtual:0:0x4000", "virtual:0x4000:1"]),
+        json!("virtual:0:4"),
+    ] {
+        assert!(parse_snapshots(Some(&invalid)).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn every_breakpoint_kind_is_advertised_with_pause_choices() {
+    let kinds = super::debug::breakpoint_kinds();
+    let names = kinds
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kind| kind["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["exec", "read", "write", "access"]);
+    assert!(kinds
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|kind| kind["pause_on_hit"] == json!([true, false])));
+}

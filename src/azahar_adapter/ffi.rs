@@ -1,7 +1,7 @@
 //! libretro and emucap debug ABI bindings for the Azahar core.
 use super::*;
 
-const DEBUG_API_VERSION: u32 = 1;
+const DEBUG_API_VERSION: u32 = 2;
 pub(super) const REGISTER_COUNT: usize = 17;
 
 const RETRO_DEVICE_JOYPAD: u32 = 1;
@@ -30,10 +30,12 @@ const RETRO_ENVIRONMENT_EXPERIMENTAL: u32 = 0x10000;
 const RETRO_ENVIRONMENT_SET_MEMORY_MAPS: u32 = 36 | RETRO_ENVIRONMENT_EXPERIMENTAL;
 const PIXEL_XRGB8888: u32 = 1;
 
-/// Fixed options: the software renderer, the default top-over-bottom layout, and touch from the
-/// libretro pointer device only. The pointer must not vanish while a touch is held.
+/// Fixed options: the software renderer, the interpreter (which checks breakpoints before every
+/// instruction), the default top-over-bottom layout, and touch from the libretro pointer device
+/// only. The pointer must not vanish while a touch is held.
 pub(super) const CORE_OPTIONS: &[(&str, &str)] = &[
     ("citra_graphics_api", "Software"),
+    ("citra_use_cpu_jit", "disabled"),
     ("citra_layout_option", "default"),
     ("citra_swap_screen", "Top"),
     ("citra_enable_touch_touchscreen", "enabled"),
@@ -100,6 +102,34 @@ pub(super) struct RetroSystemAvInfo {
     pub(super) timing: RetroSystemTiming,
 }
 
+/// `EmucapDebug::Point` in the core.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct NativePoint {
+    pub(super) id: u64,
+    pub(super) kind: u32,
+    pub(super) start: u32,
+    pub(super) end: u32,
+    pub(super) pause_on_hit: u32,
+}
+
+/// `EmucapDebug::Event` in the core.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct NativeEvent {
+    pub(super) sequence: u64,
+    pub(super) breakpoint_id: u64,
+    pub(super) kind: u32,
+    pub(super) address: u32,
+    pub(super) size: u32,
+    pub(super) value: u32,
+    pub(super) paused: u32,
+    pub(super) registers: [u32; REGISTER_COUNT],
+}
+
+pub(super) const STOP_BREAKPOINT: u32 = 1;
+pub(super) const STOP_STEP: u32 = 2;
+
 type EnvironmentCallback = extern "C" fn(u32, *mut c_void) -> bool;
 type VideoCallback = extern "C" fn(*const c_void, u32, u32, usize);
 type AudioSampleCallback = extern "C" fn(i16, i16);
@@ -128,6 +158,17 @@ pub(super) struct CoreApi {
     pub(super) write_memory: unsafe extern "C" fn(u32, *const u8, usize) -> i32,
     pub(super) get_registers: unsafe extern "C" fn(*mut u32, usize) -> i32,
     pub(super) program_id: unsafe extern "C" fn(*mut u64) -> i32,
+    pub(super) debug_available: unsafe extern "C" fn() -> i32,
+    pub(super) set_point: unsafe extern "C" fn(*const NativePoint) -> i32,
+    pub(super) clear_point: unsafe extern "C" fn(u64) -> i32,
+    pub(super) clear_points: unsafe extern "C" fn(),
+    pub(super) poll_event: unsafe extern "C" fn(*mut NativeEvent) -> i32,
+    pub(super) take_dropped: unsafe extern "C" fn() -> u64,
+    pub(super) resume: unsafe extern "C" fn() -> i32,
+    pub(super) request_step: unsafe extern "C" fn(i32),
+    pub(super) stop_requested: unsafe extern "C" fn() -> i32,
+    pub(super) take_stop_reason: unsafe extern "C" fn() -> u32,
+    pub(super) disassemble: unsafe extern "C" fn(u32, i32, *mut c_char, usize, *mut u32) -> i32,
     _library: Library,
 }
 
@@ -170,6 +211,17 @@ impl CoreApi {
             write_memory: symbol!("emucap_azahar_write_memory"),
             get_registers: symbol!("emucap_azahar_get_registers"),
             program_id: symbol!("emucap_azahar_program_id"),
+            debug_available: symbol!("emucap_azahar_debug_available"),
+            set_point: symbol!("emucap_azahar_debug_set_point"),
+            clear_point: symbol!("emucap_azahar_debug_clear_point"),
+            clear_points: symbol!("emucap_azahar_debug_clear_points"),
+            poll_event: symbol!("emucap_azahar_debug_poll_event"),
+            take_dropped: symbol!("emucap_azahar_debug_take_dropped"),
+            resume: symbol!("emucap_azahar_debug_resume"),
+            request_step: symbol!("emucap_azahar_debug_request_step"),
+            stop_requested: symbol!("emucap_azahar_debug_stop_requested"),
+            take_stop_reason: symbol!("emucap_azahar_debug_take_stop_reason"),
+            disassemble: symbol!("emucap_azahar_disassemble"),
             _library: library,
         })
     }

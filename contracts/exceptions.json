@@ -1458,6 +1458,28 @@
       "constraints": {"state.load.execution_states.allowed": ["frozen"]},
       "public_behavior": {"invalid": "bad_state"},
       "verification": ["contract-test:azahar-state-load-frozen-only"]
+    },
+    {
+      "id": "azahar.breakpoint.subset",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"conditions": "present", "auto_savestate": true, "snapshot": "present", "pause_on_hit": false, "memory_type": "not_virtual"},
+      "constraints": {"breakpoint.kinds.allowed": ["exec", "read", "write", "access"], "breakpoint.memory_types.allowed": ["virtual", "cpu"], "breakpoint.conditions.supported": false, "breakpoint.snapshot.supported": true, "breakpoint.snapshot.pause_on_hit.required": true, "breakpoint.snapshot.max_ranges": 16, "breakpoint.snapshot.max_total_bytes": 16384, "breakpoint.max_count": 128},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:azahar-breakpoint-subset-rejected-before-mutation"]
+    },
+    {
+      "id": "azahar.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"method": "call_stack"},
+      "constraints": {"debug.call-stack.max_depth": 2},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:azahar-call-stack-link-register"]
     }
   ]
 }

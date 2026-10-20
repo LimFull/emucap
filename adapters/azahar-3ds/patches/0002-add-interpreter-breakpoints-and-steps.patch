@@ -1,0 +1,597 @@
+--- a/src/citra_libretro/CMakeLists.txt
++++ b/src/citra_libretro/CMakeLists.txt
+@@ -51,6 +51,8 @@
+ target_compile_definitions(input_common PRIVATE HAVE_LIBRETRO)
+ 
+ target_link_libraries(citra_libretro PRIVATE citra_common citra_core)
++# emucap: the debug ABI uses the dynarmic A32 disassembler.
++target_link_libraries(citra_libretro PRIVATE dynarmic)
+ target_link_libraries(citra_libretro PRIVATE Boost::boost dds-ktx libretro tsl::robin_map)
+ if(ENABLE_VULKAN)
+   target_link_libraries(citra_libretro PRIVATE sirit vulkan-headers vma)
+--- a/src/citra_libretro/citra_libretro.cpp
++++ b/src/citra_libretro/citra_libretro.cpp
+@@ -41,6 +41,7 @@
+ #include "common/logging/filter.h"
+ #include "common/settings.h"
+ #include "common/string_util.h"
++#include "core/emucap_debug.h"
+ #include "core/core.h"
+ #include "core/frontend/applets/default_applets.h"
+ #include "core/frontend/image_interface.h"
+@@ -284,7 +285,8 @@
+         Core::System::GetInstance().RegisterCoreLoopThreadId();
+     }
+ 
+-    while (!emu_instance->emu_window->HasSubmittedFrame()) {
++    // emucap: a debugger stop ends the run before the frame is presented.
++    while (!emu_instance->emu_window->HasSubmittedFrame() && !EmucapDebug::StopRequested()) {
+         auto result = Core::System::GetInstance().RunLoop();
+ 
+         if (result != Core::System::ResultStatus::Success) {
+--- a/src/citra_libretro/emucap_debug.cpp
++++ b/src/citra_libretro/emucap_debug.cpp
+@@ -4,12 +4,20 @@
+ // emucap debug ABI. The frontend calls these only between retro_run calls, on the thread that
+ // owns the core, so no guest thread runs concurrently with an access.
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
++#include <cstring>
+ #include <memory>
++#include <string>
+ 
++#include <dynarmic/interface/A32/disassembler.h>
++
+ #include "core/arm/arm_interface.h"
++#include "common/settings.h"
+ #include "core/core.h"
++#include "core/emucap_debug.h"
+ #include "core/hle/kernel/kernel.h"
+ #include "core/hle/kernel/process.h"
+ #include "core/loader/loader.h"
+@@ -19,7 +27,7 @@
+ 
+ namespace {
+ 
+-constexpr std::uint32_t DEBUG_API_VERSION = 1;
++constexpr std::uint32_t DEBUG_API_VERSION = 2;
+ constexpr std::size_t REGISTER_COUNT = 17; // r0-r15 and CPSR
+ 
+ /// The loaded title's process; system modules and applets are never selected.
+@@ -110,5 +118,111 @@
+         return 0;
+     }
+     *out = process->codeset->program_id;
++    return 1;
++}
++
++/// Breakpoints and instruction steps need the interpreter, which checks before every instruction.
++EMUCAP_EXPORT int emucap_azahar_debug_available() {
++    return Settings::values.use_cpu_jit.GetValue() ? 0 : 1;
++}
++
++EMUCAP_EXPORT int emucap_azahar_debug_set_point(const EmucapDebug::Point* point) {
++    return point && EmucapDebug::AddPoint(*point) ? 1 : 0;
++}
++
++EMUCAP_EXPORT int emucap_azahar_debug_clear_point(std::uint64_t id) {
++    return EmucapDebug::RemovePoint(id) ? 1 : 0;
++}
++
++EMUCAP_EXPORT void emucap_azahar_debug_clear_points() {
++    EmucapDebug::ClearPoints();
++}
++
++EMUCAP_EXPORT int emucap_azahar_debug_poll_event(EmucapDebug::Event* event) {
++    return event && EmucapDebug::PollEvent(*event) ? 1 : 0;
++}
++
++EMUCAP_EXPORT std::uint64_t emucap_azahar_debug_take_dropped() {
++    return EmucapDebug::TakeDroppedEvents();
++}
++
++/// Clears a stop before the next retro_run and binds points to the running title. Returns 0
++/// while no title process exists; points then cannot match.
++EMUCAP_EXPORT int emucap_azahar_debug_resume() {
++    auto process = ApplicationProcess();
++    EmucapDebug::Resume(process ? process->codeset->program_id : 0);
++    return process ? 1 : 0;
++}
++
++/// The next retro_run stops after one application instruction, or `armed == 0` cancels that.
++EMUCAP_EXPORT void emucap_azahar_debug_request_step(int armed) {
++    EmucapDebug::RequestStep(armed != 0);
++}
++
++EMUCAP_EXPORT int emucap_azahar_debug_stop_requested() {
++    return EmucapDebug::StopRequested() ? 1 : 0;
++}
++
++/// Returns and clears why the last run stopped early: 0 none, 1 breakpoint, 2 step.
++EMUCAP_EXPORT std::uint32_t emucap_azahar_debug_take_stop_reason() {
++    return EmucapDebug::TakeStopReason();
++}
++
++/// Disassembles one ARM (thumb == 0) or Thumb instruction of the application into `text`.
++EMUCAP_EXPORT int emucap_azahar_disassemble(std::uint32_t address, int thumb, char* text,
++                                            std::size_t capacity, std::uint32_t* length) {
++    auto process = ApplicationProcess();
++    auto& memory = Core::System::GetInstance().Memory();
++    if (!process || !text || capacity == 0 || !length) {
++        return 0;
++    }
++    std::string row;
++    if (!thumb) {
++        std::uint32_t word = 0;
++        if ((address & 3) != 0 || !RangeMapped(memory, *process, address, 4)) {
++            return 0;
++        }
++        memory.ReadBlock(*process, address, &word, 4);
++        row = Dynarmic::A32::DisassembleArm(word);
++        *length = 4;
++    } else {
++        std::uint16_t first = 0;
++        if ((address & 1) != 0 || !RangeMapped(memory, *process, address, 2)) {
++            return 0;
++        }
++        memory.ReadBlock(*process, address, &first, 2);
++        if ((first >> 11) >= 0x1D) {
++            // 32-bit Thumb: decode the BL/BLX call pair, which dominates call tracing.
++            std::uint16_t second = 0;
++            if (!RangeMapped(memory, *process, address + 2, 2)) {
++                return 0;
++            }
++            memory.ReadBlock(*process, address + 2, &second, 2);
++            *length = 4;
++            const bool bl = (first >> 11) == 0x1E && (second >> 11) == 0x1F;
++            const bool blx = (first >> 11) == 0x1E && (second >> 11) == 0x1D;
++            if (bl || blx) {
++                std::int32_t offset = ((first & 0x7FF) << 12) | ((second & 0x7FF) << 1);
++                offset = (offset << 9) >> 9; // sign-extend the 23-bit offset
++                std::uint32_t target = address + 4 + offset;
++                if (blx) {
++                    target &= ~3u;
++                }
++                char buffer[48];
++                std::snprintf(buffer, sizeof(buffer), "%s #0x%08x", bl ? "bl" : "blx", target);
++                row = buffer;
++            } else {
++                char buffer[48];
++                std::snprintf(buffer, sizeof(buffer), "<thumb32 %04x %04x>", first, second);
++                row = buffer;
++            }
++        } else {
++            row = Dynarmic::A32::DisassembleThumb16(first);
++            *length = 2;
++        }
++    }
++    const std::size_t count = std::min(row.size(), capacity - 1);
++    std::memcpy(text, row.data(), count);
++    text[count] = '\0';
+     return 1;
+ }
+--- a/src/citra_libretro/libretro.osx.def
++++ b/src/citra_libretro/libretro.osx.def
+@@ -30,3 +30,14 @@
+ _emucap_azahar_write_memory
+ _emucap_azahar_get_registers
+ _emucap_azahar_program_id
++_emucap_azahar_debug_available
++_emucap_azahar_debug_set_point
++_emucap_azahar_debug_clear_point
++_emucap_azahar_debug_clear_points
++_emucap_azahar_debug_poll_event
++_emucap_azahar_debug_take_dropped
++_emucap_azahar_debug_resume
++_emucap_azahar_debug_request_step
++_emucap_azahar_debug_stop_requested
++_emucap_azahar_debug_take_stop_reason
++_emucap_azahar_disassemble
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -35,6 +35,8 @@
+     cheats/gateway_cheat.cpp
+     cheats/gateway_cheat.h
+     core.cpp
++    emucap_debug.cpp
++    emucap_debug.h
+     core.h
+     core_timing.cpp
+     core_timing.h
+--- a/src/core/arm/dyncom/arm_dyncom_interpreter.cpp
++++ b/src/core/arm/dyncom/arm_dyncom_interpreter.cpp
+@@ -13,6 +13,7 @@
+ #include "common/common_types.h"
+ #include "common/logging/log.h"
+ #include "common/microprofile.h"
++#include "core/emucap_debug.h"
+ #include "core/arm/dyncom/arm_dyncom_dec.h"
+ #include "core/arm/dyncom/arm_dyncom_interpreter.h"
+ #include "core/arm/dyncom/arm_dyncom_run.h"
+@@ -957,7 +958,14 @@
+ #define INC_PC_STUB ptr += sizeof(arm_inst)
+ 
+ #ifndef ENABLE_GDBSTUB
+-#define GDB_BP_CHECK
++// emucap: stop before the instruction at PC when a breakpoint, step or pending stop asks for it.
++#define GDB_BP_CHECK                                                                               \
++    if (EmucapDebug::active) [[unlikely]] {                                                        \
++        cpu->Cpsr &= ~(1 << 5);                                                                    \
++        cpu->Cpsr |= cpu->TFlag << 5;                                                              \
++        if (EmucapDebug::BeforeInstruction(*cpu))                                                  \
++            goto END;                                                                              \
++    }
+ #else
+ #define GDB_BP_CHECK                                                                               \
+     cpu->Cpsr &= ~(1 << 5);                                                                        \
+--- a/src/core/arm/skyeye_common/armstate.cpp
++++ b/src/core/arm/skyeye_common/armstate.cpp
+@@ -6,6 +6,7 @@
+ #include <csignal>
+ #include "common/logging/log.h"
+ #include "common/swap.h"
++#include "core/emucap_debug.h"
+ #include "core/arm/skyeye_common/armstate.h"
+ #include "core/arm/skyeye_common/vfp/vfp.h"
+ #include "core/core.h"
+@@ -192,7 +193,11 @@
+ }
+ 
+ u8 ARMul_State::ReadMemory8(u32 address) const {
+-    return memory.Read8(address);
++    const u8 data = memory.Read8(address);
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 1, false, data);
++    }
++    return data;
+ }
+ 
+ u16 ARMul_State::ReadMemory16(u32 address) const {
+@@ -201,6 +206,9 @@
+     if (InBigEndianMode())
+         data = Common::swap16(data);
+ 
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 2, false, data);
++    }
+     return data;
+ }
+ 
+@@ -210,6 +218,9 @@
+     if (InBigEndianMode())
+         data = Common::swap32(data);
+ 
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 4, false, data);
++    }
+     return data;
+ }
+ 
+@@ -219,14 +230,23 @@
+     if (InBigEndianMode())
+         data = Common::swap64(data);
+ 
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 8, false, data);
++    }
+     return data;
+ }
+ 
+ void ARMul_State::WriteMemory8(u32 address, u8 data) {
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 1, true, data);
++    }
+     memory.Write8(address, data);
+ }
+ 
+ void ARMul_State::WriteMemory16(u32 address, u16 data) {
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 2, true, data);
++    }
+     if (InBigEndianMode())
+         data = Common::swap16(data);
+ 
+@@ -234,6 +254,9 @@
+ }
+ 
+ void ARMul_State::WriteMemory32(u32 address, u32 data) {
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 4, true, data);
++    }
+     if (InBigEndianMode())
+         data = Common::swap32(data);
+ 
+@@ -241,6 +264,9 @@
+ }
+ 
+ void ARMul_State::WriteMemory64(u32 address, u64 data) {
++    if (EmucapDebug::active) [[unlikely]] {
++        EmucapDebug::OnAccess(*this, address, 8, true, data);
++    }
+     if (InBigEndianMode())
+         data = Common::swap64(data);
+ 
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -12,6 +12,7 @@
+ #include "common/logging/log.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
++#include "core/emucap_debug.h"
+ #include "core/arm/arm_interface.h"
+ #include "core/arm/exclusive_monitor.h"
+ #include "core/hle/service/cam/cam.h"
+@@ -304,6 +305,11 @@
+             }
+             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
+             Reschedule();
++            // emucap: a debugger stop freezes the machine at this core's instruction boundary;
++            // the remaining cores catch up through the delayed-core path on the next run.
++            if (EmucapDebug::StopRequested()) {
++                break;
++            }
+         }
+     }
+ 
+--- a/src/core/emucap_debug.cpp
++++ b/src/core/emucap_debug.cpp
+@@ -0,0 +1,195 @@
++// Copyright 2026 emucap contributors
++// Licensed under GPLv2 or any later version
++
++#include <algorithm>
++#include <deque>
++#include <optional>
++#include <vector>
++
++#include "core/arm/skyeye_common/armstate.h"
++#include "core/core.h"
++#include "core/emucap_debug.h"
++#include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/process.h"
++
++namespace EmucapDebug {
++
++namespace {
++
++constexpr std::size_t MAX_POINTS = 128;
++constexpr std::size_t MAX_EVENTS = 256;
++
++enum class StepState { None, Armed, Started };
++
++std::vector<Point> points;
++std::deque<Event> events;
++u64 dropped_events = 0;
++u64 next_sequence = 1;
++u64 application_id = 0;
++bool stop_requested = false;
++u32 stop_reason = StopReason::None;
++StepState step = StepState::None;
++/// An exec stop leaves the guest before that instruction; the next run must execute it once.
++std::optional<u32> resume_skip_pc;
++
++void Refresh() {
++    active = !points.empty() || step != StepState::None || stop_requested ||
++             resume_skip_pc.has_value();
++}
++
++bool InApplication() {
++    const auto process = Core::System::GetInstance().Kernel().GetCurrentProcess();
++    return process && process->codeset && process->codeset->program_id == application_id;
++}
++
++void Record(const ARMul_State& cpu, const Point& point, u32 address, u32 size, u32 value) {
++    if (events.size() == MAX_EVENTS) {
++        events.pop_front();
++        ++dropped_events;
++    }
++    Event event{};
++    event.sequence = next_sequence++;
++    event.breakpoint_id = point.id;
++    event.kind = point.kind;
++    event.address = address;
++    event.size = size;
++    event.value = value;
++    event.paused = point.pause_on_hit;
++    std::copy(cpu.Reg.begin(), cpu.Reg.end(), event.registers);
++    // The interpreter keeps the condition flags outside CPSR while it runs.
++    event.registers[16] = (cpu.Cpsr & 0x0FFFFFDF) | (cpu.NFlag << 31) | (cpu.ZFlag << 30) |
++                          (cpu.CFlag << 29) | (cpu.VFlag << 28) | (cpu.TFlag << 5);
++    events.push_back(event);
++}
++
++} // namespace
++
++bool active = false;
++
++bool BeforeInstruction(ARMul_State& cpu) {
++    if (stop_requested) {
++        return true;
++    }
++    const u32 pc = cpu.Reg[15];
++    const bool exec_candidate = std::any_of(points.begin(), points.end(), [pc](const Point& p) {
++        return p.kind == Kind::Exec && p.start <= pc && pc <= p.end;
++    });
++    if (!exec_candidate && step == StepState::None && !resume_skip_pc) {
++        return false;
++    }
++    if (!InApplication()) {
++        return false;
++    }
++    bool skipped = false;
++    if (resume_skip_pc) {
++        skipped = *resume_skip_pc == pc;
++        resume_skip_pc.reset();
++    }
++    bool stop = false;
++    bool exec_stop = false;
++    if (exec_candidate && !skipped) {
++        for (const auto& point : points) {
++            if (point.kind == Kind::Exec && point.start <= pc && pc <= point.end) {
++                Record(cpu, point, pc, cpu.TFlag ? 2 : 4, 0);
++                exec_stop |= point.pause_on_hit != 0;
++            }
++        }
++        stop = exec_stop;
++    }
++    if (step == StepState::Started) {
++        step = StepState::None;
++        stop = true;
++    } else if (step == StepState::Armed && !stop) {
++        step = StepState::Started;
++    }
++    if (stop) {
++        stop_requested = true;
++        stop_reason = exec_stop ? StopReason::Breakpoint : StopReason::Step;
++        if (exec_stop) {
++            resume_skip_pc = pc;
++        }
++    }
++    Refresh();
++    return stop;
++}
++
++void OnAccess(const ARMul_State& cpu, u32 address, u32 size, bool write, u64 value) {
++    const u64 last = static_cast<u64>(address) + size - 1;
++    bool checked = false;
++    for (const auto& point : points) {
++        const bool direction = point.kind == Kind::Access ||
++                               point.kind == (write ? Kind::Write : Kind::Read);
++        if (!direction || last < point.start || address > point.end) {
++            continue;
++        }
++        if (!checked) {
++            if (!InApplication()) {
++                return;
++            }
++            checked = true;
++        }
++        Record(cpu, point, address, size, size <= 4 ? static_cast<u32>(value) : 0);
++        if (point.pause_on_hit) {
++            // The access completes; the guest stops before its next instruction.
++            stop_requested = true;
++            stop_reason = StopReason::Breakpoint;
++        }
++    }
++    Refresh();
++}
++
++bool StopRequested() {
++    return stop_requested;
++}
++
++bool AddPoint(const Point& point) {
++    if (points.size() == MAX_POINTS || point.kind > Kind::Access || point.end < point.start ||
++        std::any_of(points.begin(), points.end(), [&](const Point& p) { return p.id == point.id; })) {
++        return false;
++    }
++    points.push_back(point);
++    Refresh();
++    return true;
++}
++
++bool RemovePoint(u64 id) {
++    const auto removed = std::erase_if(points, [id](const Point& p) { return p.id == id; });
++    Refresh();
++    return removed != 0;
++}
++
++void ClearPoints() {
++    points.clear();
++    Refresh();
++}
++
++bool PollEvent(Event& event) {
++    if (events.empty()) {
++        return false;
++    }
++    event = events.front();
++    events.pop_front();
++    return true;
++}
++
++u64 TakeDroppedEvents() {
++    return std::exchange(dropped_events, 0);
++}
++
++void Resume(u64 program_id) {
++    application_id = program_id;
++    stop_requested = false;
++    stop_reason = StopReason::None;
++    Refresh();
++}
++
++void RequestStep(bool armed) {
++    step = armed ? StepState::Armed : StepState::None;
++    Refresh();
++}
++
++u32 TakeStopReason() {
++    return std::exchange(stop_reason, StopReason::None);
++}
++
++} // namespace EmucapDebug
+--- a/src/core/emucap_debug.h
++++ b/src/core/emucap_debug.h
+@@ -0,0 +1,58 @@
++// Copyright 2026 emucap contributors
++// Licensed under GPLv2 or any later version
++
++// emucap debugger state for the dyncom interpreter. Everything runs on the emulation thread:
++// the interpreter consults it, and the frontend changes it only between retro_run calls.
++
++#pragma once
++
++#include <cstddef>
++#include "common/common_types.h"
++
++class ARMul_State;
++
++namespace EmucapDebug {
++
++enum Kind : u32 { Exec = 0, Read = 1, Write = 2, Access = 3 };
++enum StopReason : u32 { None = 0, Breakpoint = 1, Step = 2 };
++constexpr std::size_t REGISTER_COUNT = 17; // r0-r15 and CPSR
++
++struct Point {
++    u64 id;
++    u32 kind;
++    u32 start; // inclusive virtual address range
++    u32 end;
++    u32 pause_on_hit;
++};
++
++struct Event {
++    u64 sequence;
++    u64 breakpoint_id;
++    u32 kind;
++    u32 address;
++    u32 size;
++    u32 value; // valid for accesses of at most four bytes
++    u32 paused;
++    u32 registers[REGISTER_COUNT];
++};
++
++/// Hot-path guard: true while any point, step or stop is pending.
++extern bool active;
++
++/// Called before each interpreted instruction; true stops before it executes.
++bool BeforeInstruction(ARMul_State& cpu);
++/// Called for each data load or store by the interpreter.
++void OnAccess(const ARMul_State& cpu, u32 address, u32 size, bool write, u64 value);
++bool StopRequested();
++
++bool AddPoint(const Point& point);
++bool RemovePoint(u64 id);
++void ClearPoints();
++bool PollEvent(Event& event);
++u64 TakeDroppedEvents();
++/// Clears a stop before the next run. Points apply only to the title `program_id`.
++void Resume(u64 program_id);
++void RequestStep(bool armed);
++u32 TakeStopReason();
++
++} // namespace EmucapDebug
