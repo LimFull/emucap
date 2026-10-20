@@ -454,6 +454,13 @@ The emucap patches provide native control while the guest is halted.
   Other disk profiles and cassette runtime remain unproven; turboR/R800 is not implemented. Generic `.rom` files require an explicit
   MSX system ID.
   → `adapters/openmsx/README.md`
+- **Azahar (Nintendo 3DS, this fork)** — build the pinned libretro core with
+  `adapters/azahar-3ds/build.sh`, then build `emucap-azahar`. `.3ds`, `.cci`, `.cxi` and
+  `.3dsx` select `system=3ds`; titles must be decrypted and need no BIOS. The headless direct
+  host exposes application virtual memory, application-core registers, exact frame control,
+  buttons and Circle Pad directions, bottom-screen touch, frozen screenshots and frozen
+  save/load. Breakpoints and disassembly are not exposed.
+  → `adapters/azahar-3ds/README.md`
 - **xemu (original Xbox)** — build the pinned GPLv2 fork with
   `adapters/xemu/build.sh`, then build `emucap-xemu-bridge`. Set
   `EMUCAP_XEMU_FIRMWARE` to an operator-owned directory containing the required MCPX,

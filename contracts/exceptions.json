@@ -1403,6 +1403,61 @@
       },
       "public_behavior": {"invalid": "bad_state"},
       "verification": ["contract-test:xemu-load-foreign-generation-rejected-before-mutation"]
+    },
+    {
+      "id": "azahar.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:azahar-input-hold-port-zero-only"]
+    },
+    {
+      "id": "azahar.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {"input.ports.allowed": [0], "input.pulse.max_frames": 120},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:azahar-input-pulse-constraints"]
+    },
+    {
+      "id": "azahar.screenshot.frozen-only",
+      "feature": "video.capture",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "VIDEO.CURRENT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"video.capture.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:azahar-screenshot-frozen-only"]
+    },
+    {
+      "id": "azahar.state-save.frozen-only",
+      "feature": "state.save",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.save.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:azahar-state-save-frozen-only"]
+    },
+    {
+      "id": "azahar.state-load.frozen-only",
+      "feature": "state.load",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "azahar-libretro", "systems": ["3ds"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.load.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:azahar-state-load-frozen-only"]
     }
   ]
 }

@@ -27,6 +27,13 @@ MAME
             (patches + Lua plugin + GDB bridges; PC-98, Neo Geo MVS/AES/CD and Taito F2)
   Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
 
+Azahar
+  Upstream: https://github.com/azahar-emu/azahar
+  Pinned source: unified source release 2126.2
+  License:  GPL-2.0-or-later
+  Used by:  adapters/azahar-3ds and emucap-azahar (direct libretro host; Nintendo 3DS)
+  Bundles third-party code under its own licenses (dynarmic, Boost, ...).
+
 NP2kai
   Upstream: https://github.com/AZO234/NP2kai
   Pinned source: d1a40352e24f943a91966c48211c92e6eb07f3a5

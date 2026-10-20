@@ -1419,6 +1419,41 @@ fn launch_plan_for_taitof2_uses_its_own_adapter_without_zip_inference_or_bios() 
 }
 
 #[test]
+fn launch_plan_for_3ds_infers_titles_and_needs_no_bios() {
+    for alias in ["3ds", "n3ds", "nintendo-3ds", "azahar"] {
+        assert_eq!(
+            infer_system(None, Some(alias))["system"],
+            "3ds",
+            "alias {alias}"
+        );
+    }
+    for title in [
+        "/tmp/game.3ds",
+        "/tmp/game.cci",
+        "/tmp/game.cxi",
+        "/tmp/game.3dsx",
+    ] {
+        assert_eq!(infer_system(Some(title), None)["system"], "3ds", "{title}");
+    }
+    assert_eq!(adapter_for_system("3ds"), ("azahar_3ds", None));
+    let plan = make_launch_plan(
+        Some(47803),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/game.3ds".into()),
+            system: None,
+            pc98_backend: None,
+            indirect_media_approval: None,
+        },
+    );
+    assert_eq!(plan["adapter"], "azahar_3ds");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .starts_with("No BIOS"));
+    assert_eq!(plan["button_hint"]["system"], "3ds");
+}
+
+#[test]
 fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
     let plan = make_launch_plan(
         Some(47804),
@@ -2822,6 +2857,7 @@ fn launch_sound_admission_matches_the_documented_adapters() {
         "mesen2",
         "mame_neogeo",
         "mame_taitof2",
+        "azahar_3ds",
         "mupen64plus",
         "np2kai",
         "desmume_nds",

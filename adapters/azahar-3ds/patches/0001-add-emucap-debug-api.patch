@@ -1,0 +1,138 @@
+--- a/src/citra_libretro/CMakeLists.txt
++++ b/src/citra_libretro/CMakeLists.txt
+@@ -27,6 +27,7 @@
+ add_library(citra_libretro SHARED
+         citra_libretro.cpp
+         citra_libretro.h
++        emucap_debug.cpp
+         $<TARGET_OBJECTS:citra_libretro_common>)
+ 
+ set_target_properties(citra_libretro PROPERTIES OUTPUT_NAME "azahar_libretro")
+--- a/src/citra_libretro/emucap_debug.cpp
++++ b/src/citra_libretro/emucap_debug.cpp
+@@ -0,0 +1,114 @@
++// Copyright 2026 emucap contributors
++// Licensed under GPLv2 or any later version
++
++// emucap debug ABI. The frontend calls these only between retro_run calls, on the thread that
++// owns the core, so no guest thread runs concurrently with an access.
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++
++#include "core/arm/arm_interface.h"
++#include "core/core.h"
++#include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/process.h"
++#include "core/loader/loader.h"
++#include "core/memory.h"
++
++#define EMUCAP_EXPORT extern "C" __attribute__((visibility("default")))
++
++namespace {
++
++constexpr std::uint32_t DEBUG_API_VERSION = 1;
++constexpr std::size_t REGISTER_COUNT = 17; // r0-r15 and CPSR
++
++/// The loaded title's process; system modules and applets are never selected.
++std::shared_ptr<Kernel::Process> ApplicationProcess() {
++    auto& system = Core::System::GetInstance();
++    if (!system.IsPoweredOn()) {
++        return nullptr;
++    }
++    u64 program_id = 0;
++    if (system.GetAppLoader().ReadProgramId(program_id) != Loader::ResultStatus::Success) {
++        return nullptr;
++    }
++    for (const auto& process : system.Kernel().GetProcessList()) {
++        if (process && process->codeset && process->codeset->program_id == program_id) {
++            return process;
++        }
++    }
++    return nullptr;
++}
++
++/// Every page of [address, address + length) is mapped in the process.
++bool RangeMapped(Memory::MemorySystem& memory, const Kernel::Process& process,
++                 std::uint32_t address, std::size_t length) {
++    if (length == 0 || static_cast<std::uint64_t>(address) + length > 0x1'0000'0000ULL) {
++        return false;
++    }
++    const std::uint64_t first = address >> Memory::CITRA_PAGE_BITS;
++    const std::uint64_t last = (static_cast<std::uint64_t>(address) + length - 1) >>
++                               Memory::CITRA_PAGE_BITS;
++    for (std::uint64_t page = first; page <= last; ++page) {
++        if (!memory.IsValidVirtualAddress(
++                process, static_cast<VAddr>(page << Memory::CITRA_PAGE_BITS))) {
++            return false;
++        }
++    }
++    return true;
++}
++
++} // namespace
++
++EMUCAP_EXPORT std::uint32_t emucap_azahar_debug_api_version() {
++    return DEBUG_API_VERSION;
++}
++
++/// Copies application virtual memory. Returns 0 without touching `out` when any page is unmapped.
++EMUCAP_EXPORT int emucap_azahar_read_memory(std::uint32_t address, std::uint8_t* out,
++                                            std::size_t length) {
++    auto process = ApplicationProcess();
++    auto& memory = Core::System::GetInstance().Memory();
++    if (!process || !out || !RangeMapped(memory, *process, address, length)) {
++        return 0;
++    }
++    memory.ReadBlock(*process, address, out, length);
++    return 1;
++}
++
++/// Writes application virtual memory and drops any JIT code compiled from it.
++EMUCAP_EXPORT int emucap_azahar_write_memory(std::uint32_t address, const std::uint8_t* data,
++                                             std::size_t length) {
++    auto process = ApplicationProcess();
++    auto& system = Core::System::GetInstance();
++    auto& memory = system.Memory();
++    if (!process || !data || !RangeMapped(memory, *process, address, length)) {
++        return 0;
++    }
++    memory.WriteBlock(*process, address, data, length);
++    system.InvalidateCacheRange(address, length);
++    return 1;
++}
++
++/// r0-r15 and CPSR of the application core (core 0) at the frame boundary.
++EMUCAP_EXPORT int emucap_azahar_get_registers(std::uint32_t* out, std::size_t count) {
++    auto& system = Core::System::GetInstance();
++    if (!out || count != REGISTER_COUNT || !system.IsPoweredOn() || system.GetNumCores() == 0) {
++        return 0;
++    }
++    const auto& core = system.GetCore(0);
++    for (int index = 0; index < 16; ++index) {
++        out[index] = core.GetReg(index);
++    }
++    out[16] = core.GetCPSR();
++    return 1;
++}
++
++EMUCAP_EXPORT int emucap_azahar_program_id(std::uint64_t* out) {
++    auto process = ApplicationProcess();
++    if (!out || !process) {
++        return 0;
++    }
++    *out = process->codeset->program_id;
++    return 1;
++}
+--- a/src/citra_libretro/libretro.osx.def
++++ b/src/citra_libretro/libretro.osx.def
+@@ -25,3 +25,8 @@
+ _retro_get_region
+ _retro_get_memory_data
+ _retro_get_memory_size
++_emucap_azahar_debug_api_version
++_emucap_azahar_read_memory
++_emucap_azahar_write_memory
++_emucap_azahar_get_registers
++_emucap_azahar_program_id

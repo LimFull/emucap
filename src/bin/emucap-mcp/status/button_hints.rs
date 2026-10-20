@@ -51,6 +51,13 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"start": "enter", "return": "enter", "escape": "esc", "select": "space"},
             "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. Ordinary digits and kp0-kp9 keypad inputs are distinct; numpadN, kp_N, and MAME N (pad) spellings are accepted aliases. step(frames) is frame-based, so tap can drive deterministic frozen input."
         }),
+        "3ds" => serde_json::json!({
+            "system": "3ds",
+            "buttons": ["a", "b", "x", "y", "l", "r", "zl", "zr", "start", "select", "up", "down", "left", "right", "circle_up", "circle_down", "circle_left", "circle_right"],
+            "aliases": {"enter": "start", "return": "start"},
+            "touch": {"screen": "bottom", "width": 320, "height": 240},
+            "notes": "D-pad is up/down/left/right; the Circle Pad is circle_* at full deflection. Touch uses bottom-screen pixels through hold_touch/release_touch. HOME is not exposed."
+        }),
         "neogeo_mvs" => serde_json::json!({
             "system": "neogeo_mvs",
             "buttons": ["a", "b", "c", "d", "start", "coin", "service", "up", "down", "left", "right"],

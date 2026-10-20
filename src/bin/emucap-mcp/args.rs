@@ -519,10 +519,10 @@ pub(crate) struct DragPointerArgs {
 pub(crate) struct TouchArgs {
     #[serde(default)]
     pub(crate) port: u64,
-    /// Lower touchscreen X coordinate (0-255). Required unless releasing.
+    /// Lower touchscreen X coordinate (NDS 0-255, 3DS 0-319). Required unless releasing.
     #[serde(default)]
     pub(crate) x: Option<u64>,
-    /// Lower touchscreen Y coordinate (0-191). Required unless releasing.
+    /// Lower touchscreen Y coordinate (NDS 0-191, 3DS 0-239). Required unless releasing.
     #[serde(default)]
     pub(crate) y: Option<u64>,
     /// Optional tap duration. When present, return after the frames have advanced
@@ -539,9 +539,9 @@ pub(crate) struct TouchArgs {
 pub(crate) struct HoldTouchArgs {
     #[serde(default)]
     pub(crate) port: u64,
-    /// Lower touchscreen X coordinate (0-255).
+    /// Lower touchscreen X coordinate (NDS 0-255, 3DS 0-319).
     pub(crate) x: u64,
-    /// Lower touchscreen Y coordinate (0-191).
+    /// Lower touchscreen Y coordinate (NDS 0-191, 3DS 0-239).
     pub(crate) y: u64,
 }
 
@@ -557,9 +557,9 @@ pub(crate) struct ReleaseTouchArgs {
 pub(crate) struct PulseTouchArgs {
     #[serde(default)]
     pub(crate) port: u64,
-    /// Lower touchscreen X coordinate (0-255).
+    /// Lower touchscreen X coordinate (NDS 0-255, 3DS 0-319).
     pub(crate) x: u64,
-    /// Lower touchscreen Y coordinate (0-191).
+    /// Lower touchscreen Y coordinate (NDS 0-191, 3DS 0-239).
     pub(crate) y: u64,
     /// Frames for which to hold the touch before releasing it. This operation
     /// leaves guest execution running.

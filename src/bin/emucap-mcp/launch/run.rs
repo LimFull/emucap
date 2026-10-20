@@ -163,6 +163,14 @@ pub(crate) fn make_launch(
             "adapter": adapter,
         });
     }
+    if adapter == "azahar_3ds" && (a.display == Some(true) || a.content_path2.is_some()) {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "the 3DS backend currently supports headless single-title launch only",
+            "system": system,
+            "adapter": adapter,
+        });
+    }
     if a.sound == Some(true) && !adapter_supports_sound(adapter) {
         return serde_json::json!({
             "launched": false,
@@ -452,6 +460,7 @@ pub(crate) fn make_launch(
         "flycast" => launch_flycast(port, producer_key, runtime, effective_args),
         "mame_pc98" => launch_mame(port, producer_key, runtime, effective_args),
         "np2kai" => launch_np2kai(port, producer_key, runtime, effective_args),
+        "azahar_3ds" => super::azahar::launch_azahar(port, producer_key, runtime, effective_args),
         "mame_neogeo" | "mame_taitof2" => super::mame_neogeo::launch_mame_neogeo(
             port,
             producer_key,

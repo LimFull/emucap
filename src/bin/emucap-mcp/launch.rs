@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use emucap::launch::{
-    desmume_nds as desmume_nds_launch, dolphin as dolphin_launch, flycast as flycast_launch,
-    mame as mame_launch, mame_neogeo as mame_neogeo_launch, mednafen as mednafen_launch,
-    mesen as mesen_launch, mupen64plus as mupen64plus_launch, np2kai as np2kai_launch,
-    openmsx as openmsx_launch, pcsx2 as pcsx2_launch, ppsspp as ppsspp_launch, xemu as xemu_launch,
-    RuntimeEnv,
+    azahar as azahar_launch, desmume_nds as desmume_nds_launch, dolphin as dolphin_launch,
+    flycast as flycast_launch, mame as mame_launch, mame_neogeo as mame_neogeo_launch,
+    mednafen as mednafen_launch, mesen as mesen_launch, mupen64plus as mupen64plus_launch,
+    np2kai as np2kai_launch, openmsx as openmsx_launch, pcsx2 as pcsx2_launch,
+    ppsspp as ppsspp_launch, xemu as xemu_launch, RuntimeEnv,
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};
 use emucap::live::runtime::{LeaseState, ManifestSpec, ProcessState, RuntimeStore};
@@ -26,6 +26,8 @@ mod tests;
 
 #[path = "launch/actions.rs"]
 mod actions;
+#[path = "launch/azahar.rs"]
+mod azahar;
 #[path = "launch/controlled.rs"]
 mod controlled;
 #[path = "launch/mame_neogeo.rs"]

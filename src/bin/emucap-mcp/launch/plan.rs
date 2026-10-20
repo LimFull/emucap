@@ -431,6 +431,7 @@ pub(super) fn adapter_binary_precondition_for(
         "ppsspp" => ppsspp_binary_precondition(root),
         "pcsx2" => pcsx2_binary_precondition(root),
         "xemu" => super::xemu::precondition(root),
+        "azahar_3ds" => super::azahar::precondition(root),
         _ => serde_json::Value::Null,
     }
 }
@@ -531,6 +532,12 @@ pub(super) fn build_required_precondition(
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/xemu/build.sh")
+        )),
+        "azahar_3ds" => serde_json::json!(format!(
+            "Build the pinned Azahar libretro core with {} and build emucap-azahar.",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/azahar-3ds/build.sh")
         )),
         _ => serde_json::Value::Null,
     }
@@ -816,6 +823,13 @@ pub(super) fn infer_system(
             "system": "dc",
             "confidence": "extension",
             "reason": "Dreamcast disc extension (.gdi/.cdi are DC-specific)",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
+        Some("3ds" | "cci" | "cxi" | "3dsx") => serde_json::json!({
+            "system": "3ds",
+            "confidence": "extension",
+            "reason": "Nintendo 3DS title extension",
             "needs_user_input": false,
             "markers": markers,
         }),
@@ -1121,6 +1135,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "taitof2" => serde_json::json!("No BIOS. Requires a game-specific MAME .zip set whose stem is the driver name; a clone also needs its parent set in the same directory."),
         "msx1" | "msx2" | "msx2p" => serde_json::json!("Requires the exact system ROMs for the pinned real-machine profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute directory, or place them under <emucap-data>/firmware/openmsx. The launcher verifies the pinned SHA-1 manifest before spawn."),
         "n64" => serde_json::Value::Null,
+        "3ds" => serde_json::json!("No BIOS. Requires a decrypted .3ds/.cci/.cxi/.3dsx title; encrypted dumps and CIA installers are rejected."),
         "xbox" => serde_json::json!("Requires operator-owned mcpx_1.0.bin, Complex_4627.bin, and xbox_hdd.qcow2. An optional xemu_eeprom.bin seeds each generation; otherwise xemu creates a generation-local EEPROM. No machine files are distributed."),
         _ => serde_json::Value::Null, // snes·md·dc는 BIOS 불요(DC는 Flycast HLE 부팅)
     };
@@ -1170,6 +1185,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "Headless PPSSPP boots the content positionally (not -m/--mount, which only mounts a second image) and is never passed --timeout (that flag aborts the run on a wall-clock deadline regardless of debugger activity); the Rust launch path manages the process lifecycle instead."
         } else if adapter == "dolphin" {
             "Dolphin is headless by default. launch(display:true) selects the compatible DolphinQt build and opens its render window. Both modes use a launch-generation portable runtime and --user directory."
+        } else if adapter == "azahar_3ds" {
+            "Nintendo 3DS runs headless only, through the emucap-owned host and the pinned Azahar software renderer. Saves stay in the launch generation; the user's Azahar or RetroArch profile is never read."
         } else if adapter == "xemu" {
             "xemu keeps its GPU path active in both modes. Headless launch uses the pinned hidden-window extension; visible launch opens an isolated native window. Neither mode reads or changes the user's xemu profile."
         } else {

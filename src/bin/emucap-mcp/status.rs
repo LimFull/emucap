@@ -466,6 +466,10 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "build": abs_path_json(&root, &["adapters", "mame-neogeo", "build.sh"]),
                 "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
             },
+            "azahar_3ds": {
+                "build": abs_path_json(&root, &["adapters", "azahar-3ds", "build.sh"]),
+                "adapter_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-azahar.exe" } else { "emucap-azahar" }]),
+            },
             "mame_taitof2": {
                 "build": abs_path_json(&root, &["adapters", "mame-taitof2", "build.sh"]),
                 "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
@@ -718,6 +722,13 @@ fn build_supported_systems_value() -> serde_json::Value {
             "content": ["xiso", "iso"],
             "required_firmware": ["mcpx_1.0.bin", "Complex_4627.bin", "xbox_hdd.qcow2"],
             "notes": ".xiso is inferred automatically. Shared .iso content requires system=xbox. Managed launch uses the pinned xemu fork and generation-isolated machine storage. Frozen save/load binds VM/HDD, EEPROM, exact current disc, host build, and controller topology and remains valid only within that launch generation. Loose XBE and later Xbox platforms are not accepted."
+        },
+        {
+            "system": "3ds",
+            "aliases": ["n3ds", "nintendo-3ds", "nintendo3ds", "azahar"],
+            "adapter": "azahar_3ds",
+            "content": ["3ds", "cci", "cxi", "3dsx"],
+            "notes": "Decrypted titles only; CIA installers are not accepted. Headless Azahar libretro host with the software renderer. Memory is the application's virtual address space, registers are the application core's, and frames end at a presented VBlank. Breakpoints and disassembly are not exposed."
         }
     ])
 }

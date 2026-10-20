@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod azahar_adapter;
 pub mod build_identity;
 pub mod bundle;
 pub mod ccd;

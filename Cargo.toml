@@ -61,6 +61,10 @@ name = "emucap-np2kai"
 path = "src/bin/emucap-np2kai.rs"
 
 [[bin]]
+name = "emucap-azahar"
+path = "src/bin/emucap-azahar.rs"
+
+[[bin]]
 name = "emucap-xemu-bridge"
 path = "src/bin/emucap-xemu-bridge.rs"
 

@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod azahar;
 pub mod desmume_nds;
 mod directory_replace;
 pub mod dolphin;

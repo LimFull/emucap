@@ -65,6 +65,7 @@ The core exposes two MCP servers: **Control** drives the emulator, while optiona
 | Mupen64Plus | Nintendo 64 |
 | openMSX | MSX1 / MSX2 / MSX2+ |
 | xemu | Original Xbox |
+| Azahar | Nintendo 3DS (this fork) |
 
 See the [adapter guide](AGENT_GUIDE.md#per-emulator-adapters-the-agent-installs-when-needed)
 for setup and each profile’s supported scope. emucap maintains source patches where
