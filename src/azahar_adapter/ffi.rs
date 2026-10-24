@@ -26,13 +26,18 @@ const RETRO_ENVIRONMENT_SET_GEOMETRY: u32 = 37;
 const RETRO_ENVIRONMENT_GET_LANGUAGE: u32 = 39;
 const RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS: u32 = 44;
 const RETRO_ENVIRONMENT_GET_INPUT_MAX_USERS: u32 = 61;
+const RETRO_ENVIRONMENT_SET_HW_RENDER: u32 = 14;
+const RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER: u32 = 56;
 const RETRO_ENVIRONMENT_EXPERIMENTAL: u32 = 0x10000;
 const RETRO_ENVIRONMENT_SET_MEMORY_MAPS: u32 = 36 | RETRO_ENVIRONMENT_EXPERIMENTAL;
+const RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE: u32 = 41 | RETRO_ENVIRONMENT_EXPERIMENTAL;
+const RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE: u32 =
+    43 | RETRO_ENVIRONMENT_EXPERIMENTAL;
 const PIXEL_XRGB8888: u32 = 1;
 
-/// Fixed options: the software renderer, the interpreter (which checks breakpoints before every
-/// instruction), the default top-over-bottom layout, and touch from the libretro pointer device
-/// only. The pointer must not vanish while a touch is held.
+/// Fixed options: the renderer (replaced by the host's selection), the interpreter (which checks
+/// breakpoints before every instruction), the default top-over-bottom layout, and touch from the libretro pointer device only. The pointer must not vanish while a
+/// touch is held.
 pub(super) const CORE_OPTIONS: &[(&str, &str)] = &[
     ("citra_graphics_api", "Software"),
     ("citra_use_cpu_jit", "disabled"),
@@ -234,6 +239,8 @@ pub(super) struct CapturedFrame {
     pub(super) height: u32,
     pub(super) pitch: usize,
     pub(super) callback_count: u64,
+    /// The frame is the Vulkan output image, read back on demand.
+    pub(super) hardware: bool,
 }
 
 pub(super) struct CallbackState {
@@ -336,6 +343,18 @@ pub(super) extern "C" fn environment_callback(command: u32, data: *mut c_void) -
                 *data.cast::<u32>() = 1;
                 true
             }
+            RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER if vulkan::active() => {
+                *data.cast::<u32>() = vulkan::RETRO_HW_CONTEXT_VULKAN;
+                true
+            }
+            RETRO_ENVIRONMENT_SET_HW_RENDER => vulkan::set_hw_render(data.cast()),
+            RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE => {
+                vulkan::set_negotiation(data.cast())
+            }
+            RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE => {
+                *data.cast::<*const c_void>() = vulkan::interface();
+                !vulkan::interface().is_null()
+            }
             RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO
             | RETRO_ENVIRONMENT_SET_GEOMETRY
             | RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS
@@ -356,6 +375,14 @@ pub(super) extern "C" fn video_callback(
 ) {
     with_state(|state| {
         state.frame.callback_count = state.frame.callback_count.saturating_add(1);
+        state.frame.hardware = data as usize == vulkan::HW_FRAME_BUFFER_VALID;
+        if state.frame.hardware {
+            state.frame.bytes.clear();
+            state.frame.width = width;
+            state.frame.height = height;
+            state.frame.pitch = width as usize * 4;
+            return;
+        }
         let Some(len) = pitch.checked_mul(height as usize) else {
             return;
         };
@@ -453,6 +480,15 @@ pub(super) fn controls_released() -> bool {
 }
 
 pub(super) fn captured_png() -> AzaharResult<(Vec<u8>, u32, u32)> {
+    let hardware = with_state(|state| {
+        let frame = &state.frame;
+        (frame.hardware && frame.bytes.is_empty()).then_some((frame.width, frame.height))
+    })
+    .flatten();
+    if let Some((width, height)) = hardware {
+        let bytes = vulkan::read_frame(width, height)?;
+        with_state(|state| state.frame.bytes = bytes);
+    }
     let slot = callback_slot()
         .lock()
         .unwrap_or_else(|value| value.into_inner());

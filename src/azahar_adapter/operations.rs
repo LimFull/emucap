@@ -15,6 +15,7 @@ impl AzaharHost {
             "implemented_methods": METHODS,
             "step_units": ["frames", "instructions"],
             "cpu": "the dyncom interpreter, so breakpoints and steps stop before the exact instruction",
+            "renderer": "Vulkan (MoltenVK on macOS) unless EMUCAP_AZAHAR_RENDERER=software or no Vulkan driver loads",
             "frame_boundary": "one retro_run, which ends at the next presented VBlank",
             "memory": "virtual is the application's 32-bit address space; unmapped pages reject the access",
             "registers": "r0-r15 and CPSR of the application core (core 0) at the frame boundary",
@@ -95,6 +96,7 @@ impl AzaharHost {
             "frame": self.frame,
             "execution_speed": self.pacing_policy_value(),
             "video_fresh": self.video_fresh,
+            "renderer": if vulkan::active() {"vulkan"} else {"software"},
             "execution_limits": Self::execution_limits(),
             "capability_notes": Self::capability_notes()
         }))

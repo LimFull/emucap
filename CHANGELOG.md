@@ -15,6 +15,12 @@ Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
   `button1`..`button4` arcade inputs, and native save/load. Rebuild MAME adapters: patch `0020`
   extends native raster-state preservation to palette-indexed screens.
 
+### Changed
+- Render the 3DS profile through Azahar's Vulkan renderer: the host provides a headless libretro
+  Vulkan context (pinned MoltenVK on macOS, staged by `build.sh`) and reads the output image back
+  for screenshots. `EMUCAP_AZAHAR_RENDERER=software` keeps the software renderer. 3D scenes went
+  from 7-10 to about 150-240 frames per second on Apple Silicon. Rebuild `adapters/azahar-3ds`.
+
 ### Fixed
 - Stop owned MAME frame steps after exactly the requested frames on screens without a VBLANK
   period, whose frame counter advances in the same callback as the frame notifier.

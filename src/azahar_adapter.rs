@@ -24,6 +24,7 @@ mod ffi;
 mod observation;
 mod operations;
 mod support;
+mod vulkan;
 
 use ffi::*;
 use support::*;
@@ -170,6 +171,7 @@ impl AzaharHost {
         let save_dir = runtime_home.join("save");
         fs::create_dir_all(&system_dir)?;
         fs::create_dir_all(&save_dir)?;
+        let renderer = vulkan::select(core_path)?;
         let mut options = HashMap::new();
         for (key, value) in CORE_OPTIONS {
             options.insert(
@@ -177,6 +179,10 @@ impl AzaharHost {
                 CString::new(*value).expect("static core option"),
             );
         }
+        options.insert(
+            "citra_graphics_api".into(),
+            CString::new(renderer).expect("static renderer"),
+        );
         {
             let mut slot = callback_slot()
                 .lock()
@@ -221,6 +227,14 @@ impl AzaharHost {
             return Err(AzaharError::Core(
                 "retro_load_game failed; the title must be a decrypted 3DS image".into(),
             ));
+        }
+        // The Vulkan core loads the title only once its context exists.
+        if vulkan::active() {
+            if let Err(error) = vulkan::start() {
+                unsafe { (api.deinit)() };
+                clear_callback_state();
+                return Err(error);
+            }
         }
         let mut av_info = RetroSystemAvInfo::default();
         unsafe { (api.get_system_av_info)(&mut av_info) };

@@ -89,6 +89,7 @@ tungstenite = "0.30"
 fs2 = "0.4"
 getrandom = "0.4"
 libloading = "0.8"
+ash = "0.38"
 png = "0.17"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
 

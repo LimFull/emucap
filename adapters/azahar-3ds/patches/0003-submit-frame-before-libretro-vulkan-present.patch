@@ -1,0 +1,13 @@
+--- a/src/citra_libretro/libretro_vk.cpp
++++ b/src/citra_libretro/libretro_vk.cpp
+@@ -703,6 +703,10 @@
+     persistent_libretro_image.image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+     persistent_libretro_image.create_info =
+         static_cast<VkImageViewCreateInfo>(output_view_create_info);
++
++    // emucap: the frame's commands reach the queue before the frontend sees the image, so a
++    // frontend readback submitted after set_image observes this frame.
++    scheduler.WaitWorker();
+ 
+     vulkan_intf->set_image(vulkan_intf->handle, &persistent_libretro_image, 0, nullptr,
+                            instance.GetGraphicsQueueFamilyIndex());

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the pinned Azahar libretro core (software renderer only) with the emucap debug ABI.
+# Build the pinned Azahar libretro core (Vulkan and software renderers) with the emucap debug ABI.
+# On macOS the pinned MoltenVK release is staged beside the core as the host's Vulkan driver.
 #
 # The archive is the upstream unified source release, which carries every submodule. Patches
 # apply to a fresh extract on each build; the CMake build directory is reused.
@@ -52,10 +53,10 @@ for patch in "${PATCHES[@]}"; do
 done
 
 echo "-> Building Azahar $AZAHAR_VERSION libretro core"
-# Vulkan and OpenGL stay off: the emucap host has no GPU context, so the core selects its
-# software renderer and presents through the software framebuffer callback.
+# The host provides a headless Vulkan context. OpenGL stays off: Azahar needs GL 4.3 and macOS
+# stops at 4.1.
 cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_LIBRETRO=ON \
-  -DENABLE_VULKAN=OFF -DENABLE_OPENGL=OFF -DENABLE_TESTS=OFF -DENABLE_LTO=OFF \
+  -DENABLE_VULKAN=ON -DENABLE_OPENGL=OFF -DENABLE_TESTS=OFF -DENABLE_LTO=OFF \
   -DCITRA_WARNINGS_AS_ERRORS=OFF
 cmake --build "$BUILD" --target azahar_libretro -j "$JOBS"
 
@@ -63,13 +64,26 @@ CORE="$(find "$BUILD/bin" -type f \( -name 'azahar_libretro.dylib' -o -name 'aza
 [ -n "$CORE" ] || { echo "ERROR: built Azahar libretro core not found under $BUILD/bin" >&2; exit 1; }
 STAGED="$WORK/$(basename "$CORE")"
 cp "$CORE" "$STAGED.tmp" && mv "$STAGED.tmp" "$STAGED"
+
+VULKAN_JSON=""
+if [ "$(uname -s)" = Darwin ]; then
+  MVK_ARCHIVE="$WORK/MoltenVK-$MOLTENVK_VERSION-macos.tar"
+  [ -f "$MVK_ARCHIVE" ] || { echo "-> Downloading MoltenVK $MOLTENVK_VERSION"; curl -fsSL -o "$MVK_ARCHIVE" "$MOLTENVK_ARCHIVE_URL"; }
+  [ "$(sha256 "$MVK_ARCHIVE" | awk '{print $1}')" = "$MOLTENVK_ARCHIVE_SHA256" ] || {
+    echo "ERROR: MoltenVK archive checksum mismatch" >&2; exit 1; }
+  tar xf "$MVK_ARCHIVE" -O MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib >"$WORK/libMoltenVK.dylib.tmp"
+  mv "$WORK/libMoltenVK.dylib.tmp" "$WORK/libMoltenVK.dylib"
+  VULKAN_JSON=",
+  \"vulkan_library\": \"libMoltenVK.dylib\",
+  \"vulkan_library_sha256\": \"$(sha256 "$WORK/libMoltenVK.dylib" | awk '{print $1}')\""
+fi
 cat >"$WORK/emucap-azahar-build.json.tmp" <<JSON
 {
   "version": "$AZAHAR_VERSION",
   "archive_sha256": "$AZAHAR_ARCHIVE_SHA256",
   "patchset_sha256": "$AZAHAR_PATCHSET_SHA256",
   "core": "$(basename "$STAGED")",
-  "core_sha256": "$(sha256 "$STAGED" | awk '{print $1}')"
+  "core_sha256": "$(sha256 "$STAGED" | awk '{print $1}')"$VULKAN_JSON
 }
 JSON
 mv "$WORK/emucap-azahar-build.json.tmp" "$WORK/emucap-azahar-build.json"

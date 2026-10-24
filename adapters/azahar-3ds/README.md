@@ -12,9 +12,11 @@ cargo build --locked --release --bin emucap-azahar
 ```
 
 `build.sh` verifies the pinned Azahar unified source release, applies `patches/` to a fresh
-extract, builds the libretro core with only the software renderer, and writes
-`work/emucap-azahar-build.json`. Launch admits a core only when that identity matches
-`upstream.lock` and the core digest. The build needs CMake, Ninja and a C++20 toolchain; the
+extract, builds the libretro core with the Vulkan and software renderers, and writes
+`work/emucap-azahar-build.json`. On macOS it also stages the pinned MoltenVK release
+(`MOLTENVK_*` in `upstream.lock`) as `work/libMoltenVK.dylib` and records its digest. Launch admits
+a core only when that identity matches `upstream.lock` and the recorded digests, and copies the
+core and MoltenVK into the generation. The build needs CMake, Ninja and a C++20 toolchain; the
 source release carries its other dependencies.
 
 ## Architecture
@@ -26,8 +28,32 @@ Patch `0001` adds a small C ABI to the core for application memory, registers an
 Patch `0002` adds the debugger: the core always runs the dyncom interpreter, which consults the
 emucap breakpoint state before every instruction and on every load and store. A hit or a finished
 step ends `retro_run` at that instruction boundary, and the remaining cores catch up on the next
-run. In 3D scenes the software renderer dominates frame time, so the interpreter costs about 15%
-there; 2D scenes still run above real time.
+run.
+
+### Renderer
+
+The host is the libretro Vulkan frontend. It loads MoltenVK (macOS) or the system Vulkan loader,
+creates the instance, lets the core create its device through the context negotiation interface,
+and provides the queue lock. The core draws both screens into one output image; patch `0003`
+waits for its command worker before `set_image`, so the frame is on the queue when the frontend
+sees it. Frames are never stalled for readback: a screenshot copies that image to a host buffer
+and converts it to the usual 400x480 PNG. OpenGL is not built because Azahar requires GL 4.3 and
+macOS stops at 4.1.
+
+`EMUCAP_AZAHAR_RENDERER=software` (in the environment of `emucap-mcp`, which launch passes to the
+host) selects the software renderer; `vulkan` requires Vulkan; unset uses Vulkan when a driver
+loads and the software renderer otherwise. `status.renderer` reports the choice. Save states are
+renderer-independent. The Vulkan renderer filters textures like the hardware, so pixels differ
+from the software renderer while the scene matches. A held touch draws the core's pointer cross
+on the bottom screen with either renderer.
+
+Frames per wall-second with unlimited pacing, Digimon World Re:Digitize Decode (Korean patch
+CXI), Apple Silicon:
+
+| scene | software renderer | Vulkan renderer |
+| --- | --- | --- |
+| title menu (3D) | 6.9 | 212-244 |
+| first field scene (3D, from one state) | 10.5 | 149 |
 The launch generation receives a read-only copy of the core and its own system and save
 directories; a user's Azahar or RetroArch profile is never read.
 
@@ -35,7 +61,8 @@ No BIOS or console system files are required for titles that boot with Azahar's 
 
 ## Supported surface
 
-- launch (headless only), pause/resume, exact frame step and run-frames, reset;
+- launch (headless only, Vulkan or software renderer), pause/resume, exact frame step and
+  run-frames, reset;
 - `virtual` memory: the application's 32-bit virtual address space. Reads and writes reject any
   range containing an unmapped page; writes invalidate JIT code for the range.
   `read_memory_batch` reads up to the shared batch limits at one frozen boundary;
@@ -66,7 +93,12 @@ Not exposed: audio output, display, the HOME button, the C-Stick, gyroscope and 
 
 ## Verification
 
-macOS ARM64 with Digimon World Re:Digitize Decode (Japan, decrypted `.3ds`): launch from
+macOS ARM64, Vulkan renderer, same title: the title menu and the first field scene render like
+the software renderer, a state saved under Vulkan loads under the software renderer, and loading
+a field state twice gave identical screenshots one and 301 frames later; a bottom-screen touch
+selected a title menu item.
+
+Earlier, with the software renderer and interpreter only: macOS ARM64 with Digimon World Re:Digitize Decode (Japan, decrypted `.3ds`): launch from
 `launch_plan` inference, exact 120-frame steps at about real time, Start and A input through
 `tap`, code and heap reads, an unmapped-read rejection, application registers, a heap write and
 batch read, and touch at exact bottom-screen pixels. Save/load restored an identical screenshot

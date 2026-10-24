@@ -33,6 +33,21 @@ fn core_admission_requires_the_locked_patch_stack_and_core_digest() {
     std::fs::write(dir.path().join("azahar_libretro.dylib"), b"replaced").unwrap();
     assert!(require_compatible_core(Path::new("/nonexistent")).is_err());
 
+    // A recorded Vulkan library must be present with its recorded digest.
+    write_build(dir.path(), locked, b"core");
+    let mut identity: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&info).unwrap()).unwrap();
+    std::fs::write(dir.path().join("libMoltenVK.dylib"), b"mvk").unwrap();
+    identity["vulkan_library"] = "libMoltenVK.dylib".into();
+    identity["vulkan_library_sha256"] =
+        sha256_file(&dir.path().join("libMoltenVK.dylib")).unwrap().into();
+    std::fs::write(&info, identity.to_string()).unwrap();
+    assert!(require_compatible_core(Path::new("/nonexistent")).is_ok());
+    std::fs::write(dir.path().join("libMoltenVK.dylib"), b"other").unwrap();
+    assert!(require_compatible_core(Path::new("/nonexistent")).is_err());
+    std::fs::remove_file(dir.path().join("libMoltenVK.dylib")).unwrap();
+    assert!(require_compatible_core(Path::new("/nonexistent")).is_err());
+
     write_build(dir.path(), &"0".repeat(64), b"core");
     let error = require_compatible_core(Path::new("/nonexistent")).unwrap_err();
     assert!(

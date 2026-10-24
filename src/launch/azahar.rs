@@ -19,6 +19,11 @@ pub struct BuildIdentity {
     pub patchset_sha256: String,
     pub core: String,
     pub core_sha256: String,
+    /// Vulkan implementation staged beside the core (MoltenVK on macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vulkan_library: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vulkan_library_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +105,20 @@ pub fn require_compatible_core(repo_root: &Path) -> std::io::Result<CompatibleCo
             identity.core_sha256
         )));
     }
+    if let Some(name) = &identity.vulkan_library {
+        let library = core.with_file_name(name);
+        let actual = if name.contains(['/', '\\']) || !library.is_file() {
+            String::new()
+        } else {
+            sha256_file(&library)?
+        };
+        if Some(&actual) != identity.vulkan_library_sha256.as_ref() {
+            return Err(invalid(format!(
+                "Azahar Vulkan library {} is missing or its digest does not match; rebuild adapters/azahar-3ds",
+                library.display()
+            )));
+        }
+    }
     Ok(CompatibleCore {
         path: core,
         identity,
@@ -160,6 +179,12 @@ pub fn launch(request: &Launch<'_>) -> std::io::Result<Launched> {
     let mut permissions = fs::metadata(&staged_core)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(&staged_core, permissions)?;
+    if let Some(name) = &bundle.identity.vulkan_library {
+        crate::path_safety::atomic_copy_file(
+            &bundle.path.with_file_name(name),
+            &core_dir.join(name),
+        )?;
+    }
     let log = runtime_home.join("azahar.log");
     let mut spec = LaunchSpec::new(&frontend, &log)
         .arg(request.port.to_string())
