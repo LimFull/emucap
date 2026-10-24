@@ -14,7 +14,7 @@ impl AzaharHost {
         json!({
             "implemented_methods": METHODS,
             "step_units": ["frames", "instructions"],
-            "cpu": "the dyncom interpreter, so breakpoints and steps stop before the exact instruction",
+            "cpu": "dynarmic JIT; the dyncom interpreter while breakpoints or steps are armed, so they stop before the exact instruction",
             "renderer": "Vulkan (MoltenVK on macOS) unless EMUCAP_AZAHAR_RENDERER=software or no Vulkan driver loads",
             "frame_boundary": "one retro_run, which ends at the next presented VBlank",
             "memory": "virtual is the application's 32-bit address space; unmapped pages reject the access",

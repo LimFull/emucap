@@ -1,0 +1,106 @@
+--- a/src/core/arm/arm_interface.h
++++ b/src/core/arm/arm_interface.h
+@@ -231,6 +231,8 @@
+     u32 id;
+ 
+     friend class boost::serialization::access;
++    // emucap: System::EmucapUseInterpreter moves this state between CPU backends.
++    friend class System;
+ 
+     template <class Archive>
+     void save(Archive& ar, const unsigned int file_version) const {
+--- a/src/core/core.h
++++ b/src/core/core.h
+@@ -247,6 +247,10 @@
+             cpu->InvalidateCacheRange(start_address, length);
+         }
+     }
++
++    /// emucap: runs every core on the interpreter (true) or dynarmic (false), moving the
++    /// architectural state at the current instruction boundary.
++    void EmucapUseInterpreter(bool interpreter);
+ 
+     /**
+      * Gets a reference to the emulated DSP.
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -767,6 +767,52 @@
+ 
+ void System::RegisterImageInterface(std::shared_ptr<Frontend::ImageInterface> image_interface) {
+     registered_image_interface = std::move(image_interface);
++}
++
++void System::EmucapUseInterpreter(bool interpreter) {
++#if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
++    if (cpu_cores.empty() ||
++        (dynamic_cast<ARM_DynCom*>(cpu_cores[0].get()) != nullptr) == interpreter) {
++        return;
++    }
++    std::vector<std::shared_ptr<ARM_Interface>> next;
++    ARM_Interface* next_running = nullptr;
++    for (u32 i = 0; i < cpu_cores.size(); ++i) {
++        const ARM_Interface& old = *cpu_cores[i];
++        std::shared_ptr<ARM_Interface> cpu;
++        if (interpreter) {
++            cpu = std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i));
++        } else {
++            cpu = std::make_shared<ARM_Dynarmic>(*this, *memory, i, timing->GetTimer(i),
++                                                 *exclusive_monitor);
++        }
++        // The same state ARM_Interface serializes, so a switch is a save and load.
++        if (old.GetPageTable()) {
++            cpu->SetPageTable(old.GetPageTable());
++        }
++        for (int r = 0; r < 15; r++) {
++            cpu->SetReg(r, old.GetReg(r));
++        }
++        cpu->SetPC(old.GetPC());
++        cpu->SetCPSR(old.GetCPSR());
++        for (int r = 0; r < 64; r++) {
++            cpu->SetVFPReg(r, old.GetVFPReg(r));
++        }
++        cpu->SetVFPSystemReg(VFP_FPSCR, old.GetVFPSystemReg(VFP_FPSCR));
++        cpu->SetVFPSystemReg(VFP_FPEXC, old.GetVFPSystemReg(VFP_FPEXC));
++        cpu->SetCP15Register(CP15_THREAD_UPRW, old.GetCP15Register(CP15_THREAD_UPRW));
++        cpu->SetCP15Register(CP15_THREAD_URO, old.GetCP15Register(CP15_THREAD_URO));
++        cpu->break_flag = old.break_flag;
++        if (running_core == cpu_cores[i].get()) {
++            next_running = cpu.get();
++        }
++        next.push_back(std::move(cpu));
++    }
++    kernel->SetCPUs(next);
++    kernel->SetRunningCPU(next_running ? next_running : next[0].get());
++    running_core = next_running ? next_running : next[0].get();
++    cpu_cores = std::move(next);
++#endif
+ }
+ 
+ void System::Shutdown(bool is_deserializing) {
+--- a/src/citra_libretro/citra_libretro.cpp
++++ b/src/citra_libretro/citra_libretro.cpp
+@@ -285,6 +285,9 @@
+         Core::System::GetInstance().RegisterCoreLoopThreadId();
+     }
+ 
++    // emucap: dynarmic runs while nothing is armed; breakpoints and steps need the interpreter.
++    Core::System::GetInstance().EmucapUseInterpreter(EmucapDebug::active);
++
+     // emucap: a debugger stop ends the run before the frame is presented.
+     while (!emu_instance->emu_window->HasSubmittedFrame() && !EmucapDebug::StopRequested()) {
+         auto result = Core::System::GetInstance().RunLoop();
+--- a/src/citra_libretro/emucap_debug.cpp
++++ b/src/citra_libretro/emucap_debug.cpp
+@@ -121,9 +121,10 @@
+     return 1;
+ }
+ 
+-/// Breakpoints and instruction steps need the interpreter, which checks before every instruction.
++/// Breakpoints and instruction steps need the interpreter, which checks before every instruction;
++/// retro_run moves the cores to it whenever one is armed.
+ EMUCAP_EXPORT int emucap_azahar_debug_available() {
+-    return Settings::values.use_cpu_jit.GetValue() ? 0 : 1;
++    return 1;
+ }
+ 
+ EMUCAP_EXPORT int emucap_azahar_debug_set_point(const EmucapDebug::Point* point) {

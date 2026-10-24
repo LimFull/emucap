@@ -35,12 +35,13 @@ const RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE: u32 =
     43 | RETRO_ENVIRONMENT_EXPERIMENTAL;
 const PIXEL_XRGB8888: u32 = 1;
 
-/// Fixed options: the renderer (replaced by the host's selection), the interpreter (which checks
-/// breakpoints before every instruction), the default top-over-bottom layout, and touch from the libretro pointer device only. The pointer must not vanish while a
+/// Fixed options: the renderer (replaced by the host's selection), the dynarmic JIT (the core
+/// moves to the interpreter while breakpoints or steps are armed), the default top-over-bottom
+/// layout, and touch from the libretro pointer device only. The pointer must not vanish while a
 /// touch is held.
 pub(super) const CORE_OPTIONS: &[(&str, &str)] = &[
     ("citra_graphics_api", "Software"),
-    ("citra_use_cpu_jit", "disabled"),
+    ("citra_use_cpu_jit", "enabled"),
     ("citra_layout_option", "default"),
     ("citra_swap_screen", "Top"),
     ("citra_enable_touch_touchscreen", "enabled"),

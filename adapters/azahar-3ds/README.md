@@ -25,10 +25,14 @@ source release carries its other dependencies.
 the NP2kai backend. One `retro_run` ends at the next presented VBlank, and every request is
 serviced between frames, so memory, registers and state are read while no guest code runs.
 Patch `0001` adds a small C ABI to the core for application memory, registers and the title ID.
-Patch `0002` adds the debugger: the core always runs the dyncom interpreter, which consults the
-emucap breakpoint state before every instruction and on every load and store. A hit or a finished
-step ends `retro_run` at that instruction boundary, and the remaining cores catch up on the next
-run.
+Patch `0002` adds the debugger: the dyncom interpreter consults the emucap breakpoint state before
+every instruction and on every load and store. A hit or a finished step ends `retro_run` at that
+instruction boundary, and the remaining cores catch up on the next run. Patch `0004` runs the
+dynarmic JIT while no breakpoint, step or exec-stop resume is armed: at the start of each
+`retro_run` the core rebuilds every CPU on the needed backend and moves the state that
+`ARM_Interface` serializes (page table, registers, VFP, FPSCR/FPEXC, CP15 thread registers), so a
+switch is an in-memory save and load at an instruction boundary. Breakpoints can be set at any
+time; the next run starts on the interpreter.
 
 ### Renderer
 
@@ -50,10 +54,12 @@ on the bottom screen with either renderer.
 Frames per wall-second with unlimited pacing, Digimon World Re:Digitize Decode (Korean patch
 CXI), Apple Silicon:
 
-| scene | software renderer | Vulkan renderer |
-| --- | --- | --- |
-| title menu (3D) | 6.9 | 212-244 |
-| first field scene (3D, from one state) | 10.5 | 149 |
+| scene | software + interpreter | Vulkan + interpreter | Vulkan + JIT |
+| --- | --- | --- | --- |
+| title menu (3D) | 6.9 | 212-244 | 1070-1540 |
+| first field scene (3D, from one state) | 10.5 | 149 | 1030-1150 |
+
+With a breakpoint armed the field runs at about 110 fps on the interpreter.
 The launch generation receives a read-only copy of the core and its own system and save
 directories; a user's Azahar or RetroArch profile is never read.
 
@@ -93,10 +99,15 @@ Not exposed: audio output, display, the HOME button, the C-Stick, gyroscope and 
 
 ## Verification
 
-macOS ARM64, Vulkan renderer, same title: the title menu and the first field scene render like
-the software renderer, a state saved under Vulkan loads under the software renderer, and loading
-a field state twice gave identical screenshots one and 301 frames later; a bottom-screen touch
-selected a title menu item.
+macOS ARM64, Vulkan renderer with JIT switching, same title from a fresh `build.sh`: the title
+menu and the first field scene render like the software renderer, a state saved under Vulkan
+loads under the software renderer, and loading a field state twice gave identical screenshots
+one frame later and identical heap 301 frames later (in one of two runs a 12x7-pixel blinking
+prompt differed at 301 frames). An armed breakpoint dropped the field to
+interpreter speed and clearing it restored JIT speed; an exec breakpoint stopped at its PC,
+instruction steps, disassembly, a mid-frame save/load with identical registers and step trace
+(the reloaded run re-hits the exec breakpoint first), and 256 non-pausing stack-write hits over
+30 frames worked; a bottom-screen touch selected a title menu item.
 
 Earlier, with the software renderer and interpreter only: macOS ARM64 with Digimon World Re:Digitize Decode (Japan, decrypted `.3ds`): launch from
 `launch_plan` inference, exact 120-frame steps at about real time, Start and A input through

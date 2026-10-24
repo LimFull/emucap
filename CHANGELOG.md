@@ -20,6 +20,9 @@ Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
   Vulkan context (pinned MoltenVK on macOS, staged by `build.sh`) and reads the output image back
   for screenshots. `EMUCAP_AZAHAR_RENDERER=software` keeps the software renderer. 3D scenes went
   from 7-10 to about 150-240 frames per second on Apple Silicon. Rebuild `adapters/azahar-3ds`.
+- Run the 3DS CPUs on the dynarmic JIT while no breakpoint or instruction step is armed; the core
+  moves them to the interpreter for debugging. 3D scenes run at about 1000 frames per second
+  with unlimited pacing.
 
 ### Fixed
 - Stop owned MAME frame steps after exactly the requested frames on screens without a VBLANK
