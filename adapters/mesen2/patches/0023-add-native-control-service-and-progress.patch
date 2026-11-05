@@ -175,11 +175,11 @@
 +	checkinitdone();
 +	AgentControlState state = _debugger->GetAgentControlState();
 +	lua_newtable(lua);
-+	lua_pushintvalue(generation, state.Generation);
-+	lua_pushintvalue(instructionBoundaries, state.InstructionBoundaries);
-+	lua_pushintvalue(haltedCpuSteps, state.HaltedCpuSteps);
-+	lua_pushintvalue(ppuCycles, state.PpuCycles);
-+	lua_pushintvalue(monotonicMs, state.MonotonicMs);
++	lua_pushliteral(lua, "generation"); lua_pushinteger(lua, (lua_Integer)state.Generation); lua_settable(lua, -3);
++	lua_pushliteral(lua, "instructionBoundaries"); lua_pushinteger(lua, (lua_Integer)state.InstructionBoundaries); lua_settable(lua, -3);
++	lua_pushliteral(lua, "haltedCpuSteps"); lua_pushinteger(lua, (lua_Integer)state.HaltedCpuSteps); lua_settable(lua, -3);
++	lua_pushliteral(lua, "ppuCycles"); lua_pushinteger(lua, (lua_Integer)state.PpuCycles); lua_settable(lua, -3);
++	lua_pushliteral(lua, "monotonicMs"); lua_pushinteger(lua, (lua_Integer)state.MonotonicMs); lua_settable(lua, -3);
 +	lua_pushintvalue(instructionRemaining, state.InstructionRemaining);
 +	lua_pushintvalue(ppuRemaining, state.PpuRemaining);
 +	lua_pushintvalue(stepType, (int)state.Type);

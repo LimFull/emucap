@@ -27,6 +27,9 @@ Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
 ### Fixed
 - Stop owned MAME frame steps after exactly the requested frames on screens without a VBLANK
   period, whose frame counter advances in the same callback as the frame notifier.
+- Keep Mesen live control past 2^31 native ticks. `getControlState` truncated its 64-bit counters
+  to 32 bits, so a GBA session retired as `invalid_native_observation` after about 7,600 frames
+  (other systems later). Rebuild the Mesen host: patch `0023` changed.
 
 ## 1.1.0
 
